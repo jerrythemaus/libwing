@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::net::{TcpStream, UdpSocket};
+use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::io::{Read, Write};
 use std::time::Duration;
 use std::sync::{Mutex, Arc};
@@ -81,23 +81,26 @@ pub struct WingConsole {
     wsock: Arc<Mutex<TcpStream>>,
     main: Arc<Mutex<_WingConsoleMain>>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
-
+    peer_ip: IpAddr,
 }
 
 impl WingConsole {
     pub fn scan(stop_on_first: bool) -> Result<Vec<DiscoveryInfo>> {
         let dsock = UdpSocket::bind("0.0.0.0:0")?;
         dsock.set_broadcast(true)?;
-        dsock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        dsock.set_read_timeout(Some(Duration::from_millis(500)))?;
 
         let mut results = Vec::new();
         let mut attempts = 0;
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let mut packets_seen = 0;
 
         dsock.send_to(b"WING?", "255.255.255.255:2222")?;
-        while attempts < 10 {
+        while attempts < 10 && packets_seen < 100 && std::time::Instant::now() < deadline {
             let mut buf = [0u8; 1024];
             match dsock.recv_from(&mut buf) {
                 Ok((received, _)) => {
+                    packets_seen += 1;
                     if let Ok(response) = String::from_utf8(buf[..received].to_vec()) {
                         let tokens: Vec<&str> = response.split(',').collect();
                         if tokens.len() >= 6 && tokens[0] == "WING" {
@@ -136,7 +139,11 @@ impl WingConsole {
                 }
             };
 
-        let mut stream = TcpStream::connect((ip, 2222))?;
+        let addr = (ip.as_str(), 2222)
+            .to_socket_addrs()?
+            .next()
+            .ok_or(Error::ConnectionError)?;
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         // stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
         stream.write_all(&[0xdf, 0xd1])?;
@@ -159,6 +166,7 @@ impl WingConsole {
                 meters: None,
                 next_meter_id: 0,
             })),
+            peer_ip: addr.ip(),
         })
     }
 
@@ -224,7 +232,7 @@ impl WingConsole {
                 if def_len == 0 { let _ = self.read_u32(&mut main, ch, &mut raw)?; }
                 raw.clear();
                 for _ in 0..def_len { self.decode_next(&mut main, &mut raw)?; } 
-                return Ok(WingResponse::NodeDef(WingNodeDef::from_bytes(&raw)));
+                return Ok(WingResponse::NodeDef(WingNodeDef::from_bytes(&raw)?));
             }
         }
     }
@@ -288,7 +296,7 @@ impl WingConsole {
     fn _keep_alive(&mut self, r: &mut _WingConsoleMain) -> Result<()> {
         if r.keep_alive_timer <= std::time::Instant::now() {
             // println!("keep_alive");
-            self.wsock.clone().lock().unwrap().write_all(&[0xdf, 0xd1])?;
+        self.wsock.clone().lock().unwrap().write_all(&[0xdf, 0xd1])?;
             r.keep_alive_timer = std::time::Instant::now() + std::time::Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
         }
         Ok(())
@@ -304,19 +312,14 @@ impl WingConsole {
     fn _keep_alive_meters(&mut self, m: &mut _WingConsoleMeters) -> Result<()> {
         if m.keep_alive_meters_timer <= std::time::Instant::now() {
             // println!("keep_alive_meters");
-            let meters = m.meters.as_ref().unwrap();
-            let mut keepalive = [
-                0xdf, 0xd3, 0xd4,
-                0x00,
-                0x00,
-                ((meters.port >> 8) & 0xff) as u8,
-                (meters.port & 0xff) as u8,
-                0xdf, 0xd1
-            ];
+            let meters = m.meters.as_ref().ok_or(Error::MeterNotInitialized)?;
             let mut i = m.next_meter_id as i32;
             while i > 0 {
-                keepalive[3] = ((i >> 8) & 0xff) as u8;
-                keepalive[4] = (i & 0xff) as u8;
+                let mut keepalive = vec![0xdf, 0xd3, 0xd4];
+                Self::extend_escaped(&mut keepalive, &(i as u16).to_be_bytes());
+                Self::extend_escaped(&mut keepalive, &meters.port.to_be_bytes());
+                keepalive.push(0xdf);
+                keepalive.push(0xd1);
                 self.wsock.clone().lock().unwrap().write_all(&keepalive)?;
                 i -= 1;
             }
@@ -337,7 +340,7 @@ impl WingConsole {
         loop {
             self._keep_alive(r)?;
             if r.rx_buf_size == 0 {
-                self.rsock.clone().lock().unwrap().set_read_timeout(Some(r.keep_alive_timer.duration_since(std::time::Instant::now())))?;
+                self.rsock.clone().lock().unwrap().set_read_timeout(Some(r.keep_alive_timer.saturating_duration_since(std::time::Instant::now())))?;
                 match self.rsock.clone().lock().unwrap().read(&mut r.rx_buf) {
                     Ok(n) if n > 0 => {
                         // println!("got n {}...", n);
@@ -345,7 +348,7 @@ impl WingConsole {
                         r.rx_buf_tail = 0;
                     }
                     // check for blocking error
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => {
                         std::thread::sleep(Duration::from_millis(10));
                         continue;
                     }
@@ -391,18 +394,23 @@ impl WingConsole {
         }
     }
 
-    fn format_id(&self, id: i32, buf: &mut Vec<u8>, prefix: u8, suffix: Option<u8>) {
+    fn push_escaped(buf: &mut Vec<u8>, byte: u8) {
+        buf.push(byte);
+        if byte == 0xdf {
+            buf.push(0xde);
+        }
+    }
+
+    fn extend_escaped(buf: &mut Vec<u8>, bytes: &[u8]) {
+        for byte in bytes {
+            Self::push_escaped(buf, *byte);
+        }
+    }
+
+    fn format_id(id: i32, buf: &mut Vec<u8>, prefix: u8, suffix: Option<u8>) {
         buf.push(prefix);
 
-        let b1 = ((id >> 24) & 0xFF) as u8;
-        let b2 = ((id >> 16) & 0xFF) as u8;
-        let b3 = ((id >>  8) & 0xFF) as u8;
-        let b4 = ((id      ) & 0xFF) as u8;
-
-        buf.push(b1); if b1 == 0xdf { buf.push(0xde); }
-        buf.push(b2); if b2 == 0xdf { buf.push(0xde); }
-        buf.push(b3); if b3 == 0xdf { buf.push(0xde); }
-        buf.push(b4); if b4 == 0xdf { buf.push(0xde); }
+        Self::extend_escaped(buf, &id.to_be_bytes());
 
         if let Some(suffix1) = suffix {
             buf.push(suffix1);
@@ -415,7 +423,7 @@ impl WingConsole {
             buf.push(0xda);
             buf.push(0xdd);
         } else {
-            self.format_id(id, &mut buf, 0xd7, Some(0xdd));
+            Self::format_id(id, &mut buf, 0xd7, Some(0xdd));
         };
         self.wsock.clone().lock().unwrap().write_all(&buf)?;
         Ok(())
@@ -427,7 +435,7 @@ impl WingConsole {
             buf.push(0xda);
             buf.push(0xdc);
         } else {
-            self.format_id(id, &mut buf, 0xd7, Some(0xdc));
+            Self::format_id(id, &mut buf, 0xd7, Some(0xdc));
         };
         self.wsock.clone().lock().unwrap().write_all(&buf)?;
         Ok(())
@@ -440,68 +448,65 @@ impl WingConsole {
     {
         let mtrsptr = self.mtrs.clone();
         let mut mtrs = mtrsptr.lock().unwrap();
-        mtrs.next_meter_id += 1;
+        mtrs.next_meter_id = mtrs.next_meter_id.checked_add(1).ok_or(Error::InvalidInput)?;
+        if mtrs.next_meter_id == 0 {
+            return Err(Error::InvalidInput);
+        }
 
         if mtrs.meters.is_none() {
             let socket = UdpSocket::bind("0.0.0.0:0")?;
             let port = socket.local_addr()?.port();
-            socket.set_read_timeout(Some(Duration::from_millis(1000))).unwrap();
+            socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
             mtrs.meters = Some(Meters { socket, port });
         } else {
             self._keep_alive_meters(&mut mtrs)?;
         }
-        let md = mtrs.meters.as_ref().unwrap();
+        let md = mtrs.meters.as_ref().ok_or(Error::MeterNotInitialized)?;
 
-        let mut buf = vec![
-            0xdf, 0xd3,
-            0xd3,
-            ((md.port >> 8) & 0xff) as u8,
-            (md.port & 0xff) as u8,
-            0xd4,
-            ((mtrs.next_meter_id >> 8) & 0xff) as u8,
-            (mtrs.next_meter_id & 0xff) as u8,
-            ((md.port >> 8) & 0xff) as u8,
-            (md.port & 0xff) as u8,
-            0xdc,
-        ];
+        let mut buf = vec![0xdf, 0xd3, 0xd3];
+        Self::extend_escaped(&mut buf, &md.port.to_be_bytes());
+        buf.push(0xd4);
+        Self::extend_escaped(&mut buf, &mtrs.next_meter_id.to_be_bytes());
+        Self::extend_escaped(&mut buf, &md.port.to_be_bytes());
+        buf.push(0xdc);
 
         for meter in meters {
             match meter {
                 Meter::Channel(n) => {
                     buf.push(0xa0);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Aux(n) => {
                     buf.push(0xa1);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Bus(n) => {
                     buf.push(0xa2);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Main(n) => {
                     buf.push(0xa3);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Matrix(n) => {
                     buf.push(0xa4);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Dca(n) => {
                     buf.push(0xa5);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Fx(n) => {
                     buf.push(0xa6);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Source(n) => {
                     buf.push(0xa7);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Output(n) => {
                     buf.push(0xa8);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Monitor => {
                     buf.push(0xa9);
@@ -511,23 +516,23 @@ impl WingConsole {
                 }
                 Meter::Channel2(n) => {
                     buf.push(0xab);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Aux2(n) => {
                     buf.push(0xac);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Bus2(n) => {
                     buf.push(0xad);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Main2(n) => {
                     buf.push(0xae);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
                 Meter::Matrix2(n) => {
                     buf.push(0xaf);
-                    buf.push(*n);
+                    Self::push_escaped(&mut buf, *n);
                 }
             }
         }
@@ -549,17 +554,20 @@ impl WingConsole {
             let mut m = mptr.lock().unwrap();
 
             self._keep_alive_meters(&mut m)?;
-            let md = m.meters.as_ref().unwrap();
+            let md = m.meters.as_ref().ok_or(Error::MeterNotInitialized)?;
             let mut buf = [0u8; 8192];
-            md.socket.set_read_timeout(Some(m.keep_alive_meters_timer.duration_since(std::time::Instant::now())))?;
+            md.socket.set_read_timeout(Some(m.keep_alive_meters_timer.saturating_duration_since(std::time::Instant::now())))?;
             match md.socket.recv_from(&mut buf) {
-                Ok((received, _addr)) => {
+                Ok((received, addr)) => {
+                    if addr.ip() != self.peer_ip || received < 4 || (received - 4) % 2 != 0 {
+                        continue;
+                    }
                     return Ok((u16::from_be_bytes([buf[0], buf[1]]), buf[4..received]
                             .chunks_exact(2) // Take 2 bytes at a time
                             .map(|chunk| i16::from_be_bytes([chunk[0], chunk[1]]))
                             .collect()));
                 }
-                Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                Err(ref e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut | std::io::ErrorKind::Interrupted) => {
                     std::thread::sleep(Duration::from_millis(10));
                     continue;
                 }
@@ -571,8 +579,26 @@ impl WingConsole {
     }
 
     pub fn set_string(&mut self, id: i32, value: &str) -> Result<()> {
+        let buf = Self::set_string_message(id, value)?;
+        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        Ok(())
+    }
+
+    pub fn set_float(&mut self, id: i32, value: f32) -> Result<()> {
+        let buf = Self::set_float_message(id, value);
+        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        Ok(())
+    }
+
+    pub fn set_int(&mut self, id: i32, value: i32) -> Result<()> {
+        let buf = Self::set_int_message(id, value);
+        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        Ok(())
+    }
+
+    fn set_string_message(id: i32, value: &str) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
-        self.format_id(id, &mut buf, 0xd7, None);
+        Self::format_id(id, &mut buf, 0xd7, None);
 
         if value.is_empty() {
             buf.push(0xd0);
@@ -581,54 +607,36 @@ impl WingConsole {
         } else if value.len() <= 256 {
             buf.push(0xd1);
             buf.push((value.len()-1) as u8);
+        } else {
+            return Err(Error::InvalidInput);
         }
 
-        for c in value.bytes() {
-            buf.push(c);
-            // do we need this escaping? i guess 0xdf never really shows up in strings unless its
-            // unicode stuff that the wing probably doesn't support
-            // if c == 0xdf { buf.push(0xde); }
-        }
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
-        Ok(())
+        Self::extend_escaped(&mut buf, value.as_bytes());
+        Ok(buf)
     }
 
-    pub fn set_float(&mut self, id: i32, value: f32) -> Result<()> {
+    fn set_float_message(id: i32, value: f32) -> Vec<u8> {
         let mut buf = Vec::new();
-        self.format_id(id, &mut buf, 0xd7, Some(0xd5));
-
-        let bytes = value.to_be_bytes();
-        buf.push(bytes[0]);
-        buf.push(bytes[1]);
-        buf.push(bytes[2]);
-        buf.push(bytes[3]);
-
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
-        Ok(())
+        Self::format_id(id, &mut buf, 0xd7, Some(0xd5));
+        Self::extend_escaped(&mut buf, &value.to_be_bytes());
+        buf
     }
 
-    pub fn set_int(&mut self, id: i32, value: i32) -> Result<()> {
+    fn set_int_message(id: i32, value: i32) -> Vec<u8> {
         let mut buf = Vec::new();
-        self.format_id(id, &mut buf, 0xd7, None);
-
+        Self::format_id(id, &mut buf, 0xd7, None);
         let bytes = value.to_be_bytes();
 
         if (0..=0x3f).contains(&value) {
             buf.push(value as u8);
         } else if (-32768..=32767).contains(&value) {
             buf.push(0xd3);
-            buf.push(bytes[0]);
-            buf.push(bytes[1]);
+            Self::extend_escaped(&mut buf, &(value as i16).to_be_bytes());
         } else {
             buf.push(0xd4);
-            buf.push(bytes[0]);
-            buf.push(bytes[1]);
-            buf.push(bytes[2]);
-            buf.push(bytes[3]);
+            Self::extend_escaped(&mut buf, &bytes);
         }
-
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
-        Ok(())
+        buf
     }
 
     pub fn name_to_id(fullname: &str) -> Option<i32> {
@@ -658,7 +666,46 @@ impl WingConsole {
 
 impl Drop for WingConsole {
     fn drop(&mut self) {
-        let _ = self.wsock.clone().lock().unwrap().shutdown(std::net::Shutdown::Both);
-        let _ = self.rsock.clone().lock().unwrap().shutdown(std::net::Shutdown::Both);
+        if Arc::strong_count(&self.wsock) == 1 {
+            if let Ok(sock) = self.wsock.lock() {
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        }
+        if Arc::strong_count(&self.rsock) == 1 {
+            if let Ok(sock) = self.rsock.lock() {
+                let _ = sock.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn set_int_uses_correct_i16_bytes() {
+        let msg = WingConsole::set_int_message(0x01020304, 1000);
+        assert_eq!(msg, vec![0xd7, 1, 2, 3, 4, 0xd3, 0x03, 0xe8]);
+    }
+
+    #[test]
+    fn set_int_escapes_i16_payload() {
+        let msg = WingConsole::set_int_message(1, -8448);
+        assert_eq!(msg, vec![0xd7, 0, 0, 0, 1, 0xd3, 0xdf, 0xde, 0x00]);
+    }
+
+    #[test]
+    fn set_string_escapes_payload_and_rejects_too_long() {
+        let msg = WingConsole::set_string_message(1, "a\u{7ff}").unwrap();
+        assert_eq!(msg, vec![0xd7, 0, 0, 0, 1, 0x82, b'a', 0xdf, 0xde, 0xbf]);
+        assert!(WingConsole::set_string_message(1, &"x".repeat(257)).is_err());
+    }
+
+    #[test]
+    fn set_float_escapes_payload() {
+        let value = f32::from_bits(0xdf000001);
+        let msg = WingConsole::set_float_message(1, value);
+        assert_eq!(msg, vec![0xd7, 0, 0, 0, 1, 0xd5, 0xdf, 0xde, 0, 0, 1]);
     }
 }

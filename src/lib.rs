@@ -28,14 +28,22 @@
 //! ### Connecting
 //! If you have a Wing's IP address, you can connect to it:
 //!
-//! ```rust
-//! WingConsole wing = WingConsole::connect(Some("192.168.1.100"));
+//! ```rust,no_run
+//! # use libwing::WingConsole;
+//! # fn main() -> Result<(), libwing::Error> {
+//! let mut wing = WingConsole::connect(Some("192.168.1.100"))?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! or just run with no IP address to discover the first Wing console on the network:
 //!
-//! ```rust
-//! WingConsole wing = WingConsole::connect(None);
+//! ```rust,no_run
+//! # use libwing::WingConsole;
+//! # fn main() -> Result<(), libwing::Error> {
+//! let mut wing = WingConsole::connect(None)?;
+//! # Ok(())
+//! # }
 //! ```
 //!
 //! There is also `WingConsole::scan()` which can be used to scan for Wing mixers.
@@ -74,6 +82,10 @@
 mod console;
 mod node;
 mod ffi;
+#[cfg(not(feature = "propmap"))]
+#[path = "empty-propmap.rs"]
+mod propmap;
+#[cfg(feature = "propmap")]
 mod propmap;
 
 pub use console::{WingConsole, DiscoveryInfo, Meter};
@@ -88,10 +100,14 @@ pub enum Error {
     Io(#[from] std::io::Error),
     #[error("Invalid data received")]
     InvalidData,
+    #[error("Invalid input")]
+    InvalidInput,
     #[error("Connection error")]
     ConnectionError,
     #[error("Failed to discover Wing console")]
     DiscoveryError,
+    #[error("Metering has not been initialized")]
+    MeterNotInitialized,
 }
 
 pub enum WingResponse {

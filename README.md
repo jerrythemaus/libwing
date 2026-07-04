@@ -59,9 +59,15 @@ copied to src/ to update the property mapping built into the library, and the
 jsonl file is for your reference.
 
 If you want to eliminate the list of name-to-ID mappings built into the code,
-you can copy `empty-propmap.rs` over the `propmap.rs` included. Note, you will
-break some of the utility of the utility programs if you do this. You can also
-use `empty-propmap.rs` if you corrupt your `propmaprs.rs` somehow.
+disable the default `propmap` feature:
+
+```toml
+libwing = { version = "1.0.4", default-features = false }
+```
+
+Note, you will break some of the utility of the utility programs if you do
+this. The `empty-propmap.rs` file is used automatically when this feature is
+disabled.
 
 The default `propmap.rs` and `propmap.jsonl` included in this repo was
 generated from a Wing Compact running 3.0.5 firmware and contains over 78,000

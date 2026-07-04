@@ -24,16 +24,19 @@ pub enum NodeUnit {
     Octaves = 7,
 }
 
+#[derive(Clone)]
 pub struct StringEnumItem {
     pub item: String,
     pub long_item: String,
 }
 
+#[derive(Clone)]
 pub struct FloatEnumItem {
     pub item: f32,
     pub long_item: String,
 }
 
+#[derive(Clone)]
 pub struct WingNodeDef {
     pub id: i32,
     pub parent_id: i32,
@@ -55,25 +58,17 @@ pub struct WingNodeDef {
 }
 
 impl WingNodeDef {
-    pub fn from_bytes(raw: &[u8]) -> Self {
+    pub fn from_bytes(raw: &[u8]) -> Result<Self> {
         let mut i = 0;
 
-        let parent_id = i32::from_be_bytes([raw[i], raw[i+1], raw[i+2], raw[i+3]]);
-        i += 4;
-        let id = i32::from_be_bytes([raw[i], raw[i+1], raw[i+2], raw[i+3]]);
-        i += 4;
-        let index = u16::from_be_bytes([raw[i], raw[i+1]]);
-        i += 2;
-        let name_len = raw[i];
-        i += 1;
-        let name = String::from_utf8(raw[i..i+name_len as usize].to_vec()).unwrap();
-        i += name_len as usize;
-        let long_name_len = raw[i];
-        i += 1;
-        let long_name = String::from_utf8(raw[i..i+long_name_len as usize].to_vec()).unwrap();
-        i += long_name_len as usize;
-        let flags = u16::from_be_bytes([raw[i], raw[i+1]]);
-        i += 2;
+        let parent_id = read_i32(raw, &mut i)?;
+        let id = read_i32(raw, &mut i)?;
+        let index = read_u16(raw, &mut i)?;
+        let name_len = read_u8(raw, &mut i)?;
+        let name = read_string(raw, &mut i, name_len as usize)?;
+        let long_name_len = read_u8(raw, &mut i)?;
+        let long_name = read_string(raw, &mut i, long_name_len as usize)?;
+        let flags = read_u16(raw, &mut i)?;
 
         let node_type = match (flags >> 4) & 0x0F {
             0 => NodeType::Node,
@@ -113,59 +108,38 @@ impl WingNodeDef {
         match node_type {
             NodeType::Node | NodeType::FaderLevel => { }
             NodeType::String => {
-                max_string_len = Some(u16::from_be_bytes([raw[i], raw[i+1]]));
-                //i += 2;
+                max_string_len = Some(read_u16(raw, &mut i)?);
             }
             NodeType::LinearFloat | 
                 NodeType::LogarithmicFloat => {
-                    min_float = Some(f32::from_be_bytes([raw[i], raw[i+1], raw[i+2], raw[i+3]]));
-                    i += 4;
-                    max_float = Some(f32::from_be_bytes([raw[i], raw[i+1], raw[i+2], raw[i+3]]));
-                    i += 4;
-                    steps = Some(i32::from_be_bytes([raw[i], raw[i+1], raw[i+2], raw[i+3]]));
-                    //i += 4;
+                    min_float = Some(read_f32(raw, &mut i)?);
+                    max_float = Some(read_f32(raw, &mut i)?);
+                    steps = Some(read_i32(raw, &mut i)?);
                 }
             NodeType::Integer => {
-                min_int = Some(i32::from_be_bytes([raw[i], raw[i+1], raw[i+2], raw[i+3]]));
-                i += 4;
-                max_int = Some(i32::from_be_bytes([raw[i], raw[i+1], raw[i+2], raw[i+3]]));
-                //i += 4;
+                min_int = Some(read_i32(raw, &mut i)?);
+                max_int = Some(read_i32(raw, &mut i)?);
             }
             NodeType::StringEnum => {
-                let num = u16::from_be_bytes([raw[i], raw[i+1]]);
-                i += 2;
+                let num = read_u16(raw, &mut i)?;
                 for _ in 0..num {
-                    let item_len = raw[i] as usize;
-                    i += 1;
-                    let item = String::from_utf8(raw[i..i+item_len].to_vec()).unwrap();
-                    i += item_len;
-                    let long_item_len = raw[i] as usize;
-                    i += 1;
-                    let long_item = String::from_utf8(raw[i..i+long_item_len].to_vec()).unwrap();
-                    i += long_item_len;
-                    if string_enum.is_none() {
-                        string_enum = Some(Vec::new());
-                    }
-                    string_enum.as_mut().unwrap().push(StringEnumItem {
+                    let item_len = read_u8(raw, &mut i)? as usize;
+                    let item = read_string(raw, &mut i, item_len)?;
+                    let long_item_len = read_u8(raw, &mut i)? as usize;
+                    let long_item = read_string(raw, &mut i, long_item_len)?;
+                    string_enum.get_or_insert_with(Vec::new).push(StringEnumItem {
                         item,
                         long_item,
                     });
                 }
             }
             NodeType::FloatEnum => {
-                let num = u16::from_be_bytes([raw[i], raw[i+1]]);
-                i += 2;
+                let num = read_u16(raw, &mut i)?;
                 for _ in 0..num {
-                    let item = f32::from_be_bytes([raw[i], raw[i+1], raw[i+2], raw[i+3]]);
-                    i += 4;
-                    let long_item_len = raw[i] as usize;
-                    i += 1;
-                    let long_item = String::from_utf8(raw[i..i+long_item_len].to_vec()).unwrap();
-                    i += long_item_len;
-                    if float_enum.is_none() {
-                        float_enum = Some(Vec::new());
-                    }
-                    float_enum.as_mut().unwrap().push(FloatEnumItem {
+                    let item = read_f32(raw, &mut i)?;
+                    let long_item_len = read_u8(raw, &mut i)? as usize;
+                    let long_item = read_string(raw, &mut i, long_item_len)?;
+                    float_enum.get_or_insert_with(Vec::new).push(FloatEnumItem {
                         item,
                         long_item,
                     });
@@ -173,7 +147,7 @@ impl WingNodeDef {
             }
         }
 
-        WingNodeDef {
+        Ok(WingNodeDef {
             id,
             parent_id,
             index,
@@ -191,52 +165,40 @@ impl WingNodeDef {
             string_enum,
             float_enum,
             raw: raw.to_vec(),
-        }
+        })
     }
 }
 
-impl Clone for WingNodeDef {
-    fn clone(&self) -> Self {
-        let mut string_enum = None;
-        if self.string_enum.is_some() {
-            string_enum = Some(self.string_enum.as_ref().unwrap().iter().map(|item| {
-                StringEnumItem {
-                    item: item.item.clone(),
-                    long_item: item.long_item.clone(),
-                }
-            }).collect::<Vec<_>>());
-        }
-
-        let mut float_enum = None;
-        if self.float_enum.is_some() {
-            float_enum = Some(self.float_enum.as_ref().unwrap().iter().map(|item| {
-                FloatEnumItem {
-                    item: item.item,
-                    long_item: item.long_item.clone(),
-                }
-            }).collect::<Vec<_>>());
-        }
-
-        Self {
-            id: self.id,
-            parent_id: self.parent_id,
-            index: self.index,
-            name: self.name.clone(),
-            long_name: self.long_name.clone(),
-            node_type: self.node_type,
-            unit: self.unit,
-            read_only: self.read_only,
-            min_float: self.min_float,
-            max_float: self.max_float,
-            steps: self.steps,
-            min_int: self.min_int,
-            max_int: self.max_int,
-            max_string_len: self.max_string_len,
-            string_enum,
-            float_enum,
-            raw: self.raw.clone(),
-        }
+fn take<'a>(raw: &'a [u8], i: &mut usize, len: usize) -> Result<&'a [u8]> {
+    if raw.len().saturating_sub(*i) < len {
+        return Err(Error::InvalidData);
     }
+    let start = *i;
+    *i += len;
+    Ok(&raw[start..start + len])
+}
+
+fn read_u8(raw: &[u8], i: &mut usize) -> Result<u8> {
+    Ok(take(raw, i, 1)?[0])
+}
+
+fn read_u16(raw: &[u8], i: &mut usize) -> Result<u16> {
+    let bytes = take(raw, i, 2)?;
+    Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+}
+
+fn read_i32(raw: &[u8], i: &mut usize) -> Result<i32> {
+    let bytes = take(raw, i, 4)?;
+    Ok(i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_f32(raw: &[u8], i: &mut usize) -> Result<f32> {
+    let bytes = take(raw, i, 4)?;
+    Ok(f32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+}
+
+fn read_string(raw: &[u8], i: &mut usize, len: usize) -> Result<String> {
+    String::from_utf8(take(raw, i, len)?.to_vec()).map_err(|_| Error::InvalidData)
 }
 
 pub struct WingNodeData {
@@ -300,12 +262,12 @@ impl WingNodeData {
     }
 
     pub fn get_string(&self) -> String {
-        if self.has_string() {
-            self.string_value.clone().unwrap()
-        } else if self.has_float() {
-            self.float_value.unwrap().to_string()
-        } else if self.has_int() {
-            self.int_value.unwrap().to_string()
+        if let Some(value) = &self.string_value {
+            value.clone()
+        } else if let Some(value) = self.float_value {
+            value.to_string()
+        } else if let Some(value) = self.int_value {
+            value.to_string()
         } else {
             String::new()
         }
@@ -416,10 +378,10 @@ impl WingNodeDef {
                 if let Some(max_string_len) = self.max_string_len { r.push_str(&format!("\nMaxLength: {}", max_string_len)); }
             }
             NodeType::StringEnum  => {
-                if self.string_enum.is_some() {
+                if let Some(string_enum) = &self.string_enum {
                     r.push_str("\nItems:");
                     let mut first = true;
-                    for item in self.string_enum.as_ref().unwrap() {
+                    for item in string_enum {
                         if first {
                             r.push_str(&format!("     {}", item.item));
                             first = false;
@@ -435,10 +397,10 @@ impl WingNodeDef {
                 }
             }
             NodeType::FloatEnum => {
-                if self.float_enum.is_some() {
+                if let Some(float_enum) = &self.float_enum {
                     r.push_str("\nItems:");
                     let mut first = true;
-                    for item in self.float_enum.as_ref().unwrap() {
+                    for item in float_enum {
                         if first {
                             r.push_str(&format!("     {}", item.item));
                             first = false;
@@ -517,8 +479,8 @@ impl WingNodeDef {
                 if let Some(max_string_len) = self.max_string_len { json.insert("maxstringlen", max_string_len).unwrap(); }
             }
             NodeType::StringEnum  => {
-                if self.string_enum.is_some() {
-                    json.insert("items", self.string_enum.as_ref().unwrap().iter().map(|item| {
+                if let Some(string_enum) = &self.string_enum {
+                    json.insert("items", string_enum.iter().map(|item| {
                         let mut j = jzon::object!{ "item": item.item.clone() };
                         if !item.long_item.is_empty() {
                             j.insert("longitem", item.long_item.clone()).unwrap();
@@ -528,8 +490,8 @@ impl WingNodeDef {
                 }
             }
             NodeType::FloatEnum => {
-                if self.float_enum.is_some() {
-                    json.insert("items", self.float_enum.as_ref().unwrap().iter().map(|item| {
+                if let Some(float_enum) = &self.float_enum {
+                    json.insert("items", float_enum.iter().map(|item| {
                         let mut j = jzon::object!{ "item": item.item };
                         if !item.long_item.is_empty() {
                             j.insert("longitem", item.long_item.clone()).unwrap();
@@ -543,3 +505,4 @@ impl WingNodeDef {
         json
     }
 }
+use crate::{Error, Result};
