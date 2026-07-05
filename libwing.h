@@ -27,7 +27,10 @@ typedef enum {
     WING_NODE_TYPE_INTEGER = 4,
     WING_NODE_TYPE_STRING_ENUM = 5,
     WING_NODE_TYPE_FLOAT_ENUM = 6,
-    WING_NODE_TYPE_STRING = 7
+    WING_NODE_TYPE_STRING = 7,
+    // A type nibble not recognized by this version of libwing (additive sentinel;
+    // values 0-7 above are unchanged).
+    WING_NODE_TYPE_UNKNOWN = 8
 } WingNodeType;
 
 typedef enum {
@@ -38,7 +41,10 @@ typedef enum {
     WING_NODE_UNIT_HERTZ = 4,
     WING_NODE_UNIT_METERS = 5,
     WING_NODE_UNIT_SECONDS = 6,
-    WING_NODE_UNIT_OCTAVES = 7
+    WING_NODE_UNIT_OCTAVES = 7,
+    // A unit nibble not recognized by this version of libwing (additive sentinel;
+    // values 0-7 above are unchanged).
+    WING_NODE_UNIT_UNKNOWN = 8
 } WingNodeUnit;
 
 typedef enum {
@@ -80,6 +86,11 @@ int                wing_console_request_node_data                 (WingConsole* 
 uint16_t           wing_console_request_meter                     (WingConsole* handle, uint16_t *meter_ids, size_t len); // see above about meter ids
 int                wing_console_read_meter                        (WingConsole* handle, uint16_t *out_id, int16_t *out_data, size_t out_data_capacity);
 int                wing_console_read_meter_bounded                (WingConsole* handle, uint16_t *out_id, int16_t *out_data, size_t out_data_capacity);
+// read()/read_meters() already send keepalives as needed; call these yourself only if
+// you have a loop that doesn't call read()/read_meters() but still wants the
+// connection held open. Returns 0 on success, -1 on failure (see wing_last_error_message()).
+int                wing_console_keep_alive                        (WingConsole* handle);
+int                wing_console_keep_alive_meters                 (WingConsole* handle);
 void               wing_console_destroy                           (WingConsole* handle);
 
 WingResponseType   wing_response_get_type                         (const Response* handle);
@@ -115,6 +126,40 @@ int                wing_node_definition_get_string_enum_item      (const Respons
 int                wing_node_definition_get_string_enum_long_item (const Response* handle, int index, char** ret); // On success (returns 1), *ret must be freed by wing_string_destroy()
 
 int                wing_name_to_id                                (const char* name, int32_t* out_id);
+// Reverse lookup: node definition for a full property-map name (e.g. "/ch/1/fdr"),
+// exposed through the SAME accessor family (wing_node_definition_get_*) used for
+// definitions read live off the console. NULL if not found (see
+// wing_last_error_message()). Return value must be freed by wing_response_destroy().
+Response*          wing_name_to_def                               (const char* name);
+
+// A wire id can map to more than one full name (e.g. every "/fx/N/HALL/..." slot
+// aliases the same ids across N). These enumerate the candidate names/definitions for
+// a given id; 0 candidates is a normal ("not found") result, not an error.
+size_t             wing_id_to_defs_count                          (int32_t id);
+// Writes the index-th candidate's full name into name_out (NUL-terminated).
+// - On success, returns bytes written including the NUL terminator.
+// - If name_cap is too small (or name_out is NULL), nothing is written and the
+//   required size (including the NUL terminator) is returned anyway -- pass
+//   name_out=NULL, name_cap=0 to query the size first. This differs deliberately from
+//   wing_console_read_meter_bounded()'s fixed -2 sentinel, which suits a fixed-shape
+//   numeric buffer rather than a variable-length C string.
+// - Returns -1 if id/index name no known candidate (see wing_last_error_message()).
+int                wing_id_to_defs_get_name                       (int32_t id, size_t index, char* name_out, size_t name_cap);
+// Node definition for the index-th candidate, through the same accessor family as
+// wing_name_to_def(). NULL if id/index name no known candidate. Return value must be
+// freed by wing_response_destroy().
+Response*          wing_id_to_defs_get_def                        (int32_t id, size_t index);
+
+// Structured last-error (R25): message + code for the most recent failing call made
+// from the CURRENT thread (each thread has its own slot). wing_last_error_message()
+// returns NULL if nothing has failed yet on this thread; otherwise the pointer is
+// owned by the library and valid until the next failing call on the same thread --
+// do not free it, and do not pass it to wing_string_destroy(). wing_last_error_code()
+// returns 0 if nothing has failed yet, -1 for an FFI-usage error (bad argument
+// detected at the FFI boundary, e.g. a null pointer), 1-8 for a specific underlying
+// error, or 99 for a future/unrecognized error variant.
+const char*        wing_last_error_message                        (void);
+int                wing_last_error_code                            (void);
 
 // you must call this to free the memory of any string returned by the library
 void               wing_string_destroy                            (char* handle);
