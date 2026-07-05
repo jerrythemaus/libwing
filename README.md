@@ -58,6 +58,18 @@ this utiltiy will create `propmap.rs` and `propmap.jsonl`. `propmap.rs` can be
 copied to src/ to update the property mapping built into the library, and the
 jsonl file is for your reference.
 
+`wingschema` also has an offline regeneration mode that rebuilds `src/propmap.rs`
+and `src/propmap.jsonl` directly from an existing full-sweep JSONL file, with no
+live console involved:
+
+```sh
+cargo run --example wingschema -- embed propmap.jsonl
+```
+
+This is how the embedded map in this repo is kept in sync with the full,
+per-model sweep at `propmap.jsonl` — see `tests/propmap_consistency.rs` for the
+checks that guard against the two drifting apart again.
+
 If you want to eliminate the list of name-to-ID mappings built into the code,
 disable the default `propmap` feature:
 

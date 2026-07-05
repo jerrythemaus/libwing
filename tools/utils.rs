@@ -1,7 +1,7 @@
 pub struct Args {
     help: String,
     args: Vec<String>,
-    it:   u8,
+    it: u8,
 }
 
 impl Args {
@@ -27,7 +27,7 @@ impl Args {
             std::process::exit(1);
         }
         self.it += 1;
-        self.args[(self.it-1) as usize].clone()
+        self.args[(self.it - 1) as usize].clone()
     }
 
     #[allow(dead_code)]
@@ -35,4 +35,3 @@ impl Args {
         self.it < self.args.len() as u8
     }
 }
-

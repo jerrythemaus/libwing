@@ -750,6 +750,13 @@ impl WingConsole {
         NAME_TO_DEF.get(fullname)
     }
 
+    /// Total number of entries in the embedded property map. Exposed for the
+    /// regeneration consistency tests (see `tests/propmap_consistency.rs`),
+    /// which have no other way to see the size of the private `NAME_TO_DEF` map.
+    pub fn propmap_len() -> usize {
+        NAME_TO_DEF.len()
+    }
+
     #[cfg(test)]
     pub(crate) fn test_with_meter_socket(peer_ip: IpAddr, socket: UdpSocket) -> Self {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
