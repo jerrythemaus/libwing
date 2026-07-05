@@ -83,6 +83,12 @@ mod ffi;
 mod helpers;
 mod meters;
 mod node;
+/// OSC-over-UDP transport (U10: R3), a sibling to the Native transport above.
+/// Namespaced rather than flattened into the root re-exports below: several of its
+/// names (`get_param`, `set_float`, ...) are generic enough that they'd collide or
+/// read confusingly next to the rest of this crate's API. Use it as `osc::get_param(..)`,
+/// `osc::WingOscClient`, etc.
+pub mod osc;
 #[cfg(not(feature = "propmap"))]
 #[path = "empty-propmap.rs"]
 mod propmap;

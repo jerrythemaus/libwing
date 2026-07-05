@@ -7,8 +7,8 @@
 //! *public* API, over a recording `Transport`, rather than the private
 //! `set_*_message` builders directly.
 //!
-//! OSC packet encoding is out of scope: OSC lands in U10/U11, and its
-//! conformance tests belong in that unit's test suite, not this one.
+//! OSC packet encoding is out of scope: OSC has its own conformance suite in
+//! `tests/osc_encode.rs` (U10).
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
