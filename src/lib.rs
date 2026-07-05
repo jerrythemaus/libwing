@@ -80,6 +80,7 @@
 
 mod console;
 mod ffi;
+mod helpers;
 mod node;
 #[cfg(not(feature = "propmap"))]
 #[path = "empty-propmap.rs"]
@@ -90,10 +91,14 @@ mod safety;
 mod schema;
 
 pub use console::{
-    DiscoveryInfo, Meter, ReconnectOutcome, ReconnectPolicy, SessionGap, Transport, WingConsole,
+    DiscoveryInfo, DumpEntry, Meter, NodeDump, NodeValue, ReconnectOutcome, ReconnectPolicy,
+    SessionGap, Transport, WingConsole,
 };
 pub use ffi::{ResponseHandle, WingConsoleHandle};
-pub use node::{NodeType, NodeUnit, WingNodeData, WingNodeDef};
+pub use helpers::{
+    decode_enum, encode_enum, write_enum, EnumDecode, EnumKey, EnumValue, RawEnumValue,
+};
+pub use node::{FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingNodeData, WingNodeDef};
 pub use safety::{risk_class, ConfirmationGuard, ConfirmationRequired, Operation, RiskClass};
 pub use schema::{
     LiveSchema, MapMetadata, Provenance, Resolution, Schema, Staleness, FIRMWARE_BASELINE,

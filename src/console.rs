@@ -4,7 +4,7 @@ use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::node::{WingNodeData, WingNodeDef};
+use crate::node::{NodeType, WingNodeData, WingNodeDef};
 use crate::propmap::NAME_TO_DEF;
 use crate::{Error, Result, WingResponse};
 
@@ -1194,6 +1194,222 @@ impl WingConsole {
                 .collect()
         })
     }
+
+    /// Attended-gets every id in `ids`, in order (U6).
+    ///
+    /// Built on [`get_node_data`](Self::get_node_data), so each miss is a normal
+    /// request/wait/timeout cycle. The one thing this adds over calling
+    /// `get_node_data` in a loop yourself: unrelated `NodeData` that
+    /// `get_node_data` buffers while waiting for one id (e.g. unsolicited
+    /// traffic, or a response to an id later in `ids`) is stashed and consulted
+    /// before issuing a fresh request for that later id, so a value that
+    /// happened to arrive early isn't requested twice. Anything buffered for an
+    /// id *not* in `ids` is dropped, same as a bare `get_node_data` call would
+    /// drop it. A timed-out id contributes nothing to this stash either way --
+    /// `get_node_data`'s `Err` path carries no partial buffer with it -- but a
+    /// timeout on one id never stops the rest of `ids` from being attempted.
+    pub fn get_nodes(
+        &mut self,
+        ids: &[i32],
+        timeout_per_node: Duration,
+    ) -> Vec<(i32, Result<WingNodeData>)> {
+        let mut pending: HashMap<i32, WingNodeData> = HashMap::new();
+        let mut out = Vec::with_capacity(ids.len());
+        for &id in ids {
+            if let Some(data) = pending.remove(&id) {
+                out.push((id, Ok(data)));
+                continue;
+            }
+            match self.get_node_data(id, timeout_per_node) {
+                Ok((data, buffered)) => {
+                    for resp in buffered {
+                        if let WingResponse::NodeData(bid, bdata) = resp {
+                            if bid != id && ids.contains(&bid) {
+                                pending.entry(bid).or_insert(bdata);
+                            }
+                        }
+                    }
+                    out.push((id, Ok(data)));
+                }
+                Err(err) => out.push((id, Err(err))),
+            }
+        }
+        out
+    }
+
+    /// Writes every `(id, value)` pair in `values`, in order, via the matching
+    /// `set_string`/`set_float`/`set_int` (U6). One node's failure doesn't stop
+    /// the rest -- each gets its own `Result` in the returned, order-preserving
+    /// list.
+    pub fn set_nodes(&mut self, values: &[(i32, NodeValue)]) -> Vec<(i32, Result<()>)> {
+        values
+            .iter()
+            .map(|(id, value)| (*id, self.write_node_value(*id, value)))
+            .collect()
+    }
+
+    fn write_node_value(&mut self, id: i32, value: &NodeValue) -> Result<()> {
+        match value {
+            NodeValue::String(s) => self.set_string(id, s),
+            NodeValue::Float(f) => self.set_float(id, *f),
+            NodeValue::Int(i) => self.set_int(id, *i),
+        }
+    }
+
+    /// Snapshots every writable value node under `root_fullname` (itself
+    /// included) from the embedded property map (U6, R18).
+    ///
+    /// The subtree's *shape* comes from the embedded map, not the console --
+    /// no definition round-trip is needed to know which ids exist under the
+    /// prefix. Each leaf's *value*, though, is only known live, so this issues
+    /// one attended `get_node_data` per leaf, in a fixed order (sorted by
+    /// fullname) so a dump taken twice in a row requests things in the same
+    /// order. Plain container nodes (`NodeType::Node`, which never carry a
+    /// value) and read-only leaves are excluded (R18): restoring a read-only
+    /// node would fail anyway, and including a valueless container would just
+    /// waste a request that could never resolve to a value.
+    ///
+    /// Fails fast on the first leaf that doesn't respond within `timeout`
+    /// rather than collecting partial results -- a dump is meant to represent
+    /// one consistent snapshot, and a partial one masquerading as complete
+    /// would be worse than an explicit error.
+    pub fn dump_subtree(&mut self, root_fullname: &str, timeout: Duration) -> Result<NodeDump> {
+        let leaves = dumpable_leaves(NAME_TO_DEF.iter(), root_fullname);
+
+        let mut entries = Vec::with_capacity(leaves.len());
+        for (fullname, id) in leaves {
+            let (data, _buffered) = self.get_node_data(id, timeout)?;
+            entries.push(DumpEntry {
+                fullname,
+                id,
+                value: NodeValue::from_data(&data),
+            });
+        }
+        Ok(NodeDump { entries })
+    }
+
+    /// Applies a [`NodeDump`] back to the console (U6, R18).
+    ///
+    /// Entries are applied in **model-first order**: any entry whose leaf name
+    /// is `mdl` (the property map's convention for a model selector, e.g.
+    /// `/fx/1/mdl`) is written before every non-selector entry, so a model's
+    /// children land after the model itself has been switched to match --
+    /// otherwise they'd be writing into whatever model the slot happened to be
+    /// in before the restore. Multiple selectors sort by ascending path depth,
+    /// so an outer selector is applied before one nested inside its own
+    /// model-specific subtree. Within each of those two groups, entries keep
+    /// their original relative order (a stable sort).
+    ///
+    /// Read-only entries shouldn't exist in a dump produced by
+    /// [`dump_subtree`](Self::dump_subtree) (which excludes them at dump time),
+    /// but a hand-built or edited [`NodeDump`] could still carry one; as
+    /// defense in depth, restoring one is skipped (reported as
+    /// `Err(Error::InvalidInput)` in the returned list) rather than attempted.
+    ///
+    /// One `Result` per entry, in the order actually applied -- a failure on
+    /// one entry doesn't stop the rest from being attempted.
+    pub fn restore(&mut self, dump: &NodeDump) -> Vec<(String, Result<()>)> {
+        let mut ordered: Vec<&DumpEntry> = dump.entries.iter().collect();
+        ordered.sort_by_key(|entry| restore_order_key(&entry.fullname));
+
+        ordered
+            .into_iter()
+            .map(|entry| {
+                let blocked = NAME_TO_DEF
+                    .get(&entry.fullname)
+                    .map(|def| def.read_only)
+                    .unwrap_or(false);
+                let result = if blocked {
+                    Err(Error::InvalidInput)
+                } else {
+                    self.write_node_value(entry.id, &entry.value)
+                };
+                (entry.fullname.clone(), result)
+            })
+            .collect()
+    }
+}
+
+/// A node value in whichever facet it was carried in on the wire -- the same
+/// three shapes [`WingNodeData`] can hold, but owned and settable back via
+/// [`WingConsole::set_nodes`] without needing to route through a specific
+/// `set_string`/`set_float`/`set_int` call at each call site (U6).
+#[derive(Clone, Debug, PartialEq)]
+pub enum NodeValue {
+    String(String),
+    Float(f32),
+    Int(i32),
+}
+
+impl NodeValue {
+    /// Reads back whichever facet `data` actually carries. A `WingNodeData`
+    /// read off the wire always has exactly one of its three facets set (see
+    /// `WingConsole::read`), so this always matches one of the first two arms
+    /// before falling back to the int facet.
+    fn from_data(data: &WingNodeData) -> Self {
+        if data.has_string() {
+            NodeValue::String(data.get_string())
+        } else if data.has_float() {
+            NodeValue::Float(data.get_float())
+        } else {
+            NodeValue::Int(data.get_int())
+        }
+    }
+}
+
+/// One node's fullname, id, and captured value within a [`NodeDump`] (U6).
+#[derive(Clone, Debug, PartialEq)]
+pub struct DumpEntry {
+    pub fullname: String,
+    pub id: i32,
+    pub value: NodeValue,
+}
+
+/// A snapshot of a subtree's writable values, as produced by
+/// [`WingConsole::dump_subtree`] and consumed by [`WingConsole::restore`] (U6,
+/// R18). Plain data -- safe to serialize/store by whatever means a caller
+/// prefers; this crate takes no dependency on a serialization format for it.
+#[derive(Clone, Debug, PartialEq, Default)]
+pub struct NodeDump {
+    pub entries: Vec<DumpEntry>,
+}
+
+/// The embedded-map walk shared by [`WingConsole::dump_subtree`]: every
+/// `(fullname, id)` under `root_fullname` (itself included) whose def is a
+/// value-bearing, writable leaf, sorted by fullname for a deterministic
+/// request order.
+///
+/// Factored out from `dump_subtree` so the read-only/container exclusion (R18)
+/// is unit-testable against a synthetic fixture without needing a real
+/// read-only entry in the embedded map (as of this map's current sweep, it has
+/// none -- see `console::tests::dumpable_leaves_excludes_read_only_and_containers`).
+fn dumpable_leaves<'a>(
+    entries: impl Iterator<Item = (&'a String, &'a WingNodeDef)>,
+    root_fullname: &str,
+) -> Vec<(String, i32)> {
+    let prefix = format!("{root_fullname}/");
+    let mut leaves: Vec<(String, i32)> = entries
+        .filter(|(name, def)| {
+            def.node_type != NodeType::Node
+                && !def.read_only
+                && (name.as_str() == root_fullname || name.starts_with(&prefix))
+        })
+        .map(|(name, def)| (name.clone(), def.id))
+        .collect();
+    leaves.sort_by(|a, b| a.0.cmp(&b.0));
+    leaves
+}
+
+/// Sort key for [`WingConsole::restore`]'s model-first ordering: model
+/// selectors (`false`, shallower-first) before everything else (`true`), with
+/// original relative order preserved within each group (the caller sorts with
+/// a stable sort).
+fn restore_order_key(fullname: &str) -> (bool, usize) {
+    if fullname.rsplit('/').next() == Some("mdl") {
+        (false, fullname.matches('/').count())
+    } else {
+        (true, 0)
+    }
 }
 
 impl Drop for WingConsole {
@@ -1351,5 +1567,82 @@ mod tests {
         let (token, values) = console.read_meters().unwrap();
         assert_eq!(token, 1);
         assert_eq!(values, vec![-6]);
+    }
+
+    fn synthetic_def(id: i32, name: &str, node_type: NodeType, read_only: bool) -> WingNodeDef {
+        WingNodeDef {
+            id,
+            parent_id: 0,
+            index: 0,
+            name: name.to_string(),
+            long_name: String::new(),
+            node_type,
+            unit: crate::node::NodeUnit::None,
+            read_only,
+            min_float: None,
+            max_float: None,
+            steps: None,
+            min_int: None,
+            max_int: None,
+            max_string_len: None,
+            string_enum: None,
+            float_enum: None,
+            raw: Vec::new(),
+        }
+    }
+
+    /// R18: a dump must exclude read-only nodes and plain (valueless)
+    /// container nodes. The real embedded map's current sweep happens to have
+    /// zero read-only definitions (verified while implementing this), so this
+    /// exercises `dumpable_leaves` directly against a synthetic fixture rather
+    /// than the embedded map -- the logic under test is identical either way.
+    #[test]
+    fn dumpable_leaves_excludes_read_only_and_containers() {
+        let fixture: Vec<(String, WingNodeDef)> = vec![
+            (
+                "/root".to_string(),
+                synthetic_def(1, "root", NodeType::Node, false),
+            ),
+            (
+                "/root/writable".to_string(),
+                synthetic_def(2, "writable", NodeType::Integer, false),
+            ),
+            (
+                "/root/locked".to_string(),
+                synthetic_def(3, "locked", NodeType::Integer, true),
+            ),
+            (
+                "/root/container".to_string(),
+                synthetic_def(4, "container", NodeType::Node, false),
+            ),
+            (
+                "/root/container/child".to_string(),
+                synthetic_def(5, "child", NodeType::LinearFloat, false),
+            ),
+            (
+                "/unrelated".to_string(),
+                synthetic_def(6, "unrelated", NodeType::Integer, false),
+            ),
+        ];
+
+        let leaves = dumpable_leaves(fixture.iter().map(|(n, d)| (n, d)), "/root");
+
+        assert_eq!(
+            leaves,
+            vec![
+                ("/root/container/child".to_string(), 5),
+                ("/root/writable".to_string(), 2),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_order_key_puts_model_selectors_first_shallowest_first() {
+        let mut names = vec!["/fx/1/HALL/pdel", "/fx/2/mdl", "/fx/1/mdl", "/ch/1/eq/mdl"];
+        names.sort_by_key(|n| restore_order_key(n));
+        assert_eq!(
+            names,
+            vec!["/fx/2/mdl", "/fx/1/mdl", "/ch/1/eq/mdl", "/fx/1/HALL/pdel"]
+        );
     }
 }
