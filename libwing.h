@@ -79,6 +79,7 @@ int                wing_console_request_node_definition           (WingConsole* 
 int                wing_console_request_node_data                 (WingConsole* handle, int32_t id);
 uint16_t           wing_console_request_meter                     (WingConsole* handle, uint16_t *meter_ids, size_t len); // see above about meter ids
 int                wing_console_read_meter                        (WingConsole* handle, uint16_t *out_id, int16_t *out_data, size_t out_data_capacity);
+int                wing_console_read_meter_bounded                (WingConsole* handle, uint16_t *out_id, int16_t *out_data, size_t out_data_capacity);
 void               wing_console_destroy                           (WingConsole* handle);
 
 WingResponseType   wing_response_get_type                         (const Response* handle);

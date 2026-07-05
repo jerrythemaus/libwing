@@ -68,6 +68,12 @@ impl WingNodeDef {
         Self::from_bytes_inner(raw, true)
     }
 
+    /// Alias for [`from_bytes`](Self::from_bytes) at call sites that want to
+    /// emphasize fallible parsing of untrusted wire bytes.
+    pub fn try_from_bytes(raw: &[u8]) -> Result<Self> {
+        Self::from_bytes(raw)
+    }
+
     /// Like [`from_bytes`](Self::from_bytes) but leaves [`raw`](Self::raw) empty.
     ///
     /// Used by the embedded property map, where the raw bytes are never read back and
@@ -115,26 +121,36 @@ impl WingNodeDef {
 
         let read_only = ((flags >> 9) & 0x01) != 0;
 
-        let mut min_float      = Option::None;
-        let mut max_float      = Option::None;
-        let mut steps          = Option::None;
-        let mut min_int        = Option::None;
-        let mut max_int        = Option::None;
+        let mut min_float = Option::None;
+        let mut max_float = Option::None;
+        let mut steps = Option::None;
+        let mut min_int = Option::None;
+        let mut max_int = Option::None;
         let mut max_string_len = Option::None;
-        let mut string_enum    = Option::None;
-        let mut float_enum     = Option::None;
+        let mut string_enum = Option::None;
+        let mut float_enum = Option::None;
 
         match node_type {
-            NodeType::Node | NodeType::FaderLevel => { }
+            NodeType::Node => {}
             NodeType::String => {
                 max_string_len = Some(read_u16(raw, &mut i)?);
             }
-            NodeType::LinearFloat | 
-                NodeType::LogarithmicFloat => {
+            NodeType::LinearFloat | NodeType::LogarithmicFloat => {
+                min_float = Some(read_f32(raw, &mut i)?);
+                max_float = Some(read_f32(raw, &mut i)?);
+                steps = Some(read_i32(raw, &mut i)?);
+            }
+            NodeType::FaderLevel => {
+                // Live consoles stream FaderLevel definitions with a min/max/steps range,
+                // but the embedded property-map snapshot predates that and omits it (the
+                // def is length-delimited on both paths). Read the range only when the
+                // definition actually carries it so both encodings parse.
+                if raw.len() - i >= 12 {
                     min_float = Some(read_f32(raw, &mut i)?);
                     max_float = Some(read_f32(raw, &mut i)?);
                     steps = Some(read_i32(raw, &mut i)?);
                 }
+            }
             NodeType::Integer => {
                 min_int = Some(read_i32(raw, &mut i)?);
                 max_int = Some(read_i32(raw, &mut i)?);
@@ -146,10 +162,9 @@ impl WingNodeDef {
                     let item = read_string(raw, &mut i, item_len)?;
                     let long_item_len = read_u8(raw, &mut i)? as usize;
                     let long_item = read_string(raw, &mut i, long_item_len)?;
-                    string_enum.get_or_insert_with(Vec::new).push(StringEnumItem {
-                        item,
-                        long_item,
-                    });
+                    string_enum
+                        .get_or_insert_with(Vec::new)
+                        .push(StringEnumItem { item, long_item });
                 }
             }
             NodeType::FloatEnum => {
@@ -158,10 +173,9 @@ impl WingNodeDef {
                     let item = read_f32(raw, &mut i)?;
                     let long_item_len = read_u8(raw, &mut i)? as usize;
                     let long_item = read_string(raw, &mut i, long_item_len)?;
-                    float_enum.get_or_insert_with(Vec::new).push(FloatEnumItem {
-                        item,
-                        long_item,
-                    });
+                    float_enum
+                        .get_or_insert_with(Vec::new)
+                        .push(FloatEnumItem { item, long_item });
                 }
             }
         }
@@ -217,7 +231,8 @@ fn read_f32(raw: &[u8], i: &mut usize) -> Result<f32> {
 }
 
 fn read_string(raw: &[u8], i: &mut usize, len: usize) -> Result<String> {
-    String::from_utf8(take(raw, i, len)?.to_vec()).map_err(|_| Error::InvalidData)
+    let bytes = take(raw, i, len)?;
+    String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidData)
 }
 
 pub struct WingNodeData {
@@ -344,59 +359,76 @@ impl WingNodeDef {
         //     r.push_str(&format!("/<Unknown:{}>", self.id));
         // }
         //
-        r.push_str(&format!(  "Id:        {}", self.id));
-        r.push_str(&format!("\nRead-only: {}", if self.read_only { "yes" } else { "no" }));
+        r.push_str(&format!("Id:        {}", self.id));
+        r.push_str(&format!(
+            "\nRead-only: {}",
+            if self.read_only { "yes" } else { "no" }
+        ));
         if self.index != 0 {
-        r.push_str(&format!("\nIndex:     {}", self.index));
+            r.push_str(&format!("\nIndex:     {}", self.index));
         }
         if !self.name.is_empty() {
-        r.push_str(&format!("\nName:      {}", self.name));
+            r.push_str(&format!("\nName:      {}", self.name));
         }
         if !self.long_name.is_empty() {
-        r.push_str(&format!("\nLong Name: {}", self.long_name));
+            r.push_str(&format!("\nLong Name: {}", self.long_name));
         }
 
-        r.push_str(&format!("\nType:      {}",
+        r.push_str(&format!(
+            "\nType:      {}",
             match self.node_type {
-                NodeType::Node             => "node",
-                NodeType::LinearFloat      => "linear float",
+                NodeType::Node => "node",
+                NodeType::LinearFloat => "linear float",
                 NodeType::LogarithmicFloat => "log float",
-                NodeType::Integer          => "integer",
-                NodeType::String           => "string",
-                NodeType::FaderLevel       => "fader level (float)",
-                NodeType::StringEnum       => "string enum",
-                NodeType::FloatEnum        => "float enum",
-            }));
+                NodeType::Integer => "integer",
+                NodeType::String => "string",
+                NodeType::FaderLevel => "fader level (float)",
+                NodeType::StringEnum => "string enum",
+                NodeType::FloatEnum => "float enum",
+            }
+        ));
         if self.unit != NodeUnit::None {
-            r.push_str(&format!("\nUnit:      {}",
+            r.push_str(&format!(
+                "\nUnit:      {}",
                 match self.unit {
-                    NodeUnit::Db           => "dB",
-                    NodeUnit::Percent      => "%",
+                    NodeUnit::Db => "dB",
+                    NodeUnit::Percent => "%",
                     NodeUnit::Milliseconds => "ms",
-                    NodeUnit::Hertz        => "Hz",
-                    NodeUnit::Meters       => "meters",
-                    NodeUnit::Seconds      => "seconds",
-                    NodeUnit::Octaves      => "octaves",
-                    _ => "UNKNOWN"
-                }));
+                    NodeUnit::Hertz => "Hz",
+                    NodeUnit::Meters => "meters",
+                    NodeUnit::Seconds => "seconds",
+                    NodeUnit::Octaves => "octaves",
+                    _ => "UNKNOWN",
+                }
+            ));
         }
 
         match self.node_type {
-            NodeType::LinearFloat | 
-            NodeType::LogarithmicFloat |
-            NodeType::FaderLevel => {
-                if let Some(min_float) = self.min_float { r.push_str(&format!("\nMinimum:   {}", min_float)); }
-                if let Some(max_float) = self.max_float { r.push_str(&format!("\nMaximum:   {}", max_float)); }
-                if let Some(steps)     = self.steps     { r.push_str(&format!("\nSteps:     {}", steps)); }
+            NodeType::LinearFloat | NodeType::LogarithmicFloat | NodeType::FaderLevel => {
+                if let Some(min_float) = self.min_float {
+                    r.push_str(&format!("\nMinimum:   {}", min_float));
+                }
+                if let Some(max_float) = self.max_float {
+                    r.push_str(&format!("\nMaximum:   {}", max_float));
+                }
+                if let Some(steps) = self.steps {
+                    r.push_str(&format!("\nSteps:     {}", steps));
+                }
             }
             NodeType::Integer => {
-                if let Some(min_int) = self.min_int { r.push_str(&format!("\nMinimum:   {}", min_int)); }
-                if let Some(max_int) = self.max_int { r.push_str(&format!("\nMaximum:   {}", max_int)); }
+                if let Some(min_int) = self.min_int {
+                    r.push_str(&format!("\nMinimum:   {}", min_int));
+                }
+                if let Some(max_int) = self.max_int {
+                    r.push_str(&format!("\nMaximum:   {}", max_int));
+                }
             }
             NodeType::String => {
-                if let Some(max_string_len) = self.max_string_len { r.push_str(&format!("\nMaxLength: {}", max_string_len)); }
+                if let Some(max_string_len) = self.max_string_len {
+                    r.push_str(&format!("\nMaxLength: {}", max_string_len));
+                }
             }
-            NodeType::StringEnum  => {
+            NodeType::StringEnum => {
                 if let Some(string_enum) = &self.string_enum {
                     r.push_str("\nItems:");
                     let mut first = true;
@@ -439,7 +471,7 @@ impl WingNodeDef {
     }
 
     pub fn to_json(&self) -> jzon::JsonValue {
-        let mut json = jzon::object!{
+        let mut json = jzon::object! {
             id: self.id,
         };
 
@@ -447,7 +479,7 @@ impl WingNodeDef {
         //     json.insert("fullname", fullname).unwrap();
         // }
 
-        if self.index != 0 { 
+        if self.index != 0 {
             json.insert("index", self.index).unwrap();
         }
         if !self.name.is_empty() {
@@ -458,24 +490,54 @@ impl WingNodeDef {
         }
 
         match self.node_type {
-            NodeType::Node             => { json.insert("type", "node").unwrap(); }
-            NodeType::LinearFloat      => { json.insert("type", "linear float").unwrap(); }
-            NodeType::LogarithmicFloat => { json.insert("type", "log float").unwrap(); }
-            NodeType::Integer          => { json.insert("type", "integer").unwrap(); }
-            NodeType::String           => { json.insert("type", "string").unwrap(); }
-            NodeType::FaderLevel       => { json.insert("type", "fader level").unwrap(); }
-            NodeType::StringEnum       => { json.insert("type", "string enum").unwrap(); }
-            NodeType::FloatEnum        => { json.insert("type", "float enum").unwrap(); }
+            NodeType::Node => {
+                json.insert("type", "node").unwrap();
+            }
+            NodeType::LinearFloat => {
+                json.insert("type", "linear float").unwrap();
+            }
+            NodeType::LogarithmicFloat => {
+                json.insert("type", "log float").unwrap();
+            }
+            NodeType::Integer => {
+                json.insert("type", "integer").unwrap();
+            }
+            NodeType::String => {
+                json.insert("type", "string").unwrap();
+            }
+            NodeType::FaderLevel => {
+                json.insert("type", "fader level").unwrap();
+            }
+            NodeType::StringEnum => {
+                json.insert("type", "string enum").unwrap();
+            }
+            NodeType::FloatEnum => {
+                json.insert("type", "float enum").unwrap();
+            }
         }
         match self.unit {
-            NodeUnit::None         => { }
-            NodeUnit::Db           => { json.insert("unit", "dB").unwrap(); }
-            NodeUnit::Percent      => { json.insert("unit", "%").unwrap(); }
-            NodeUnit::Milliseconds => { json.insert("unit", "ms").unwrap(); }
-            NodeUnit::Hertz        => { json.insert("unit", "Hz").unwrap(); }
-            NodeUnit::Meters       => { json.insert("unit", "meters").unwrap(); }
-            NodeUnit::Seconds      => { json.insert("unit", "seconds").unwrap(); }
-            NodeUnit::Octaves      => { json.insert("unit", "octaves").unwrap(); }
+            NodeUnit::None => {}
+            NodeUnit::Db => {
+                json.insert("unit", "dB").unwrap();
+            }
+            NodeUnit::Percent => {
+                json.insert("unit", "%").unwrap();
+            }
+            NodeUnit::Milliseconds => {
+                json.insert("unit", "ms").unwrap();
+            }
+            NodeUnit::Hertz => {
+                json.insert("unit", "Hz").unwrap();
+            }
+            NodeUnit::Meters => {
+                json.insert("unit", "meters").unwrap();
+            }
+            NodeUnit::Seconds => {
+                json.insert("unit", "seconds").unwrap();
+            }
+            NodeUnit::Octaves => {
+                json.insert("unit", "octaves").unwrap();
+            }
         }
 
         if self.read_only {
@@ -483,40 +545,64 @@ impl WingNodeDef {
         }
 
         match self.node_type {
-            NodeType::LinearFloat | 
-            NodeType::LogarithmicFloat |
-            NodeType::FaderLevel => {
-                if let Some(min_float) = self.min_float { json.insert("minfloat", min_float).unwrap(); }
-                if let Some(max_float) = self.max_float { json.insert("maxfloat", max_float).unwrap(); }
-                if let Some(steps) = self.steps { json.insert("steps", steps).unwrap(); }
+            NodeType::LinearFloat | NodeType::LogarithmicFloat | NodeType::FaderLevel => {
+                if let Some(min_float) = self.min_float {
+                    json.insert("minfloat", min_float).unwrap();
+                }
+                if let Some(max_float) = self.max_float {
+                    json.insert("maxfloat", max_float).unwrap();
+                }
+                if let Some(steps) = self.steps {
+                    json.insert("steps", steps).unwrap();
+                }
             }
             NodeType::Integer => {
-                if let Some(min_int) = self.min_int { json.insert("minint", min_int).unwrap(); }
-                if let Some(max_int) = self.max_int { json.insert("maxint", max_int).unwrap(); }
+                if let Some(min_int) = self.min_int {
+                    json.insert("minint", min_int).unwrap();
+                }
+                if let Some(max_int) = self.max_int {
+                    json.insert("maxint", max_int).unwrap();
+                }
             }
             NodeType::String => {
-                if let Some(max_string_len) = self.max_string_len { json.insert("maxstringlen", max_string_len).unwrap(); }
+                if let Some(max_string_len) = self.max_string_len {
+                    json.insert("maxstringlen", max_string_len).unwrap();
+                }
             }
-            NodeType::StringEnum  => {
+            NodeType::StringEnum => {
                 if let Some(string_enum) = &self.string_enum {
-                    json.insert("items", string_enum.iter().map(|item| {
-                        let mut j = jzon::object!{ "item": item.item.clone() };
-                        if !item.long_item.is_empty() {
-                            j.insert("longitem", item.long_item.clone()).unwrap();
-                        }
-                        j
-                    }).collect::<Vec<_>>()).unwrap();
+                    json.insert(
+                        "items",
+                        string_enum
+                            .iter()
+                            .map(|item| {
+                                let mut j = jzon::object! { "item": item.item.clone() };
+                                if !item.long_item.is_empty() {
+                                    j.insert("longitem", item.long_item.clone()).unwrap();
+                                }
+                                j
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
                 }
             }
             NodeType::FloatEnum => {
                 if let Some(float_enum) = &self.float_enum {
-                    json.insert("items", float_enum.iter().map(|item| {
-                        let mut j = jzon::object!{ "item": item.item };
-                        if !item.long_item.is_empty() {
-                            j.insert("longitem", item.long_item.clone()).unwrap();
-                        }
-                        j
-                    }).collect::<Vec<_>>()).unwrap();
+                    json.insert(
+                        "items",
+                        float_enum
+                            .iter()
+                            .map(|item| {
+                                let mut j = jzon::object! { "item": item.item };
+                                if !item.long_item.is_empty() {
+                                    j.insert("longitem", item.long_item.clone()).unwrap();
+                                }
+                                j
+                            })
+                            .collect::<Vec<_>>(),
+                    )
+                    .unwrap();
                 }
             }
             _ => {}
@@ -532,37 +618,91 @@ mod tests {
 
     /// Minimal builder for a node-definition byte stream in the wire format that
     /// `WingNodeDef::from_bytes` parses.
-    struct DefBuilder {
-        buf: Vec<u8>,
+    struct DefBuilder<'a> {
+        parent_id: i32,
+        id: i32,
+        index: u16,
+        name: &'a str,
+        long_name: &'a str,
+        node_type: u8,
+        unit: u8,
+        read_only: bool,
+        payload: Vec<u8>,
     }
 
-    impl DefBuilder {
-        fn new(parent_id: i32, id: i32, index: u16, name: &str, long_name: &str, node_type: u8, unit: u8, read_only: bool) -> Self {
-            let mut buf = Vec::new();
-            buf.extend_from_slice(&parent_id.to_be_bytes());
-            buf.extend_from_slice(&id.to_be_bytes());
-            buf.extend_from_slice(&index.to_be_bytes());
-            buf.push(name.len() as u8);
-            buf.extend_from_slice(name.as_bytes());
-            buf.push(long_name.len() as u8);
-            buf.extend_from_slice(long_name.as_bytes());
-            let flags: u16 = ((node_type as u16 & 0x0F) << 4)
-                | (unit as u16 & 0x0F)
-                | if read_only { 1 << 9 } else { 0 };
-            buf.extend_from_slice(&flags.to_be_bytes());
-            Self { buf }
+    impl<'a> DefBuilder<'a> {
+        fn new(id: i32, name: &'a str, long_name: &'a str, node_type: u8) -> Self {
+            Self {
+                parent_id: 0,
+                id,
+                index: 0,
+                name,
+                long_name,
+                node_type,
+                unit: 0,
+                read_only: false,
+                payload: Vec::new(),
+            }
         }
-        fn u16(mut self, v: u16) -> Self { self.buf.extend_from_slice(&v.to_be_bytes()); self }
-        fn i32(mut self, v: i32) -> Self { self.buf.extend_from_slice(&v.to_be_bytes()); self }
-        fn f32(mut self, v: f32) -> Self { self.buf.extend_from_slice(&v.to_be_bytes()); self }
-        fn str(mut self, s: &str) -> Self { self.buf.push(s.len() as u8); self.buf.extend_from_slice(s.as_bytes()); self }
-        fn build(self) -> Vec<u8> { self.buf }
+        fn parent_id(mut self, parent_id: i32) -> Self {
+            self.parent_id = parent_id;
+            self
+        }
+        fn index(mut self, index: u16) -> Self {
+            self.index = index;
+            self
+        }
+        fn unit(mut self, unit: u8) -> Self {
+            self.unit = unit;
+            self
+        }
+        fn read_only(mut self) -> Self {
+            self.read_only = true;
+            self
+        }
+        fn u16(mut self, v: u16) -> Self {
+            self.payload.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+        fn i32(mut self, v: i32) -> Self {
+            self.payload.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+        fn f32(mut self, v: f32) -> Self {
+            self.payload.extend_from_slice(&v.to_be_bytes());
+            self
+        }
+        fn str(mut self, s: &str) -> Self {
+            self.payload.push(s.len() as u8);
+            self.payload.extend_from_slice(s.as_bytes());
+            self
+        }
+        fn build(self) -> Vec<u8> {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&self.parent_id.to_be_bytes());
+            buf.extend_from_slice(&self.id.to_be_bytes());
+            buf.extend_from_slice(&self.index.to_be_bytes());
+            buf.push(self.name.len() as u8);
+            buf.extend_from_slice(self.name.as_bytes());
+            buf.push(self.long_name.len() as u8);
+            buf.extend_from_slice(self.long_name.as_bytes());
+            let flags: u16 = ((self.node_type as u16 & 0x0F) << 4)
+                | (self.unit as u16 & 0x0F)
+                | if self.read_only { 1 << 9 } else { 0 };
+            buf.extend_from_slice(&flags.to_be_bytes());
+            buf.extend_from_slice(&self.payload);
+            buf
+        }
     }
 
     #[test]
     fn parses_plain_node() {
         // node_type 0 = Node, unit 0 = None
-        let bytes = DefBuilder::new(1, 2, 3, "gain", "Gain", 0, 0, true).build();
+        let bytes = DefBuilder::new(2, "gain", "Gain", 0)
+            .parent_id(1)
+            .index(3)
+            .read_only()
+            .build();
         let def = WingNodeDef::from_bytes(&bytes).unwrap();
         assert_eq!(def.parent_id, 1);
         assert_eq!(def.id, 2);
@@ -577,8 +717,11 @@ mod tests {
     #[test]
     fn parses_integer_node_with_min_max() {
         // node_type 4 = Integer, unit 1 = Db
-        let bytes = DefBuilder::new(0, 10, 0, "vol", "Volume", 4, 1, false)
-            .i32(-100).i32(100).build();
+        let bytes = DefBuilder::new(10, "vol", "Volume", 4)
+            .unit(1)
+            .i32(-100)
+            .i32(100)
+            .build();
         let def = WingNodeDef::from_bytes(&bytes).unwrap();
         assert_eq!(def.node_type, NodeType::Integer);
         assert_eq!(def.unit, NodeUnit::Db);
@@ -589,8 +732,11 @@ mod tests {
     #[test]
     fn parses_linear_float_node() {
         // node_type 1 = LinearFloat
-        let bytes = DefBuilder::new(0, 11, 0, "f", "F", 1, 0, false)
-            .f32(-1.5).f32(3.5).i32(256).build();
+        let bytes = DefBuilder::new(11, "f", "F", 1)
+            .f32(-1.5)
+            .f32(3.5)
+            .i32(256)
+            .build();
         let def = WingNodeDef::from_bytes(&bytes).unwrap();
         assert_eq!(def.node_type, NodeType::LinearFloat);
         assert_eq!(def.min_float, Some(-1.5));
@@ -599,12 +745,30 @@ mod tests {
     }
 
     #[test]
+    fn parses_fader_level_node_with_float_metadata() {
+        // node_type 3 = FaderLevel
+        let bytes = DefBuilder::new(11, "fdr", "Fader", 3)
+            .unit(1)
+            .f32(-90.0)
+            .f32(10.0)
+            .i32(1024)
+            .build();
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.node_type, NodeType::FaderLevel);
+        assert_eq!(def.min_float, Some(-90.0));
+        assert_eq!(def.max_float, Some(10.0));
+        assert_eq!(def.steps, Some(1024));
+    }
+
+    #[test]
     fn parses_string_enum_node() {
         // node_type 5 = StringEnum, 2 items
-        let bytes = DefBuilder::new(0, 12, 0, "e", "E", 5, 0, false)
+        let bytes = DefBuilder::new(12, "e", "E", 5)
             .u16(2)
-            .str("a").str("Alpha")
-            .str("b").str("Bravo")
+            .str("a")
+            .str("Alpha")
+            .str("b")
+            .str("Bravo")
             .build();
         let def = WingNodeDef::from_bytes(&bytes).unwrap();
         assert_eq!(def.node_type, NodeType::StringEnum);
@@ -619,9 +783,10 @@ mod tests {
     #[test]
     fn parses_float_enum_node() {
         // node_type 6 = FloatEnum, 1 item
-        let bytes = DefBuilder::new(0, 13, 0, "fe", "FE", 6, 0, false)
+        let bytes = DefBuilder::new(13, "fe", "FE", 6)
             .u16(1)
-            .f32(0.25).str("Quarter")
+            .f32(0.25)
+            .str("Quarter")
             .build();
         let def = WingNodeDef::from_bytes(&bytes).unwrap();
         assert_eq!(def.node_type, NodeType::FloatEnum);
@@ -634,7 +799,7 @@ mod tests {
     #[test]
     fn parses_string_node_with_max_len() {
         // node_type 7 = String
-        let bytes = DefBuilder::new(0, 14, 0, "s", "S", 7, 0, false).u16(256).build();
+        let bytes = DefBuilder::new(14, "s", "S", 7).u16(256).build();
         let def = WingNodeDef::from_bytes(&bytes).unwrap();
         assert_eq!(def.node_type, NodeType::String);
         assert_eq!(def.max_string_len, Some(256));
@@ -643,19 +808,36 @@ mod tests {
     #[test]
     fn parses_256_byte_name_without_panic() {
         let name = "n".repeat(255); // name_len is a u8, so 255 is the max
-        let bytes = DefBuilder::new(0, 15, 0, &name, "", 0, 0, false).build();
+        let bytes = DefBuilder::new(15, &name, "", 0).build();
         let def = WingNodeDef::from_bytes(&bytes).unwrap();
         assert_eq!(def.name.len(), 255);
+    }
+
+    #[test]
+    fn raw_free_parser_preserves_fields_but_not_raw_bytes() {
+        let bytes = DefBuilder::new(10, "vol", "Volume", 4)
+            .unit(1)
+            .i32(-100)
+            .i32(100)
+            .build();
+        let def = WingNodeDef::from_bytes_without_raw(&bytes).unwrap();
+        assert_eq!(def.name, "vol");
+        assert_eq!(def.min_int, Some(-100));
+        assert_eq!(def.max_int, Some(100));
+        assert!(def.raw.is_empty());
     }
 
     #[test]
     fn truncated_input_returns_error_not_panic() {
         // A full Integer def, then progressively truncate every prefix. None may panic;
         // every short read must surface as Err(InvalidData) via the bounds-checked take().
-        let full = DefBuilder::new(0, 10, 0, "vol", "Volume", 4, 1, false)
-            .i32(-100).i32(100).build();
+        let full = DefBuilder::new(10, "vol", "Volume", 4)
+            .unit(1)
+            .i32(-100)
+            .i32(100)
+            .build();
         for len in 0..full.len() {
-            let res = WingNodeDef::from_bytes(&full[..len]);
+            let res = WingNodeDef::try_from_bytes(&full[..len]);
             assert!(res.is_err(), "expected error for truncated len {len}");
             assert!(matches!(res, Err(Error::InvalidData)));
         }
@@ -669,14 +851,34 @@ mod tests {
         bytes.extend_from_slice(&0u16.to_be_bytes()); // index
         bytes.push(2); // name_len
         bytes.extend_from_slice(&[0xff, 0xfe]); // invalid utf-8
-        assert!(matches!(WingNodeDef::from_bytes(&bytes), Err(Error::InvalidData)));
+        assert!(matches!(
+            WingNodeDef::try_from_bytes(&bytes),
+            Err(Error::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn nul_in_string_field_is_valid_rust_string() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // parent_id
+        bytes.extend_from_slice(&1i32.to_be_bytes()); // id
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // index
+        bytes.push(3); // name_len
+        bytes.extend_from_slice(b"a\0b");
+        bytes.push(0); // long_name_len
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // flags
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.name, "a\0b");
     }
 
     #[test]
     fn string_enum_count_larger_than_data_errors_without_panic() {
         // Claim 1000 items but provide none: the per-item reads must run out of bytes
         // and return Err rather than panicking or looping unboundedly.
-        let bytes = DefBuilder::new(0, 12, 0, "e", "E", 5, 0, false).u16(1000).build();
-        assert!(matches!(WingNodeDef::from_bytes(&bytes), Err(Error::InvalidData)));
+        let bytes = DefBuilder::new(12, "e", "E", 5).u16(1000).build();
+        assert!(matches!(
+            WingNodeDef::try_from_bytes(&bytes),
+            Err(Error::InvalidData)
+        ));
     }
 }

@@ -78,19 +78,18 @@
 //!
 //! All these calls are thread safe.
 
-
 mod console;
-mod node;
 mod ffi;
+mod node;
 #[cfg(not(feature = "propmap"))]
 #[path = "empty-propmap.rs"]
 mod propmap;
 #[cfg(feature = "propmap")]
 mod propmap;
 
-pub use console::{WingConsole, DiscoveryInfo, Meter};
-pub use node::{WingNodeDef, WingNodeData, NodeType, NodeUnit};
-pub use ffi::{WingConsoleHandle, ResponseHandle};
+pub use console::{DiscoveryInfo, Meter, WingConsole};
+pub use ffi::{ResponseHandle, WingConsoleHandle};
+pub use node::{NodeType, NodeUnit, WingNodeData, WingNodeDef};
 
 type Result<T> = std::result::Result<T, Error>;
 

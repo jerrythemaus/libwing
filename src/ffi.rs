@@ -1,12 +1,12 @@
+use crate::{console::Meter, NodeType, NodeUnit, WingConsole, WingResponse};
 use std::ffi::{CStr, CString};
-use std::os::raw::{c_char, c_int, c_float};
+use std::os::raw::{c_char, c_float, c_int};
 use std::ptr;
-use crate::{WingConsole, NodeType, NodeUnit, WingResponse, console::Meter};
 
 // Opaque type wrappers
 #[repr(C)]
 pub struct WingDiscoveryInfoHandle {
-    info: Vec<crate::DiscoveryInfo>
+    info: Vec<crate::DiscoveryInfo>,
 }
 
 // WingConsole is already Clone and internally synchronized (its rsock/wsock/main/mtrs
@@ -22,7 +22,7 @@ pub struct WingConsoleHandle {
 
 #[repr(C)]
 pub struct ResponseHandle {
-    pub response: WingResponse
+    pub response: WingResponse,
 }
 
 #[repr(C)]
@@ -37,6 +37,10 @@ fn string_to_c(value: &str) -> *mut c_char {
     CString::new(value).map_or(ptr::null_mut(), CString::into_raw)
 }
 
+fn is_c_string_compatible(value: &str) -> bool {
+    !value.as_bytes().contains(&0)
+}
+
 unsafe fn cstr_to_str<'a>(value: *const c_char) -> Option<&'a str> {
     if value.is_null() {
         return None;
@@ -44,7 +48,9 @@ unsafe fn cstr_to_str<'a>(value: *const c_char) -> Option<&'a str> {
     CStr::from_ptr(value).to_str().ok()
 }
 
-unsafe fn discovery_ref<'a>(handle: *const WingDiscoveryInfoHandle) -> Option<&'a WingDiscoveryInfoHandle> {
+unsafe fn discovery_ref<'a>(
+    handle: *const WingDiscoveryInfoHandle,
+) -> Option<&'a WingDiscoveryInfoHandle> {
     handle.as_ref()
 }
 
@@ -55,7 +61,9 @@ unsafe fn response_ref<'a>(handle: *const ResponseHandle) -> Option<&'a Response
 #[no_mangle]
 pub extern "C" fn wing_string_destroy(handle: *mut c_char) {
     unsafe {
-        if handle.is_null() { return; }
+        if handle.is_null() {
+            return;
+        }
         drop(CString::from_raw(handle));
     }
 }
@@ -86,37 +94,72 @@ pub extern "C" fn wing_discover_count(handle: *const WingDiscoveryInfoHandle) ->
 }
 
 #[no_mangle]
-pub extern "C" fn wing_discover_get_ip(handle: *const WingDiscoveryInfoHandle, index: c_int) -> *mut c_char {
+pub extern "C" fn wing_discover_get_ip(
+    handle: *const WingDiscoveryInfoHandle,
+    index: c_int,
+) -> *mut c_char {
     unsafe { discovery_ref(handle) }
-        .and_then(|handle| usize::try_from(index).ok().and_then(|index| handle.info.get(index)))
+        .and_then(|handle| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| handle.info.get(index))
+        })
         .map_or(ptr::null_mut(), |info| string_to_c(&info.ip))
 }
 
 #[no_mangle]
-pub extern "C" fn wing_discover_get_name(handle: *const WingDiscoveryInfoHandle, index: c_int) -> *mut c_char {
+pub extern "C" fn wing_discover_get_name(
+    handle: *const WingDiscoveryInfoHandle,
+    index: c_int,
+) -> *mut c_char {
     unsafe { discovery_ref(handle) }
-        .and_then(|handle| usize::try_from(index).ok().and_then(|index| handle.info.get(index)))
+        .and_then(|handle| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| handle.info.get(index))
+        })
         .map_or(ptr::null_mut(), |info| string_to_c(&info.name))
 }
 
 #[no_mangle]
-pub extern "C" fn wing_discover_get_model(handle: *const WingDiscoveryInfoHandle, index: c_int) -> *mut c_char {
+pub extern "C" fn wing_discover_get_model(
+    handle: *const WingDiscoveryInfoHandle,
+    index: c_int,
+) -> *mut c_char {
     unsafe { discovery_ref(handle) }
-        .and_then(|handle| usize::try_from(index).ok().and_then(|index| handle.info.get(index)))
+        .and_then(|handle| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| handle.info.get(index))
+        })
         .map_or(ptr::null_mut(), |info| string_to_c(&info.model))
 }
 
 #[no_mangle]
-pub extern "C" fn wing_discover_get_serial(handle: *const WingDiscoveryInfoHandle, index: c_int) -> *mut c_char {
+pub extern "C" fn wing_discover_get_serial(
+    handle: *const WingDiscoveryInfoHandle,
+    index: c_int,
+) -> *mut c_char {
     unsafe { discovery_ref(handle) }
-        .and_then(|handle| usize::try_from(index).ok().and_then(|index| handle.info.get(index)))
+        .and_then(|handle| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| handle.info.get(index))
+        })
         .map_or(ptr::null_mut(), |info| string_to_c(&info.serial))
 }
 
 #[no_mangle]
-pub extern "C" fn wing_discover_get_firmware(handle: *const WingDiscoveryInfoHandle, index: c_int) -> *mut c_char {
+pub extern "C" fn wing_discover_get_firmware(
+    handle: *const WingDiscoveryInfoHandle,
+    index: c_int,
+) -> *mut c_char {
     unsafe { discovery_ref(handle) }
-        .and_then(|handle| usize::try_from(index).ok().and_then(|index| handle.info.get(index)))
+        .and_then(|handle| {
+            usize::try_from(index)
+                .ok()
+                .and_then(|index| handle.info.get(index))
+        })
         .map_or(ptr::null_mut(), |info| string_to_c(&info.firmware))
 }
 
@@ -125,12 +168,12 @@ pub extern "C" fn wing_console_connect(ip: *const c_char) -> *mut WingConsoleHan
     if ip.is_null() {
         match WingConsole::connect(None) {
             Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console })),
-            Err(_) => ptr::null_mut()
+            Err(_) => ptr::null_mut(),
         }
     } else if let Some(ip) = unsafe { cstr_to_str(ip) } {
         match WingConsole::connect(Some(ip)) {
             Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console })),
-            Err(_) => ptr::null_mut()
+            Err(_) => ptr::null_mut(),
         }
     } else {
         ptr::null_mut()
@@ -170,9 +213,12 @@ pub extern "C" fn wing_response_destroy(handle: *mut ResponseHandle) {
     }
 }
 
-
 #[no_mangle]
-pub extern "C" fn wing_console_set_string(handle: *mut WingConsoleHandle, id: i32, value: *const c_char) -> c_int {
+pub extern "C" fn wing_console_set_string(
+    handle: *mut WingConsoleHandle,
+    id: i32,
+    value: *const c_char,
+) -> c_int {
     let Some(value) = (unsafe { cstr_to_str(value) }) else {
         return -1;
     };
@@ -188,7 +234,11 @@ pub extern "C" fn wing_console_set_string(handle: *mut WingConsoleHandle, id: i3
 }
 
 #[no_mangle]
-pub extern "C" fn wing_console_set_float(handle: *mut WingConsoleHandle, id: i32, value: c_float) -> c_int {
+pub extern "C" fn wing_console_set_float(
+    handle: *mut WingConsoleHandle,
+    id: i32,
+    value: c_float,
+) -> c_int {
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
@@ -201,7 +251,11 @@ pub extern "C" fn wing_console_set_float(handle: *mut WingConsoleHandle, id: i32
 }
 
 #[no_mangle]
-pub extern "C" fn wing_console_set_int(handle: *mut WingConsoleHandle, id: i32, value: c_int) -> c_int {
+pub extern "C" fn wing_console_set_int(
+    handle: *mut WingConsoleHandle,
+    id: i32,
+    value: c_int,
+) -> c_int {
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
@@ -214,7 +268,10 @@ pub extern "C" fn wing_console_set_int(handle: *mut WingConsoleHandle, id: i32, 
 }
 
 #[no_mangle]
-pub extern "C" fn wing_console_request_node_definition(handle: *mut WingConsoleHandle, id: i32) -> c_int {
+pub extern "C" fn wing_console_request_node_definition(
+    handle: *mut WingConsoleHandle,
+    id: i32,
+) -> c_int {
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
@@ -251,7 +308,9 @@ pub extern "C" fn wing_response_get_type(handle: *const ResponseHandle) -> Respo
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_id(handle: *const ResponseHandle) -> i32 {
-    if let Some(WingResponse::NodeData(id, _)) = unsafe { response_ref(handle).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeData(id, _)) =
+        unsafe { response_ref(handle).map(|handle| &handle.response) }
+    {
         *id
     } else {
         0
@@ -260,7 +319,9 @@ pub extern "C" fn wing_node_data_get_id(handle: *const ResponseHandle) -> i32 {
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_string(handle: *const ResponseHandle) -> *mut c_char {
-    if let Some(WingResponse::NodeData(_, data)) = unsafe { response_ref(handle).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeData(_, data)) =
+        unsafe { response_ref(handle).map(|handle| &handle.response) }
+    {
         string_to_c(&data.get_string())
     } else {
         ptr::null_mut()
@@ -269,7 +330,9 @@ pub extern "C" fn wing_node_data_get_string(handle: *const ResponseHandle) -> *m
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_float(handle: *const ResponseHandle) -> c_float {
-    if let Some(WingResponse::NodeData(_, data)) = unsafe { response_ref(handle).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeData(_, data)) =
+        unsafe { response_ref(handle).map(|handle| &handle.response) }
+    {
         data.get_float()
     } else {
         0.0
@@ -278,7 +341,9 @@ pub extern "C" fn wing_node_data_get_float(handle: *const ResponseHandle) -> c_f
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_int(handle: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeData(_, data)) = unsafe { response_ref(handle).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeData(_, data)) =
+        unsafe { response_ref(handle).map(|handle| &handle.response) }
+    {
         data.get_int()
     } else {
         0
@@ -287,8 +352,14 @@ pub extern "C" fn wing_node_data_get_int(handle: *const ResponseHandle) -> c_int
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_string(handle: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeData(_, data)) = unsafe { response_ref(handle).map(|handle| &handle.response) } {
-        if data.has_string() { 1 } else { 0 }
+    if let Some(WingResponse::NodeData(_, data)) =
+        unsafe { response_ref(handle).map(|handle| &handle.response) }
+    {
+        if data.has_string() && is_c_string_compatible(&data.get_string()) {
+            1
+        } else {
+            0
+        }
     } else {
         0
     }
@@ -296,8 +367,14 @@ pub extern "C" fn wing_node_data_has_string(handle: *const ResponseHandle) -> c_
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_float(handle: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeData(_, data)) = unsafe { response_ref(handle).map(|handle| &handle.response) } {
-        if data.has_float() { 1 } else { 0 }
+    if let Some(WingResponse::NodeData(_, data)) =
+        unsafe { response_ref(handle).map(|handle| &handle.response) }
+    {
+        if data.has_float() {
+            1
+        } else {
+            0
+        }
     } else {
         0
     }
@@ -305,8 +382,14 @@ pub extern "C" fn wing_node_data_has_float(handle: *const ResponseHandle) -> c_i
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_int(handle: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeData(_, data)) = unsafe { response_ref(handle).map(|handle| &handle.response) } {
-        if data.has_int() { 1 } else { 0 }
+    if let Some(WingResponse::NodeData(_, data)) =
+        unsafe { response_ref(handle).map(|handle| &handle.response) }
+    {
+        if data.has_int() {
+            1
+        } else {
+            0
+        }
     } else {
         0
     }
@@ -321,7 +404,9 @@ pub extern "C" fn wing_name_to_id(name: *const c_char, out_id: *mut i32) -> c_in
         return 0;
     };
     if let Some(id) = WingConsole::name_to_id(name_str) {
-        unsafe { *out_id = id; }
+        unsafe {
+            *out_id = id;
+        }
         1
     } else {
         0
@@ -330,7 +415,9 @@ pub extern "C" fn wing_name_to_id(name: *const c_char, out_id: *mut i32) -> c_in
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_id(def: *const ResponseHandle) -> i32 {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         def.id
     } else {
         0
@@ -339,7 +426,9 @@ pub extern "C" fn wing_node_definition_get_id(def: *const ResponseHandle) -> i32
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_parent_id(def: *const ResponseHandle) -> i32 {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         def.parent_id
     } else {
         0
@@ -348,7 +437,9 @@ pub extern "C" fn wing_node_definition_get_parent_id(def: *const ResponseHandle)
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_index(def: *const ResponseHandle) -> u16 {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         def.index
     } else {
         0
@@ -357,7 +448,9 @@ pub extern "C" fn wing_node_definition_get_index(def: *const ResponseHandle) -> 
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_type(def: *const ResponseHandle) -> NodeType {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         def.node_type
     } else {
         NodeType::Node
@@ -366,7 +459,9 @@ pub extern "C" fn wing_node_definition_get_type(def: *const ResponseHandle) -> N
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_unit(def: *const ResponseHandle) -> NodeUnit {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         def.unit
     } else {
         NodeUnit::None
@@ -375,7 +470,9 @@ pub extern "C" fn wing_node_definition_get_unit(def: *const ResponseHandle) -> N
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_name(def: *const ResponseHandle) -> *mut c_char {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         string_to_c(&def.name)
     } else {
         ptr::null_mut()
@@ -384,7 +481,9 @@ pub extern "C" fn wing_node_definition_get_name(def: *const ResponseHandle) -> *
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_long_name(def: *const ResponseHandle) -> *mut c_char {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         string_to_c(&def.long_name)
     } else {
         ptr::null_mut()
@@ -393,21 +492,34 @@ pub extern "C" fn wing_node_definition_get_long_name(def: *const ResponseHandle)
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_is_read_only(def: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
-        if def.read_only { 1 } else { 0 }
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
+        if def.read_only {
+            1
+        } else {
+            0
+        }
     } else {
         0
     }
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_min_float(def: *const ResponseHandle, ret: *mut c_float) -> c_int {
+pub extern "C" fn wing_node_definition_get_min_float(
+    def: *const ResponseHandle,
+    ret: *mut c_float,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(min_float) = def.min_float {
-            unsafe { *ret = min_float; }
+            unsafe {
+                *ret = min_float;
+            }
             1
         } else {
             0
@@ -418,13 +530,20 @@ pub extern "C" fn wing_node_definition_get_min_float(def: *const ResponseHandle,
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_max_float(def: *const ResponseHandle, ret: *mut c_float) -> c_int {
+pub extern "C" fn wing_node_definition_get_max_float(
+    def: *const ResponseHandle,
+    ret: *mut c_float,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(max_float) = def.max_float {
-            unsafe { *ret = max_float; }
+            unsafe {
+                *ret = max_float;
+            }
             1
         } else {
             0
@@ -435,13 +554,20 @@ pub extern "C" fn wing_node_definition_get_max_float(def: *const ResponseHandle,
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_steps(def: *const ResponseHandle, ret: *mut c_int) -> c_int {
+pub extern "C" fn wing_node_definition_get_steps(
+    def: *const ResponseHandle,
+    ret: *mut c_int,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(steps) = def.steps {
-            unsafe { *ret = steps; }
+            unsafe {
+                *ret = steps;
+            }
             1
         } else {
             0
@@ -452,13 +578,20 @@ pub extern "C" fn wing_node_definition_get_steps(def: *const ResponseHandle, ret
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_min_int(def: *const ResponseHandle, ret: *mut c_int) -> c_int {
+pub extern "C" fn wing_node_definition_get_min_int(
+    def: *const ResponseHandle,
+    ret: *mut c_int,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(min_int) = def.min_int {
-            unsafe { *ret = min_int; }
+            unsafe {
+                *ret = min_int;
+            }
             1
         } else {
             0
@@ -469,13 +602,20 @@ pub extern "C" fn wing_node_definition_get_min_int(def: *const ResponseHandle, r
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_max_int(def: *const ResponseHandle, ret: *mut c_int) -> c_int {
+pub extern "C" fn wing_node_definition_get_max_int(
+    def: *const ResponseHandle,
+    ret: *mut c_int,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(max_int) = def.max_int {
-            unsafe { *ret = max_int; }
+            unsafe {
+                *ret = max_int;
+            }
             1
         } else {
             0
@@ -486,13 +626,20 @@ pub extern "C" fn wing_node_definition_get_max_int(def: *const ResponseHandle, r
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_max_string_len(def: *const ResponseHandle, ret: *mut c_int) -> c_int {
+pub extern "C" fn wing_node_definition_get_max_string_len(
+    def: *const ResponseHandle,
+    ret: *mut c_int,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(max_string_len) = def.max_string_len {
-            unsafe { *ret = max_string_len as i32; }
+            unsafe {
+                *ret = max_string_len as i32;
+            }
             1
         } else {
             0
@@ -504,8 +651,12 @@ pub extern "C" fn wing_node_definition_get_max_string_len(def: *const ResponseHa
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_string_enum_count(def: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
-        def.string_enum.as_ref().map_or(0, |string_enum| string_enum.len() as c_int)
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
+        def.string_enum
+            .as_ref()
+            .map_or(0, |string_enum| string_enum.len() as c_int)
     } else {
         0
     }
@@ -513,24 +664,36 @@ pub extern "C" fn wing_node_definition_get_string_enum_count(def: *const Respons
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_float_enum_count(def: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
-        def.float_enum.as_ref().map_or(0, |float_enum| float_enum.len() as c_int)
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
+        def.float_enum
+            .as_ref()
+            .map_or(0, |float_enum| float_enum.len() as c_int)
     } else {
         0
     }
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_float_enum_item(def: *const ResponseHandle, index: c_int, ret: *mut c_float) -> c_int {
+pub extern "C" fn wing_node_definition_get_float_enum_item(
+    def: *const ResponseHandle,
+    index: c_int,
+    ret: *mut c_float,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
     let Some(index) = usize::try_from(index).ok() else {
         return 0;
     };
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(item) = def.float_enum.as_ref().and_then(|items| items.get(index)) {
-            unsafe { *ret = item.item; }
+            unsafe {
+                *ret = item.item;
+            }
             1
         } else {
             0
@@ -541,17 +704,29 @@ pub extern "C" fn wing_node_definition_get_float_enum_item(def: *const ResponseH
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_float_enum_long_item(def: *const ResponseHandle, index: c_int, ret: *mut *mut c_char) -> c_int {
+pub extern "C" fn wing_node_definition_get_float_enum_long_item(
+    def: *const ResponseHandle,
+    index: c_int,
+    ret: *mut *mut c_char,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
     let Some(index) = usize::try_from(index).ok() else {
         return 0;
     };
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(item) = def.float_enum.as_ref().and_then(|items| items.get(index)) {
-            unsafe { *ret = string_to_c(&item.long_item); }
-            if unsafe { (*ret).is_null() } { 0 } else { 1 }
+            unsafe {
+                *ret = string_to_c(&item.long_item);
+            }
+            if unsafe { (*ret).is_null() } {
+                0
+            } else {
+                1
+            }
         } else {
             0
         }
@@ -561,17 +736,29 @@ pub extern "C" fn wing_node_definition_get_float_enum_long_item(def: *const Resp
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_string_enum_item(def: *const ResponseHandle, index: c_int, ret: *mut *mut c_char) -> c_int {
+pub extern "C" fn wing_node_definition_get_string_enum_item(
+    def: *const ResponseHandle,
+    index: c_int,
+    ret: *mut *mut c_char,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
     let Some(index) = usize::try_from(index).ok() else {
         return 0;
     };
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(item) = def.string_enum.as_ref().and_then(|items| items.get(index)) {
-            unsafe { *ret = string_to_c(&item.item); }
-            if unsafe { (*ret).is_null() } { 0 } else { 1 }
+            unsafe {
+                *ret = string_to_c(&item.item);
+            }
+            if unsafe { (*ret).is_null() } {
+                0
+            } else {
+                1
+            }
         } else {
             0
         }
@@ -580,17 +767,29 @@ pub extern "C" fn wing_node_definition_get_string_enum_item(def: *const Response
     }
 }
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_string_enum_long_item(def: *const ResponseHandle, index: c_int, ret: *mut *mut c_char) -> c_int {
+pub extern "C" fn wing_node_definition_get_string_enum_long_item(
+    def: *const ResponseHandle,
+    index: c_int,
+    ret: *mut *mut c_char,
+) -> c_int {
     if ret.is_null() {
         return 0;
     }
     let Some(index) = usize::try_from(index).ok() else {
         return 0;
     };
-    if let Some(WingResponse::NodeDef(def)) = unsafe { response_ref(def).map(|handle| &handle.response) } {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
         if let Some(item) = def.string_enum.as_ref().and_then(|items| items.get(index)) {
-            unsafe { *ret = string_to_c(&item.long_item); }
-            if unsafe { (*ret).is_null() } { 0 } else { 1 }
+            unsafe {
+                *ret = string_to_c(&item.long_item);
+            }
+            if unsafe { (*ret).is_null() } {
+                0
+            } else {
+                1
+            }
         } else {
             0
         }
@@ -600,7 +799,11 @@ pub extern "C" fn wing_node_definition_get_string_enum_long_item(def: *const Res
 }
 
 #[no_mangle]
-pub extern "C" fn wing_console_request_meter(handle: *mut WingConsoleHandle, meters: *const u16, meters_count: usize) -> u16 {
+pub extern "C" fn wing_console_request_meter(
+    handle: *mut WingConsoleHandle,
+    meters: *const u16,
+    meters_count: usize,
+) -> u16 {
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return 0;
     };
@@ -614,8 +817,9 @@ pub extern "C" fn wing_console_request_meter(handle: *mut WingConsoleHandle, met
         unsafe { std::slice::from_raw_parts(meters, meters_count) }
     };
 
-    let Some(meters) = meter_ids.iter().map(|m|
-        match m & 0xff00 {
+    let Some(meters) = meter_ids
+        .iter()
+        .map(|m| match m & 0xff00 {
             0xa000 => Some(Meter::Channel((m & 0xff) as u8)),
             0xa100 => Some(Meter::Aux((m & 0xff) as u8)),
             0xa200 => Some(Meter::Bus((m & 0xff) as u8)),
@@ -633,8 +837,9 @@ pub extern "C" fn wing_console_request_meter(handle: *mut WingConsoleHandle, met
             0xae00 => Some(Meter::Main2((m & 0xff) as u8)),
             0xaf00 => Some(Meter::Matrix2((m & 0xff) as u8)),
             _ => None,
-        }
-    ).collect::<Option<Vec<_>>>() else {
+        })
+        .collect::<Option<Vec<_>>>()
+    else {
         return 0;
     };
 
@@ -643,7 +848,32 @@ pub extern "C" fn wing_console_request_meter(handle: *mut WingConsoleHandle, met
 }
 
 #[no_mangle]
-pub extern "C" fn wing_console_read_meter(handle: *mut WingConsoleHandle, ret_id: *mut u16, ret_data: *mut i16, ret_data_capacity: usize) -> c_int {
+pub extern "C" fn wing_console_read_meter(
+    handle: *mut WingConsoleHandle,
+    ret_id: *mut u16,
+    ret_data: *mut i16,
+    ret_data_capacity: usize,
+) -> c_int {
+    wing_console_read_meter_into(handle, ret_id, ret_data, ret_data_capacity, true)
+}
+
+#[no_mangle]
+pub extern "C" fn wing_console_read_meter_bounded(
+    handle: *mut WingConsoleHandle,
+    ret_id: *mut u16,
+    ret_data: *mut i16,
+    ret_data_capacity: usize,
+) -> c_int {
+    wing_console_read_meter_into(handle, ret_id, ret_data, ret_data_capacity, false)
+}
+
+fn wing_console_read_meter_into(
+    handle: *mut WingConsoleHandle,
+    ret_id: *mut u16,
+    ret_data: *mut i16,
+    ret_data_capacity: usize,
+    write_id_on_capacity_failure: bool,
+) -> c_int {
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
@@ -652,15 +882,221 @@ pub extern "C" fn wing_console_read_meter(handle: *mut WingConsoleHandle, ret_id
     }
     let mut console = handle.console.clone();
     if let Ok((id, data)) = console.read_meters() {
-        unsafe { *ret_id = id; }
         if data.len() > ret_data_capacity {
+            if write_id_on_capacity_failure {
+                unsafe {
+                    *ret_id = id;
+                }
+            }
             return -2;
         }
+        unsafe {
+            *ret_id = id;
+        }
         if !data.is_empty() {
-            unsafe { ptr::copy_nonoverlapping(data.as_ptr(), ret_data, data.len()); }
+            unsafe {
+                ptr::copy_nonoverlapping(data.as_ptr(), ret_data, data.len());
+            }
         }
         data.len() as c_int
     } else {
         -1
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::WingNodeData;
+    use std::net::{SocketAddr, UdpSocket};
+
+    fn meter_handle() -> (UdpSocket, SocketAddr, WingConsoleHandle) {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(std::time::Duration::from_millis(100)))
+            .unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_ip = sender.local_addr().unwrap().ip();
+        let console = WingConsole::test_with_meter_socket(peer_ip, receiver);
+        (sender, receiver_addr, WingConsoleHandle { console })
+    }
+
+    #[test]
+    fn string_presence_matches_c_getter_for_embedded_nul() {
+        let response = ResponseHandle {
+            response: WingResponse::NodeData(1, WingNodeData::with_string("a\0b".to_string())),
+        };
+
+        assert_eq!(wing_node_data_has_string(&response), 0);
+        assert!(wing_node_data_get_string(&response).is_null());
+    }
+
+    #[test]
+    fn string_getter_out_params_reject_null_and_bad_index() {
+        assert_eq!(
+            wing_node_definition_get_string_enum_item(ptr::null(), 0, ptr::null_mut()),
+            0
+        );
+
+        let response = ResponseHandle {
+            response: WingResponse::NodeDef(crate::WingNodeDef {
+                id: 1,
+                parent_id: 0,
+                index: 0,
+                name: String::new(),
+                long_name: String::new(),
+                node_type: NodeType::StringEnum,
+                unit: NodeUnit::None,
+                read_only: false,
+                min_float: None,
+                max_float: None,
+                steps: None,
+                min_int: None,
+                max_int: None,
+                max_string_len: None,
+                string_enum: Some(vec![crate::node::StringEnumItem {
+                    item: "short".to_string(),
+                    long_item: "Long".to_string(),
+                }]),
+                float_enum: None,
+                raw: Vec::new(),
+            }),
+        };
+        let mut out: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            wing_node_definition_get_string_enum_item(&response, -1, &mut out),
+            0
+        );
+        assert!(out.is_null());
+        assert_eq!(
+            wing_node_definition_get_string_enum_item(&response, 0, &mut out),
+            1
+        );
+        assert!(!out.is_null());
+        wing_string_destroy(out);
+    }
+
+    #[test]
+    fn bounded_meter_read_reports_capacity_failure_without_copying() {
+        let (sender, receiver_addr, mut handle) = meter_handle();
+
+        sender
+            .send_to(&[0x12, 0x34, 0, 0, 0, 1, 0, 2], receiver_addr)
+            .unwrap();
+
+        let mut id = 0xbeef;
+        let mut data = [123_i16; 1];
+        assert_eq!(
+            wing_console_read_meter_bounded(&mut handle, &mut id, data.as_mut_ptr(), data.len()),
+            -2
+        );
+        assert_eq!(id, 0xbeef);
+        assert_eq!(data, [123]);
+    }
+
+    #[test]
+    fn legacy_meter_read_keeps_id_on_capacity_failure() {
+        let (sender, receiver_addr, mut handle) = meter_handle();
+
+        sender
+            .send_to(&[0x12, 0x34, 0, 0, 0, 1, 0, 2], receiver_addr)
+            .unwrap();
+
+        let mut id = 0xbeef;
+        let mut data = [123_i16; 1];
+        assert_eq!(
+            wing_console_read_meter(&mut handle, &mut id, data.as_mut_ptr(), data.len()),
+            -2
+        );
+        assert_eq!(id, 0x1234);
+        assert_eq!(data, [123]);
+    }
+
+    #[test]
+    fn meter_read_rejects_null_outputs() {
+        let (_, _, mut handle) = meter_handle();
+        let mut id = 0;
+        let mut data = [0_i16; 1];
+
+        assert_eq!(
+            wing_console_read_meter_bounded(
+                &mut handle,
+                ptr::null_mut(),
+                data.as_mut_ptr(),
+                data.len()
+            ),
+            -1
+        );
+        assert_eq!(
+            wing_console_read_meter_bounded(&mut handle, &mut id, ptr::null_mut(), data.len()),
+            -1
+        );
+    }
+
+    #[test]
+    fn bounded_meter_read_allows_null_data_for_zero_capacity() {
+        let (sender, receiver_addr, mut handle) = meter_handle();
+
+        sender
+            .send_to(&[0x12, 0x34, 0, 0, 0, 1, 0, 2], receiver_addr)
+            .unwrap();
+
+        let mut id = 0xbeef;
+        assert_eq!(
+            wing_console_read_meter_bounded(&mut handle, &mut id, ptr::null_mut(), 0),
+            -2
+        );
+        assert_eq!(id, 0xbeef);
+    }
+
+    #[test]
+    fn bounded_meter_read_allows_null_data_for_empty_packet() {
+        let (sender, receiver_addr, mut handle) = meter_handle();
+
+        sender.send_to(&[0x12, 0x34, 0, 0], receiver_addr).unwrap();
+
+        let mut id = 0;
+        assert_eq!(
+            wing_console_read_meter_bounded(&mut handle, &mut id, ptr::null_mut(), 0),
+            0
+        );
+        assert_eq!(id, 0x1234);
+    }
+
+    #[test]
+    fn meter_read_copies_samples_on_success() {
+        let (sender, receiver_addr, mut handle) = meter_handle();
+
+        sender
+            .send_to(&[0x12, 0x34, 0, 0, 0, 1, 0, 2], receiver_addr)
+            .unwrap();
+
+        let mut id = 0;
+        let mut data = [0_i16; 2];
+        assert_eq!(
+            wing_console_read_meter(&mut handle, &mut id, data.as_mut_ptr(), data.len()),
+            2
+        );
+        assert_eq!(id, 0x1234);
+        assert_eq!(data, [1, 2]);
+    }
+
+    #[test]
+    fn bounded_meter_read_copies_samples_on_success() {
+        let (sender, receiver_addr, mut handle) = meter_handle();
+
+        sender
+            .send_to(&[0x12, 0x34, 0, 0, 0, 1, 0, 2], receiver_addr)
+            .unwrap();
+
+        let mut id = 0;
+        let mut data = [0_i16; 2];
+        assert_eq!(
+            wing_console_read_meter_bounded(&mut handle, &mut id, data.as_mut_ptr(), data.len()),
+            2
+        );
+        assert_eq!(id, 0x1234);
+        assert_eq!(data, [1, 2]);
     }
 }
