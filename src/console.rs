@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -85,6 +85,63 @@ pub struct Meters {
     pub port: u16,
 }
 
+/// Bounded-backoff policy for [`WingConsole::reconnect`] (R2).
+///
+/// Each failed attempt sleeps `initial_backoff * 2^n` (capped at `max_backoff`) before the
+/// next, so an unreachable console produces bounded backoff instead of a busy loop. After
+/// `max_attempts` failures, `reconnect` returns the last connection error.
+#[derive(Clone, Debug)]
+pub struct ReconnectPolicy {
+    pub max_attempts: u32,
+    pub initial_backoff: Duration,
+    pub max_backoff: Duration,
+}
+
+impl Default for ReconnectPolicy {
+    /// 5 attempts, starting at 250ms and doubling up to a 5s cap.
+    fn default() -> Self {
+        Self {
+            max_attempts: 5,
+            initial_backoff: Duration::from_millis(250),
+            max_backoff: Duration::from_secs(5),
+        }
+    }
+}
+
+/// What a caller must assume was lost across a [`WingConsole::reconnect`] (R42).
+///
+/// The WING wire protocol has no session resumption: a reconnect is a brand-new TCP session,
+/// not a continuation of the old one. This struct is the "surface partial state rather than
+/// hiding it" contract -- each field documents the action a consumer should take.
+#[derive(Clone, Debug)]
+pub struct SessionGap {
+    /// Always `true`: any unsolicited `NodeData`/`NodeDef` the console sent between the
+    /// disconnect and the reconnect is gone -- there's no buffering or replay on the wire.
+    /// Consumers that mirror console state should treat their mirror as stale and re-request
+    /// (`get_node_data`/`get_node_definition`/`request_node_data`) whatever they still need.
+    pub dropped_events: bool,
+    /// `true` iff a meter subscription ([`request_meter`](WingConsole::request_meter)) existed
+    /// before the reconnect. The UDP meter socket itself is untouched and still usable, but the
+    /// *subscription* lived on the console side of the old TCP session and is gone with it --
+    /// the server has forgotten it. Consumers must call `request_meter` again to resume
+    /// metering.
+    pub meters_invalidated: bool,
+    /// Always `true`: the console may have changed (another controller, or the hardware
+    /// itself) while this session was down. Consumers that track node values should re-sync
+    /// via `get_node_data`/`request_node_data` for the nodes they mirror rather than assume
+    /// their cached values are still current.
+    pub state_may_have_changed: bool,
+}
+
+/// Result of a successful [`WingConsole::reconnect`].
+#[derive(Clone, Debug)]
+pub struct ReconnectOutcome {
+    /// Number of connection attempts made, including the one that succeeded (1-based).
+    pub attempts: u32,
+    /// What the caller lost / must re-sync across the gap (R42).
+    pub gap: SessionGap,
+}
+
 struct _WingConsoleMain {
     keep_alive_timer: std::time::Instant,
     rx_buf: [u8; RX_BUFFER_SIZE],
@@ -107,6 +164,27 @@ struct _WingConsoleMeters {
     keep_alive_meters_timer: std::time::Instant,
 }
 
+/// Handle to a connected (or test-constructed) Wing console. Cheap to `Clone`: clones share
+/// the same underlying transports and state via `Arc<Mutex<_>>`, so e.g. a meter-reading loop
+/// can hold its own clone of the same session independently of the node-data reader.
+///
+/// ## Keepalive ownership (R44)
+///
+/// The WING protocol tears down each socket after a short idle period, so *something* has to
+/// keep writing to it even when the caller has nothing new to say:
+///
+/// - **Data keepalive** (7s cadence) is fully automatic: every [`read`](Self::read) call
+///   checks the timer and re-arms it internally. A caller driving `read()` in a loop (the
+///   normal usage pattern) never needs to think about this.
+/// - **Meter keepalive** (3s cadence) is automatic *only while the caller is actively driving
+///   the meter path*: [`read_meters`](Self::read_meters) and [`request_meter`](Self::request_meter)
+///   both check and re-arm it internally. A caller that calls `request_meter` once and then
+///   stops calling `read_meters` (e.g. a paused meter UI) lets the subscription lapse
+///   server-side, since nothing is re-arming the timer on its behalf.
+/// - Both have a public escape hatch -- [`keep_alive`](Self::keep_alive) and
+///   [`keep_alive_meters`](Self::keep_alive_meters) -- for callers who own a loop that isn't
+///   `read()`/`read_meters()` itself (e.g. a UI thread idling with no pending requests) and
+///   still need to keep the respective socket alive on their own cadence.
 #[derive(Clone)]
 pub struct WingConsole {
     rsock: Arc<Mutex<Box<dyn Transport>>>,
@@ -114,6 +192,15 @@ pub struct WingConsole {
     main: Arc<Mutex<_WingConsoleMain>>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
     peer_ip: IpAddr,
+    /// The peer's TCP port, so [`reconnect`](Self::reconnect) can target the same endpoint
+    /// without re-resolving a hostname (`connect` always used 2222; `connect_addr` may not
+    /// have). Unused (and meaningless) on a [`from_transports`](Self::from_transports)
+    /// console, which never reconnects.
+    peer_port: u16,
+    /// `true` for consoles backed by a real TCP connection ([`connect`](Self::connect) /
+    /// [`connect_addr`](Self::connect_addr)); `false` for [`from_transports`](Self::from_transports)
+    /// consoles (tests/replay), which have no real peer to reconnect to.
+    reconnectable: bool,
     firmware: Arc<Mutex<Option<String>>>,
 }
 
@@ -182,19 +269,7 @@ impl WingConsole {
 
         let mut last_connect_error = None;
         for addr in (ip.as_str(), 2222).to_socket_addrs()? {
-            let attempt =
-                TcpStream::connect_timeout(&addr, Duration::from_secs(5)).and_then(|mut stream| {
-                    // stream.set_nonblocking(true)?;
-                    stream.set_nodelay(true)?;
-                    // Bound writes: without a write timeout, write_all() can block forever if the
-                    // peer's receive window stays full (dead/stalled console), permanently hanging
-                    // any thread that sends a command or keep-alive.
-                    stream.set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT_SECONDS)))?;
-                    stream.write_all(&[0xdf, 0xd1])?;
-                    let wsock = stream.try_clone()?;
-                    Ok(Self::from_streams(wsock, stream, addr.ip()))
-                });
-            match attempt {
+            match Self::handshake(addr) {
                 Ok(console) => {
                     let firmware = firmware_hint
                         .clone()
@@ -207,10 +282,43 @@ impl WingConsole {
         }
 
         if let Some(err) = last_connect_error {
-            Err(err.into())
+            Err(err)
         } else {
             Err(Error::ConnectionError)
         }
+    }
+
+    /// Connects directly to `addr` instead of resolving a hostname/discovery IP against the
+    /// default WING port (2222). Useful for consoles reached through port forwarding or on a
+    /// non-standard port. Performs the same handshake and best-effort firmware probe as
+    /// [`connect`](Self::connect) (there's no discovery reply to reuse here, so firmware is
+    /// always probed).
+    pub fn connect_addr(addr: SocketAddr) -> Result<Self> {
+        let console = Self::handshake(addr)?;
+        *console.firmware.lock().unwrap() = Self::probe_firmware(addr.ip());
+        Ok(console)
+    }
+
+    /// TCP connect + Wing handshake (nodelay, write timeout, initial `0xdf 0xd1` probe) against
+    /// a single resolved address, returning the raw duplex streams. Shared by
+    /// [`connect`](Self::connect), [`connect_addr`](Self::connect_addr), and
+    /// [`reconnect`](Self::reconnect) so this logic lives in exactly one place.
+    fn handshake_streams(addr: SocketAddr) -> Result<(TcpStream, TcpStream)> {
+        let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
+        // stream.set_nonblocking(true)?;
+        stream.set_nodelay(true)?;
+        // Bound writes: without a write timeout, write_all() can block forever if the
+        // peer's receive window stays full (dead/stalled console), permanently hanging
+        // any thread that sends a command or keep-alive.
+        stream.set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT_SECONDS)))?;
+        stream.write_all(&[0xdf, 0xd1])?;
+        let wsock = stream.try_clone()?;
+        Ok((wsock, stream))
+    }
+
+    fn handshake(addr: SocketAddr) -> Result<Self> {
+        let (wsock, rsock) = Self::handshake_streams(addr)?;
+        Ok(Self::from_streams(wsock, rsock, addr.ip(), addr.port()))
     }
 
     /// Best-effort unicast firmware probe used by `connect()` when connecting
@@ -249,24 +357,33 @@ impl WingConsole {
         self.firmware.lock().unwrap().clone()
     }
 
-    fn from_streams(wsock: TcpStream, rsock: TcpStream, peer_ip: IpAddr) -> Self {
-        Self::from_boxed(Box::new(wsock), Box::new(rsock), peer_ip)
+    fn from_streams(wsock: TcpStream, rsock: TcpStream, peer_ip: IpAddr, peer_port: u16) -> Self {
+        Self::from_boxed(Box::new(wsock), Box::new(rsock), peer_ip, peer_port, true)
     }
 
     /// Construct a [`WingConsole`] over arbitrary reader/writer transports instead of a
     /// live TCP connection to a physical console.
     ///
     /// This is the replay/testing entry point (the record-replay fixture harness builds
-    /// on it) -- normal use should go through [`connect`](Self::connect).
+    /// on it) -- normal use should go through [`connect`](Self::connect). Because there's no
+    /// real peer behind these transports, [`reconnect`](Self::reconnect) always fails with
+    /// `Error::InvalidInput` on a console built this way; tests exercising reconnect should
+    /// use a real (localhost) TCP socket via [`connect_addr`](Self::connect_addr) instead.
     pub fn from_transports(
         reader: impl Transport + 'static,
         writer: impl Transport + 'static,
         peer_ip: IpAddr,
     ) -> Self {
-        Self::from_boxed(Box::new(writer), Box::new(reader), peer_ip)
+        Self::from_boxed(Box::new(writer), Box::new(reader), peer_ip, 0, false)
     }
 
-    fn from_boxed(wsock: Box<dyn Transport>, rsock: Box<dyn Transport>, peer_ip: IpAddr) -> Self {
+    fn from_boxed(
+        wsock: Box<dyn Transport>,
+        rsock: Box<dyn Transport>,
+        peer_ip: IpAddr,
+        peer_port: u16,
+        reconnectable: bool,
+    ) -> Self {
         Self {
             wsock: Arc::new(Mutex::new(wsock)),
             rsock: Arc::new(Mutex::new(rsock)),
@@ -289,8 +406,72 @@ impl WingConsole {
                 next_meter_id: 0,
             })),
             peer_ip,
+            peer_port,
+            reconnectable,
             firmware: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Re-establishes the TCP session to the same peer this console was originally connected
+    /// to ([`connect`](Self::connect) or [`connect_addr`](Self::connect_addr)), with bounded
+    /// exponential backoff between attempts (R2).
+    ///
+    /// The new streams are swapped into this console's transports **in place**, so clones of
+    /// this `WingConsole` (e.g. a meter-reading loop on another thread) keep working without
+    /// needing to be re-obtained. Buffered receive state (partial frame, escape flag, current
+    /// node id) is reset -- a fresh TCP session has no partial frame to resume.
+    ///
+    /// The meter UDP socket, if any, is left untouched: it's a client-side socket and still
+    /// usable. But the meter *subscription* lived server-side on the old session and is gone
+    /// with it; see [`SessionGap::meters_invalidated`] -- callers must call
+    /// [`request_meter`](Self::request_meter) again to resume metering.
+    ///
+    /// Returns `Err(Error::InvalidInput)` immediately for a console built via
+    /// [`from_transports`](Self::from_transports) -- there's no real peer to reconnect to.
+    pub fn reconnect(&mut self, policy: &ReconnectPolicy) -> Result<ReconnectOutcome> {
+        if !self.reconnectable {
+            return Err(Error::InvalidInput);
+        }
+        let addr = SocketAddr::new(self.peer_ip, self.peer_port);
+        let mut backoff = policy.initial_backoff;
+        let mut last_err = Error::ConnectionError;
+        for attempt in 1..=policy.max_attempts {
+            match Self::handshake_streams(addr) {
+                Ok((wsock, rsock)) => {
+                    *self.wsock.lock().unwrap() = Box::new(wsock);
+                    *self.rsock.lock().unwrap() = Box::new(rsock);
+                    {
+                        let mut main = self.main.lock().unwrap();
+                        main.rx_buf_tail = 0;
+                        main.rx_buf_size = 0;
+                        main.rx_esc = false;
+                        main.rx_current_channel = -1;
+                        main.rx_has_in_pipe = None;
+                        main.current_node_id = 0;
+                        main.op_deadline = None;
+                        main.keep_alive_timer =
+                            Instant::now() + Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
+                    }
+                    let meters_invalidated = self.mtrs.lock().unwrap().meters.is_some();
+                    return Ok(ReconnectOutcome {
+                        attempts: attempt,
+                        gap: SessionGap {
+                            dropped_events: true,
+                            meters_invalidated,
+                            state_may_have_changed: true,
+                        },
+                    });
+                }
+                Err(err) => {
+                    last_err = err;
+                    if attempt < policy.max_attempts {
+                        std::thread::sleep(backoff);
+                        backoff = backoff.saturating_mul(2).min(policy.max_backoff);
+                    }
+                }
+            }
+        }
+        Err(last_err)
     }
 
     pub fn read(&mut self) -> Result<WingResponse> {
@@ -988,7 +1169,7 @@ impl WingConsole {
         let client = TcpStream::connect(addr).unwrap();
         let (server, _) = listener.accept().unwrap();
         let port = socket.local_addr().unwrap().port();
-        let console = Self::from_streams(client.try_clone().unwrap(), client, peer_ip);
+        let console = Self::from_streams(client.try_clone().unwrap(), client, peer_ip, addr.port());
 
         {
             let mut meters = console.mtrs.lock().unwrap();
@@ -1041,7 +1222,12 @@ mod tests {
         let client = TcpStream::connect(addr).unwrap();
         let (mut server, peer_addr) = listener.accept().unwrap();
         server.write_all(input).unwrap();
-        WingConsole::from_streams(client.try_clone().unwrap(), client, peer_addr.ip())
+        WingConsole::from_streams(
+            client.try_clone().unwrap(),
+            client,
+            peer_addr.ip(),
+            peer_addr.port(),
+        )
     }
 
     fn plain_node_definition_bytes() -> Vec<u8> {
@@ -1134,5 +1320,36 @@ mod tests {
             wing.read_meters(),
             Err(Error::MeterNotInitialized)
         ));
+    }
+
+    /// R43: a meter (UDP) socket failure must not tear down parameter (TCP) control, and vice
+    /// versa. `test_with_meter_socket` already tears down the TCP server half before handing
+    /// back the console, so the console's `read()` fails immediately -- proving the meter path
+    /// (a real, independent UDP socket pair) keeps delivering frames regardless.
+    #[test]
+    fn read_meters_keeps_working_after_tcp_transport_errors() {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        receiver
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_ip = sender.local_addr().unwrap().ip();
+
+        let mut console = WingConsole::test_with_meter_socket(peer_ip, receiver);
+
+        // TCP side is already gone (server half dropped inside test_with_meter_socket).
+        assert!(console.read().is_err());
+
+        // token (u16) + 2 reserved bytes + one i16 sample, matching read_meters' framing.
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&1u16.to_be_bytes());
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        frame.extend_from_slice(&(-6i16).to_be_bytes());
+        sender.send_to(&frame, receiver_addr).unwrap();
+
+        let (token, values) = console.read_meters().unwrap();
+        assert_eq!(token, 1);
+        assert_eq!(values, vec![-6]);
     }
 }
