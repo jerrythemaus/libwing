@@ -1,7 +1,9 @@
-//! OSC-over-UDP transport (U10: R3) -- a sibling to the Native (TCP) transport in
-//! `console.rs`, not a replacement for it. WING runs both protocols side by side:
-//! Native on TCP port 2222 (see [`crate::WingConsole`]), OSC on UDP port 2223. This
-//! module only speaks the latter.
+//! OSC-over-UDP transport (U10: R3; subscriptions/robustness/availability U11: R4, R6,
+//! R75) -- a sibling to the Native (TCP) transport in `console.rs`, not a replacement
+//! for it. WING runs both protocols side by side: Native on TCP port 2222 (see
+//! [`crate::WingConsole`]), OSC on UDP port 2223. This module only speaks the latter.
+//! For which operations each transport can perform, see
+//! [`crate::schema::transport_availability`] (R6).
 //!
 //! Reference: `references/WING_Remote_Protocols_V3.1-03.md`, "WING OSC protocol data
 //! interface" chapter (pages 19-30). Byte-exact golden vectors quoted in doc comments
@@ -12,10 +14,15 @@
 //! - [`OscMessage`] / [`OscArg`] / [`encode`] / [`decode`]: a pure, offline-testable
 //!   OSC 1.0 codec (no bundles, per WING's implementation). No I/O.
 //! - Request builders ([`get_param`], [`set_float`], [`toggle`], [`node_set_local`],
-//!   ...): construct an [`OscMessage`] for a specific WING operation.
-//! - Reply parsers ([`parse_param_reply`], [`parse_node_ack`], [`parse_node_dump`],
-//!   [`parse_console_info`]): decode a received [`OscMessage`] into a typed result.
-//! - [`WingOscClient`]: the thin UDP transport tying the above together.
+//!   [`subscribe`], ...): construct an [`OscMessage`] for a specific WING operation.
+//! - Reply/event parsers ([`parse_param_reply`], [`parse_node_ack`], [`parse_node_dump`],
+//!   [`parse_console_info`]): decode a received [`OscMessage`] into a typed result;
+//!   [`OscEvent`] classifies subscription traffic specifically.
+//! - [`WingOscClient`]: the UDP transport tying the above together -- get/set
+//!   ([`request`](WingOscClient::request)), subscriptions
+//!   ([`subscribe`](WingOscClient::subscribe), [`poll_event`](WingOscClient::poll_event)),
+//!   and robustness ([`request_with_policy`](WingOscClient::request_with_policy),
+//!   [`take_unsolicited`](WingOscClient::take_unsolicited)).
 //!
 //! ## Value facets (R14)
 //!
@@ -33,6 +40,7 @@
 //! root-level exports or read confusingly next to them. Call sites use `osc::get_param(..)`,
 //! `osc::WingOscClient`, etc.
 
+use std::cell::RefCell;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
@@ -46,6 +54,15 @@ pub const OSC_PORT: u16 = 2223;
 /// OSC over UDP is capped at 32 KB per the OSC spec and WING's own implementation
 /// (page 19: "The maximum UDP packet size is 32k bytes.").
 pub const MAX_PACKET_BYTES: usize = 32 * 1024;
+
+/// How long the console keeps an OSC subscription alive without a renewal (page 30:
+/// "Subscriptions must be kept alive; they automatically die after 10 seconds.").
+pub const SUBSCRIPTION_EXPIRY: Duration = Duration::from_secs(10);
+
+/// Default renewal cadence [`WingOscClient::subscribe`] uses: comfortably inside
+/// [`SUBSCRIPTION_EXPIRY`] so a caller polling at a normal rate never brushes the real
+/// 10-second deadline.
+pub const SUBSCRIPTION_RENEW_MARGIN: Duration = Duration::from_secs(5);
 
 /// `#[non_exhaustive]` (R21) for the same reason as [`crate::Error`]: new failure modes
 /// may be added without that being a breaking change for callers matching with a
@@ -70,6 +87,11 @@ pub enum OscError {
     /// (page 23) instead of `OK`.
     #[error("console rejected the node command: {0:?}")]
     Node(OscNodeError),
+    /// [`WingOscClient::request_with_policy`] made every attempt [`RequestPolicy`]
+    /// allowed and none got a reply (R75). Carries the attempt count so callers/tests
+    /// can observe that retries actually happened, not just that it eventually failed.
+    #[error("operation timed out waiting for a reply after {attempts} attempt(s)")]
+    RetriesExhausted { attempts: u32 },
 }
 
 /// Convenience alias for this module's `Result<T, OscError>`.
@@ -270,47 +292,71 @@ pub fn decode(bytes: &[u8]) -> Result<OscMessage> {
 // Request builders
 // ---------------------------------------------------------------------------
 
+/// Rejects `path` if it contains an OSC-reserved address-pattern character (page 19:
+/// "wildcards '?' and '*' in Address Patterns are reserved for special cases") or one of
+/// the other OSC 1.0 pattern metacharacters (`[`, `]`, `{`, `}`, `,`, space) that a
+/// literal WING node path should never contain. Applied by every builder below that
+/// takes a caller-supplied path as the message *address*.
+///
+/// The two deliberate non-literal address forms WING documents are built without going
+/// through this validator, so they're unaffected: [`get_param_by_id`] constructs `/#..`
+/// directly from a hash id (never free-form text), and [`with_reply_port`] only prepends
+/// `/%<port>` to an address some other builder already validated.
+fn validate_address_path(path: &str) -> Result<()> {
+    if path.contains(['*', '?', '[', ']', '{', '}', ',', ' ']) {
+        return Err(OscError::Malformed(
+            "address path contains an OSC-reserved wildcard/pattern character",
+        ));
+    }
+    Ok(())
+}
+
 /// GET a single parameter or node by its path (page 20-21), e.g. `/ch/1/fdr`.
-pub fn get_param(path: &str) -> OscMessage {
-    OscMessage::new(path, vec![])
+pub fn get_param(path: &str) -> Result<OscMessage> {
+    validate_address_path(path)?;
+    Ok(OscMessage::new(path, vec![]))
 }
 
 /// GET a single parameter or node by its native hash id instead of its path (page 21):
-/// `/#f50f69f8` for id `0xf50f69f8`.
+/// `/#f50f69f8` for id `0xf50f69f8`. Always valid -- the address is synthesized from the
+/// id, never free-form text, so there's nothing for [`validate_address_path`] to reject.
 pub fn get_param_by_id(id: i32) -> OscMessage {
     OscMessage::new(format!("/#{:08x}", id as u32), vec![])
 }
 
 /// SET a parameter by sending a string value; WING converts it to the parameter's
 /// actual wire type (page 22).
-pub fn set_string(path: &str, value: &str) -> OscMessage {
-    OscMessage::new(path, vec![OscArg::Str(value.to_string())])
+pub fn set_string(path: &str, value: &str) -> Result<OscMessage> {
+    validate_address_path(path)?;
+    Ok(OscMessage::new(path, vec![OscArg::Str(value.to_string())]))
 }
 
 /// SET a parameter by sending a float32 value (page 22).
-pub fn set_float(path: &str, value: f32) -> OscMessage {
-    OscMessage::new(path, vec![OscArg::Float(value)])
+pub fn set_float(path: &str, value: f32) -> Result<OscMessage> {
+    validate_address_path(path)?;
+    Ok(OscMessage::new(path, vec![OscArg::Float(value)]))
 }
 
 /// SET a parameter by sending an int32 value (page 22).
-pub fn set_int(path: &str, value: i32) -> OscMessage {
-    OscMessage::new(path, vec![OscArg::Int(value)])
+pub fn set_int(path: &str, value: i32) -> Result<OscMessage> {
+    validate_address_path(path)?;
+    Ok(OscMessage::new(path, vec![OscArg::Int(value)]))
 }
 
 /// Toggles a 0/1 int parameter (page 22): sending `-1` to an int-typed 0/1 parameter
 /// flips it, saving a read-before-write round-trip.
-pub fn toggle(path: &str) -> OscMessage {
+pub fn toggle(path: &str) -> Result<OscMessage> {
     set_int(path, -1)
 }
 
 /// SET a `StringEnum` parameter by its item name (page 22), e.g. `mode` -> `"FX"`.
-pub fn set_enum_by_name(path: &str, name: &str) -> OscMessage {
+pub fn set_enum_by_name(path: &str, name: &str) -> Result<OscMessage> {
     set_string(path, name)
 }
 
 /// SET an enum parameter by its position in the item list (page 23), e.g. `mode` ->
 /// index `6` (== `"FX"` in that def's list).
-pub fn set_enum_by_index(path: &str, index: i32) -> OscMessage {
+pub fn set_enum_by_index(path: &str, index: i32) -> Result<OscMessage> {
     set_int(path, index)
 }
 
@@ -327,8 +373,12 @@ fn format_node_pairs(pairs: &[(&str, &str)]) -> String {
 /// SET multiple parameters under one node in a single request (page 24), e.g.
 /// `node_path = "/ch/1"`, `pairs = [("fdr", "4"), ("mute", "1")]` sends
 /// `fdr=4,mute=1`. The console acks on `<node_path>*` (see [`parse_node_ack`]).
-pub fn node_set_local(node_path: &str, pairs: &[(&str, &str)]) -> OscMessage {
-    OscMessage::new(node_path, vec![OscArg::Str(format_node_pairs(pairs))])
+pub fn node_set_local(node_path: &str, pairs: &[(&str, &str)]) -> Result<OscMessage> {
+    validate_address_path(node_path)?;
+    Ok(OscMessage::new(
+        node_path,
+        vec![OscArg::Str(format_node_pairs(pairs))],
+    ))
 }
 
 /// SET across multiple nodes from the root in a single request (page 23-24). `payload`
@@ -347,20 +397,32 @@ pub fn node_set_root(payload: &str) -> OscMessage {
 
 /// Node introspection: full data dump (`*` argument, page 24) -- the same content a
 /// snap file would save; read-only/temporary data is excluded.
-pub fn node_dump(node_path: &str) -> OscMessage {
-    OscMessage::new(node_path, vec![OscArg::Str("*".to_string())])
+pub fn node_dump(node_path: &str) -> Result<OscMessage> {
+    validate_address_path(node_path)?;
+    Ok(OscMessage::new(
+        node_path,
+        vec![OscArg::Str("*".to_string())],
+    ))
 }
 
 /// Node introspection: parameter description without current values (`?` argument,
 /// page 24).
-pub fn node_describe(node_path: &str) -> OscMessage {
-    OscMessage::new(node_path, vec![OscArg::Str("?".to_string())])
+pub fn node_describe(node_path: &str) -> Result<OscMessage> {
+    validate_address_path(node_path)?;
+    Ok(OscMessage::new(
+        node_path,
+        vec![OscArg::Str("?".to_string())],
+    ))
 }
 
 /// Node introspection: parameter description including current values (`#` argument,
 /// page 25).
-pub fn node_describe_with_values(node_path: &str) -> OscMessage {
-    OscMessage::new(node_path, vec![OscArg::Str("#".to_string())])
+pub fn node_describe_with_values(node_path: &str) -> Result<OscMessage> {
+    validate_address_path(node_path)?;
+    Ok(OscMessage::new(
+        node_path,
+        vec![OscArg::Str("#".to_string())],
+    ))
 }
 
 /// Console identification (page 20): replies `,s` with
@@ -374,6 +436,50 @@ pub fn console_info() -> OscMessage {
 /// command can be wrapped this way.
 pub fn with_reply_port(port: u16, msg: OscMessage) -> OscMessage {
     OscMessage::new(format!("/%{port}{}", msg.addr), msg.args)
+}
+
+// ---------------------------------------------------------------------------
+// Subscriptions (R4)
+// ---------------------------------------------------------------------------
+
+/// The three OSC event-subscription formats (page 30). **Only one is active
+/// console-wide at any time**, granted to whichever client last (re)subscribed -- see
+/// [`WingOscClient::subscribe`] for the full takeover story.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SubscriptionFormat {
+    /// `/*b`: event-driven native-binary messages. Delivered as a `,b` blob on the
+    /// constant address `/`; the payload is exactly the native/binary-interface wire
+    /// format (see [`crate::console`]) and can be sent back to the console verbatim.
+    Binary,
+    /// `/*s`: OSC "triplet" events, addressed by the parameter's own path, using the
+    /// same `,s` (string/enum) / `,sff` (float) / `,sfi` (int) shapes as a plain
+    /// get/set reply (see [`parse_param_reply`]). `$`-prefixed sibling paths (e.g.
+    /// `/ch/1/$fdr`, the 0.0..1.0-normalized twin of `/ch/1/fdr`) stream alongside the
+    /// plain path.
+    OscTriplet,
+    /// `/*S`: OSC "single-tag" events, addressed by the parameter's own path, reporting
+    /// just its native wire type (`,f` or `,i`) with no display/raw facet -- see
+    /// [`ParamFacets::NativeFloat`]/[`ParamFacets::NativeInt`]. Re-sendable to the
+    /// console verbatim.
+    OscNative,
+}
+
+impl SubscriptionFormat {
+    fn address(self) -> &'static str {
+        match self {
+            Self::Binary => "/*b",
+            Self::OscTriplet => "/*s",
+            Self::OscNative => "/*S",
+        }
+    }
+}
+
+/// Builds the subscribe-or-renew message for `format` (page 30): a bare address with no
+/// arguments, e.g. `/*b`. Sending this same message again before it expires (see
+/// [`WingOscClient::subscribe`]) is how a subscription is renewed; there's no separate
+/// "renew" message on the wire.
+pub fn subscribe(format: SubscriptionFormat) -> OscMessage {
+    OscMessage::new(format.address(), vec![])
 }
 
 // ---------------------------------------------------------------------------
@@ -401,6 +507,12 @@ pub enum ParamFacets {
         raw: f32,
         value: i32,
     },
+    /// `,f`: a bare float, with no display/raw facet. Never produced by a get/set
+    /// reply -- only by a [`SubscriptionFormat::OscNative`] (`/*S`) event (page 30),
+    /// which reports just the parameter's native value.
+    NativeFloat(f32),
+    /// `,i`: as `NativeFloat`, but for an int-typed parameter.
+    NativeInt(i32),
 }
 
 /// A parsed single-parameter GET reply.
@@ -411,7 +523,10 @@ pub struct ParamReply {
 }
 
 /// Parses a single-parameter GET reply (page 21): `,s` / `,sff` / `,sfi` depending on
-/// the parameter's type.
+/// the parameter's type. Also parses a [`SubscriptionFormat::OscNative`] (`/*S`) event's
+/// bare `,f` / `,i` shape into [`ParamFacets::NativeFloat`]/[`ParamFacets::NativeInt`]
+/// (page 30) -- a plain get/set reply never takes that shape, so there's no ambiguity
+/// reusing this parser for both.
 pub fn parse_param_reply(msg: &OscMessage) -> Result<ParamReply> {
     let facets = match msg.args.as_slice() {
         [OscArg::Str(display)] => ParamFacets::StringOrEnum {
@@ -427,12 +542,57 @@ pub fn parse_param_reply(msg: &OscMessage) -> Result<ParamReply> {
             raw: *raw,
             value: *value,
         },
+        [OscArg::Float(value)] => ParamFacets::NativeFloat(*value),
+        [OscArg::Int(value)] => ParamFacets::NativeInt(*value),
         _ => return Err(OscError::Malformed("unexpected parameter reply shape")),
     };
     Ok(ParamReply {
         path: msg.addr.clone(),
         facets,
     })
+}
+
+/// A parsed subscription event (R4): what [`WingOscClient::poll_event`] classifies each
+/// received datagram into while a subscription is active.
+#[non_exhaustive]
+#[derive(Clone, Debug, PartialEq)]
+pub enum OscEvent {
+    /// A `/*s` triplet event or `/*S` single-tag event, parsed like a get/set reply
+    /// (see [`parse_param_reply`]). `/*S` events land in [`ParamFacets::NativeFloat`]/
+    /// [`ParamFacets::NativeInt`], the one shape a plain get/set reply never produces.
+    Param(ParamReply),
+    /// A `/*b` event: the native-interface blob payload (page 30), re-sendable to the
+    /// console verbatim. The event's address is always the constant `/` on the wire,
+    /// so only the payload is carried here.
+    Binary(Vec<u8>),
+    /// Didn't match either recognized event shape. Never dropped silently -- e.g. a
+    /// node-set ack can legitimately arrive on the same socket if a caller also issues
+    /// [`WingOscClient::request`] calls while a subscription is active (see
+    /// [`WingOscClient::poll_event`]'s docs for how to avoid that ambiguity).
+    Raw(OscMessage),
+}
+
+/// Classifies one received datagram as subscription-event traffic (see [`OscEvent`]).
+///
+/// A node-ack-shaped address (`/*` or `<node>*`, see [`parse_node_ack`]) is routed to
+/// [`OscEvent::Raw`] rather than through [`parse_param_reply`], even though its `,s`
+/// payload would otherwise parse as a (bogus) [`ParamFacets::StringOrEnum`]: an ack is
+/// never a parameter event, so treating it as one would misreport e.g. `"OK"` as a
+/// parameter's display value.
+fn classify_event(msg: OscMessage) -> OscEvent {
+    if msg.addr == "/" {
+        return match msg.args.as_slice() {
+            [OscArg::Blob(data)] => OscEvent::Binary(data.clone()),
+            _ => OscEvent::Raw(msg),
+        };
+    }
+    if msg.addr.ends_with('*') {
+        return OscEvent::Raw(msg);
+    }
+    match parse_param_reply(&msg) {
+        Ok(reply) => OscEvent::Param(reply),
+        Err(_) => OscEvent::Raw(msg),
+    }
 }
 
 /// The node-set error strings WING documents (page 23). `#[non_exhaustive]`: a future
@@ -539,15 +699,51 @@ pub fn parse_console_info(msg: &OscMessage) -> Result<DiscoveryInfo> {
 // Transport
 // ---------------------------------------------------------------------------
 
-/// A minimal OSC-over-UDP client (R3). UDP is connectionless, so `connect` only binds
-/// a local socket and resolves the target -- there's no handshake to perform.
+/// Default policy for [`WingOscClient::request_with_policy`] (R75): 3 attempts of 500ms
+/// each. Chosen to comfortably outlast an occasional dropped UDP datagram on a LAN
+/// without turning a genuinely-unreachable console into a multi-second hang.
+impl Default for RequestPolicy {
+    fn default() -> Self {
+        Self {
+            attempts: 3,
+            timeout_per_attempt: Duration::from_millis(500),
+        }
+    }
+}
+
+/// Retry policy for [`WingOscClient::request_with_policy`] (R75): UDP has no delivery
+/// guarantee, so a request or its reply can simply vanish. Re-sending the same request
+/// is safe for every builder in this module -- gets are idempotent, and a set landing
+/// twice (because the first send's reply was lost, not the send itself) just reapplies
+/// the same value.
+#[derive(Clone, Copy, Debug)]
+pub struct RequestPolicy {
+    pub attempts: u32,
+    pub timeout_per_attempt: Duration,
+}
+
+/// Tracks an active subscription's format and renewal schedule (R4). Not `pub`: exposed
+/// only through [`WingOscClient`]'s methods.
+#[derive(Clone, Copy, Debug)]
+struct SubscriptionState {
+    format: SubscriptionFormat,
+    renew_interval: Duration,
+    next_renew: Instant,
+}
+
+/// A minimal OSC-over-UDP client (R3, R4, R75). UDP is connectionless, so `connect`
+/// only binds a local socket and resolves the target -- there's no handshake to
+/// perform.
 ///
-/// Extension points left for U11 (R4, R75): this struct deliberately has no
-/// subscription state, no de-duplication/reordering buffer, and no retry policy.
-/// [`request`](Self::request) is a simple send-and-filter loop, not the
-/// buffer-unrelated-replies approach [`crate::WingConsole`]'s attended-get uses --
-/// good enough for single-shot get/set, but subscriptions need more (a persistent
-/// listener, sequence tracking, one-active-subscription takeover) that belongs in U11.
+/// All methods take `&self` (interior mutability via `RefCell`, not `Mutex`: this type
+/// isn't meant to be shared across threads, just to let `request`/`subscribe`/
+/// `poll_event` all be called through a shared reference without a separate `&mut`
+/// story). It is not designed for concurrent use from multiple threads or for
+/// interleaving foreground [`request`](Self::request) calls with background
+/// [`poll_event`](Self::poll_event) polling on *the same instance* -- see
+/// [`poll_event`](Self::poll_event)'s docs for why, and use
+/// [`bind_reply_port`](Self::bind_reply_port) to give a subscription its own socket
+/// when a caller needs both.
 pub struct WingOscClient {
     socket: UdpSocket,
     target: SocketAddr,
@@ -555,6 +751,13 @@ pub struct WingOscClient {
     /// [`recv`](Self::recv)/[`request`](Self::request) read from this socket instead
     /// of `socket`, matching a request built with [`with_reply_port`].
     reply_socket: Option<UdpSocket>,
+    /// Messages received by [`request`](Self::request) that didn't match what it was
+    /// waiting for (R75: out-of-order replies), in arrival order. Drained by
+    /// [`take_unsolicited`](Self::take_unsolicited).
+    unsolicited: RefCell<Vec<OscMessage>>,
+    /// Set by [`subscribe`](Self::subscribe); consulted by
+    /// [`poll_event`](Self::poll_event) to auto-renew on cadence.
+    subscription: RefCell<Option<SubscriptionState>>,
 }
 
 impl WingOscClient {
@@ -578,6 +781,8 @@ impl WingOscClient {
             socket,
             target,
             reply_socket: None,
+            unsolicited: RefCell::new(Vec::new()),
+            subscription: RefCell::new(None),
         })
     }
 
@@ -585,7 +790,15 @@ impl WingOscClient {
     /// redirects there by wrapping requests with [`with_reply_port`]. Once bound,
     /// [`recv`](Self::recv)/[`request`](Self::request) read from this socket instead
     /// of the one `connect` created (the console's IP doesn't change, page 21 -- only
-    /// the destination port of its reply does).
+    /// the destination port of its reply does). This is also the mechanism for giving
+    /// a subscription its own socket/port when a caller also needs foreground
+    /// `request`/`request_with_policy` calls against the same console -- see
+    /// [`poll_event`](Self::poll_event)'s docs -- by wrapping the subscribe message with
+    /// [`with_reply_port`] targeting this port before sending it on a second client.
+    ///
+    /// Local port conflict (R75): if `reply_port` is already bound by another process
+    /// (or another socket in this one), this returns `Err(OscError::Io(_))` -- bind
+    /// failure is a plain OS error, already a typed variant of this module's error enum.
     pub fn bind_reply_port(mut self, reply_port: u16) -> Result<Self> {
         let sock = UdpSocket::bind(("0.0.0.0", reply_port))?;
         sock.connect(self.target)?;
@@ -617,11 +830,37 @@ impl WingOscClient {
         decode(&buf[..n])
     }
 
+    /// Drains any datagrams already sitting in the socket buffer that are exact
+    /// duplicates of `matched` (R75: WING or an intervening network can deliver a UDP
+    /// reply twice). Anything that isn't an exact duplicate is buffered via
+    /// [`unsolicited`](Self::take_unsolicited) instead of being lost. Uses a very short
+    /// timeout rather than a true non-blocking peek: a genuine duplicate of a just-sent
+    /// reply arrives essentially immediately on a loopback/LAN, so this adds negligible
+    /// latency while still catching it.
+    fn drain_duplicate_replies(&self, matched: &OscMessage) {
+        loop {
+            match self.recv(Duration::from_millis(1)) {
+                Ok(msg) if msg == *matched => continue,
+                Ok(msg) => {
+                    self.unsolicited.borrow_mut().push(msg);
+                    break;
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
     /// Sends `msg` and waits up to `timeout` for its reply: a message whose address
     /// equals `msg.addr` (the normal get/set-single-parameter case), or the node-ack
     /// address it implies (`<msg.addr>*`, covering [`node_set_local`]; `/*` also
-    /// matches, covering [`node_set_root`]). Anything else received in the meantime is
-    /// discarded rather than buffered -- see the struct docs for why.
+    /// matches, covering [`node_set_root`]).
+    ///
+    /// Robustness (R75): anything else received while waiting -- an out-of-order
+    /// unrelated message -- is buffered (arrival order preserved) rather than dropped,
+    /// available via [`take_unsolicited`](Self::take_unsolicited); this mirrors
+    /// [`crate::WingConsole`]'s attended-get pattern. Once the real reply arrives, any
+    /// exact duplicate of it already queued behind it is drained and discarded rather
+    /// than left to confuse a subsequent `request` to the same address.
     pub fn request(&self, msg: &OscMessage, timeout: Duration) -> Result<OscMessage> {
         let deadline = Instant::now() + timeout;
         self.send(msg)?;
@@ -633,7 +872,152 @@ impl WingOscClient {
             }
             let reply = self.recv(remaining)?;
             if reply.addr == msg.addr || reply.addr == node_ack_addr || reply.addr == "/*" {
+                self.drain_duplicate_replies(&reply);
                 return Ok(reply);
+            }
+            self.unsolicited.borrow_mut().push(reply);
+        }
+    }
+
+    /// [`request`](Self::request), retrying up to `policy.attempts` times (R75) if an
+    /// attempt times out -- covers a lost request as well as a lost reply, since the
+    /// client can't tell which happened. Returns
+    /// `Err(OscError::RetriesExhausted { attempts })` if every attempt times out;
+    /// any non-timeout error (e.g. [`OscError::Node`]) is returned immediately without
+    /// retrying, since re-sending wouldn't change a console-side rejection.
+    pub fn request_with_policy(
+        &self,
+        msg: &OscMessage,
+        policy: RequestPolicy,
+    ) -> Result<OscMessage> {
+        for attempt in 1..=policy.attempts.max(1) {
+            match self.request(msg, policy.timeout_per_attempt) {
+                Ok(reply) => return Ok(reply),
+                Err(OscError::Timeout) if attempt < policy.attempts => continue,
+                Err(OscError::Timeout) => {
+                    return Err(OscError::RetriesExhausted { attempts: attempt })
+                }
+                Err(e) => return Err(e),
+            }
+        }
+        Err(OscError::RetriesExhausted {
+            attempts: policy.attempts,
+        })
+    }
+
+    /// Drains and returns every message [`request`](Self::request) has buffered as
+    /// unrelated/out-of-order traffic since the last call (R75), in arrival order.
+    pub fn take_unsolicited(&self) -> Vec<OscMessage> {
+        std::mem::take(&mut self.unsolicited.borrow_mut())
+    }
+
+    /// Subscribes to `format`'s event stream (page 30), auto-renewing every
+    /// [`SUBSCRIPTION_RENEW_MARGIN`] via [`poll_event`](Self::poll_event) thereafter.
+    ///
+    /// **Only one OSC subscription is active console-wide at a time (R4), granted to
+    /// whichever client last (re)subscribed.** The protocol gives the displaced client
+    /// no notification -- it just stops receiving events. Renewal is itself a
+    /// re-subscribe, so it's also a takeover: if two clients are both subscribed and
+    /// both renewing, whichever renews last each 10-second window "wins" that window,
+    /// and the two subscriptions ping-pong for as long as both keep renewing. This is
+    /// the protocol's documented behavior, not a bug in this client -- there is no way
+    /// to detect or prevent it from the wire alone. Consequently: prolonged silence from
+    /// [`poll_event`](Self::poll_event) is *not* reliable evidence of displacement
+    /// either (a quiet console produces no events regardless of who holds the
+    /// subscription), so don't build a staleness/takeover detector on top of it.
+    pub fn subscribe(&self, format: SubscriptionFormat) -> Result<()> {
+        self.subscribe_with_renewal(format, SUBSCRIPTION_RENEW_MARGIN)
+    }
+
+    /// Like [`subscribe`](Self::subscribe), with an injectable renewal cadence. Exists
+    /// so tests can exercise renewal on a short, deterministic interval instead of
+    /// waiting out the real 10-second expiry; production callers should use
+    /// [`subscribe`](Self::subscribe).
+    pub fn subscribe_with_renewal(
+        &self,
+        format: SubscriptionFormat,
+        renew_interval: Duration,
+    ) -> Result<()> {
+        self.send(&subscribe(format))?;
+        *self.subscription.borrow_mut() = Some(SubscriptionState {
+            format,
+            renew_interval,
+            next_renew: Instant::now() + renew_interval,
+        });
+        Ok(())
+    }
+
+    /// Whether the active subscription (if any) is due for its renewal re-send.
+    /// [`poll_event`](Self::poll_event) checks this on its own; exposed for callers
+    /// pumping their own read loop instead (mirrors
+    /// [`crate::WingConsole::keep_alive_meters`]'s caller-owned-pumping story).
+    pub fn renew_due(&self) -> bool {
+        self.subscription
+            .borrow()
+            .as_ref()
+            .is_some_and(|s| Instant::now() >= s.next_renew)
+    }
+
+    /// Re-sends the active subscription's message, re-asserting ownership of it (see
+    /// [`subscribe`](Self::subscribe)'s takeover docs), and reschedules the next
+    /// renewal. A no-op if there's no active subscription.
+    pub fn renew(&self) -> Result<()> {
+        let format = match self.subscription.borrow().as_ref() {
+            Some(s) => s.format,
+            None => return Ok(()),
+        };
+        self.send(&subscribe(format))?;
+        if let Some(s) = self.subscription.borrow_mut().as_mut() {
+            s.next_renew = Instant::now() + s.renew_interval;
+        }
+        Ok(())
+    }
+
+    /// Blocks up to `timeout` for the next subscription event, transparently renewing
+    /// the active subscription when its cadence comes due while waiting -- mirrors how
+    /// [`crate::WingConsole::read_meters`] folds its own keep-alive into a blocking
+    /// read: a caller just needs to keep calling `poll_event` at least as often as the
+    /// renewal interval, with no separate timer/thread required.
+    ///
+    /// Requires an active subscription ([`subscribe`](Self::subscribe) first); returns
+    /// `Err(OscError::Malformed(_))` otherwise.
+    ///
+    /// Not safe to interleave with foreground [`request`](Self::request)/
+    /// [`request_with_policy`](Self::request_with_policy) calls on the same client: both
+    /// read from the same socket, so a get/set reply could be consumed here and
+    /// misclassified as an [`OscEvent::Raw`], or an event could be consumed by
+    /// `request` and buffered as unsolicited instead of reaching `poll_event`. A caller
+    /// needing both should use [`bind_reply_port`](Self::bind_reply_port) to give the
+    /// subscription (via [`with_reply_port`]) a dedicated socket/port, polling that from
+    /// one client while issuing requests from another.
+    pub fn poll_event(&self, timeout: Duration) -> Result<OscEvent> {
+        if self.subscription.borrow().is_none() {
+            return Err(OscError::Malformed(
+                "poll_event called with no active subscription",
+            ));
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            if self.renew_due() {
+                self.renew()?;
+            }
+            let until_deadline = deadline.saturating_duration_since(Instant::now());
+            if until_deadline.is_zero() {
+                return Err(OscError::Timeout);
+            }
+            let until_renew = self
+                .subscription
+                .borrow()
+                .as_ref()
+                .map(|s| s.next_renew.saturating_duration_since(Instant::now()))
+                .unwrap_or(until_deadline);
+            let wait = until_deadline
+                .min(until_renew)
+                .max(Duration::from_millis(1));
+            match self.recv(wait) {
+                Ok(msg) => return Ok(classify_event(msg)),
+                Err(OscError::Timeout) => continue,
+                Err(e) => return Err(e),
             }
         }
     }

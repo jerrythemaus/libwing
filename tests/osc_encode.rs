@@ -140,7 +140,7 @@ fn golden_console_info_reply() {
 #[test]
 fn golden_get_param_request() {
     // Page 21: "->W, 12 B: /ch/1/fdr~~~" == 2f63682f312f666472000000
-    let bytes = encode(&osc::get_param("/ch/1/fdr")).unwrap();
+    let bytes = encode(&osc::get_param("/ch/1/fdr").unwrap()).unwrap();
     assert_eq!(hex(&bytes), "2f63682f312f666472000000");
     assert_eq!(bytes.len(), 12);
 }
@@ -175,7 +175,7 @@ fn golden_get_param_float_reply() {
 #[test]
 fn golden_toggle_request() {
     // Page 22: "->W, 20 B: /ch/1/mute~~,i~~[-1]"
-    let bytes = encode(&osc::toggle("/ch/1/mute")).unwrap();
+    let bytes = encode(&osc::toggle("/ch/1/mute").unwrap()).unwrap();
     assert_eq!(hex(&bytes), "2f63682f312f6d75746500002c690000ffffffff");
     assert_eq!(bytes.len(), 20);
 }
@@ -183,7 +183,7 @@ fn golden_toggle_request() {
 #[test]
 fn golden_enum_by_name_request() {
     // Page 23: "/$ctl/user/1/1/enc/mode ,s FX" -> 32 bytes.
-    let bytes = encode(&osc::set_enum_by_name("/$ctl/user/1/1/enc/mode", "FX")).unwrap();
+    let bytes = encode(&osc::set_enum_by_name("/$ctl/user/1/1/enc/mode", "FX").unwrap()).unwrap();
     assert_eq!(
         hex(&bytes),
         "2f2463746c2f757365722f312f312f656e632f6d6f6465002c73000046580000"
@@ -194,7 +194,7 @@ fn golden_enum_by_name_request() {
 #[test]
 fn golden_enum_by_index_request() {
     // Page 23: "/$ctl/user/1/1/enc/mode ,i 6" -> 32 bytes.
-    let bytes = encode(&osc::set_enum_by_index("/$ctl/user/1/1/enc/mode", 6)).unwrap();
+    let bytes = encode(&osc::set_enum_by_index("/$ctl/user/1/1/enc/mode", 6).unwrap()).unwrap();
     assert_eq!(
         hex(&bytes),
         "2f2463746c2f757365722f312f312f656e632f6d6f6465002c69000000000006"
@@ -218,13 +218,13 @@ fn golden_bulk_node_set_root() {
 #[test]
 fn golden_node_local_set() {
     // Page 24: "->W, 20 B: /ch/1~~~,s~~fdr=3~~~"
-    let msg = node_set_local("/ch/1", &[("fdr", "3")]);
+    let msg = node_set_local("/ch/1", &[("fdr", "3")]).unwrap();
     let bytes = encode(&msg).unwrap();
     assert_eq!(bytes.len(), 20);
     assert_eq!(hex(&bytes), "2f63682f310000002c7300006664723d33000000");
 
     // Page 24: "->W, 28 B: /ch/1~~~,s~~fdr=4,mute=1~~~~"
-    let msg2 = node_set_local("/ch/1", &[("fdr", "4"), ("mute", "1")]);
+    let msg2 = node_set_local("/ch/1", &[("fdr", "4"), ("mute", "1")]).unwrap();
     let bytes2 = encode(&msg2).unwrap();
     assert_eq!(bytes2.len(), 28);
 }
@@ -232,7 +232,7 @@ fn golden_node_local_set() {
 #[test]
 fn golden_node_dump_parse() {
     // Page 25: "/fx/1 ,s *" -> "/fx/1~~~,s~~mdl=NONE,fxmix=100,~" (32 bytes).
-    let bytes = encode(&osc::node_dump("/fx/1")).unwrap();
+    let bytes = encode(&osc::node_dump("/fx/1").unwrap()).unwrap();
     assert_eq!(bytes.len(), 16);
 
     let wire = "2f66782f310000002c7300006d646c3d4e4f4e452c66786d69783d3130302c00";
@@ -256,7 +256,11 @@ fn golden_node_dump_parse() {
 #[test]
 fn golden_reply_port_prefix() {
     // Page 21: "->W, 20 B: /%10027/ch/1/mute~~~"
-    let bytes = encode(&with_reply_port(10027, osc::get_param("/ch/1/mute"))).unwrap();
+    let bytes = encode(&with_reply_port(
+        10027,
+        osc::get_param("/ch/1/mute").unwrap(),
+    ))
+    .unwrap();
     assert_eq!(bytes.len(), 20);
     assert_eq!(hex(&bytes), "2f2531303032372f63682f312f6d757465000000");
 }
@@ -330,7 +334,10 @@ fn client_request_round_trips_over_loopback() {
     });
 
     let reply = client
-        .request(&osc::get_param("/ch/1/fdr"), Duration::from_secs(2))
+        .request(
+            &osc::get_param("/ch/1/fdr").unwrap(),
+            Duration::from_secs(2),
+        )
         .unwrap();
     let parsed = parse_param_reply(&reply).unwrap();
     match parsed.facets {
@@ -348,7 +355,10 @@ fn client_request_times_out_without_a_reply() {
     let client = WingOscClient::connect_addr(console_addr).unwrap();
 
     let err = client
-        .request(&osc::get_param("/ch/1/fdr"), Duration::from_millis(200))
+        .request(
+            &osc::get_param("/ch/1/fdr").unwrap(),
+            Duration::from_millis(200),
+        )
         .unwrap_err();
     assert!(matches!(err, OscError::Timeout));
 }

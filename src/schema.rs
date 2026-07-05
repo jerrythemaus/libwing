@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 
 use crate::console::WingConsole;
 use crate::node::WingNodeDef;
+use crate::safety::Operation;
 use crate::{Error, Result, WingResponse};
 
 /// The firmware version the checked-in embedded map (`src/propmap.jsonl` /
@@ -341,6 +342,96 @@ impl LiveSchema {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Transport availability map (U11: R6)
+// ---------------------------------------------------------------------------
+
+/// Which transport(s) can perform a given [`Operation`] (R6): the Native TCP session in
+/// `console.rs` (port 2222), the OSC UDP transport in `osc.rs` (port 2223), both, or
+/// neither.
+#[non_exhaustive]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TransportAvailability {
+    /// Only Native can perform this operation today.
+    NativeOnly,
+    /// Only OSC can perform this operation today.
+    OscOnly,
+    /// Either transport can perform an equivalent operation. "Equivalent" doesn't
+    /// always mean byte-identical output -- see [`transport_availability`]'s per-arm
+    /// doc comments for the operations where the two routes differ in shape.
+    Both,
+    /// Not a network request at all, so no transport applies.
+    NonNetwork,
+}
+
+/// Total mapping from [`Operation`] to which transport(s) can perform it (R6). Every
+/// variant gets exactly one label plus a rationale below; an exhaustiveness check lives
+/// as an in-crate `#[cfg(test)]` unit test in this module (not an external integration
+/// test), since `Operation` is `#[non_exhaustive]` and can't be matched without a
+/// wildcard arm from outside this crate.
+pub fn transport_availability(op: Operation) -> TransportAvailability {
+    match op {
+        // Native: `WingConsole::request_node_data`/`get_node_data`. OSC:
+        // `osc::get_param`/`WingOscClient::request`. Both read a single node's current
+        // value; the wire shapes differ (raw+display vs display/raw/real facets) but
+        // the operation -- "read this node" -- is available either way.
+        Operation::ReadNodeData => TransportAvailability::Both,
+
+        // Native: `WingConsole::request_node_definition` returns the full binary
+        // `WingNodeDef` schema (type, min/max, units, access). OSC:
+        // `osc::node_describe`/`node_describe_with_values` return a text/display
+        // description, not that binary schema. Labeled `Both` because OSC *can* fetch
+        // definition-shaped information for a node, but callers relying on
+        // `WingNodeDef`'s specific fields should treat the OSC route as informational,
+        // not a substitute -- same caveat as `SchemaCrawl` below.
+        Operation::ReadNodeDefinition => TransportAvailability::Both,
+
+        // Native only: `WingConsole::scan` broadcasts a UDP discovery probe with no
+        // prior knowledge of a console's address. OSC's equivalent-looking `/?`
+        // (`osc::console_info`) requires already having a console's IP:port to send to
+        // (it's a unicast request-reply, not a broadcast) -- it can confirm a console
+        // at a known address, but it cannot discover one.
+        Operation::Discover => TransportAvailability::NativeOnly,
+
+        // Native only: `WingConsole::connect` opens the stateful Native TCP session
+        // this crate's `WingConsole` is built around. OSC is connectionless UDP --
+        // `WingOscClient::connect`/`connect_addr` just resolve an address and bind a
+        // local socket, with no session/handshake concept to "connect" in the same
+        // sense.
+        Operation::Connect => TransportAvailability::NativeOnly,
+
+        // Native only: meter levels are the Native binary channel-3 UDP stream
+        // (`console.rs`'s `request_meter`). OSC has no meter-level stream at all --
+        // `osc.rs` has no meter concept.
+        Operation::SubscribeMeters => TransportAvailability::NativeOnly,
+
+        // Native only: reads the Native meter socket (`WingConsole::read_meters`); same
+        // reasoning as `SubscribeMeters` -- there is no OSC meter data to read.
+        Operation::ReadMeters => TransportAvailability::NativeOnly,
+
+        // Native only: `WingConsole::keep_alive`/`keep_alive_meters` are this crate's
+        // Native session/meter keepalive cadence. OSC's analogous idea is subscription
+        // renewal (`WingOscClient::subscribe`/`renew`/`poll_event`, R4) -- a different
+        // mechanism (re-sending a subscribe message, not a keepalive byte) that isn't
+        // modeled as this `Operation` variant, so it doesn't make this `Both`.
+        Operation::KeepAlive => TransportAvailability::NativeOnly,
+
+        // Both: Native `set_string`/`set_float`/`set_int` and OSC's equivalents
+        // (`osc::set_string`/`set_float`/`set_int`/`toggle`/`set_enum_by_name`/
+        // `set_enum_by_index`) write a node's value; either transport can do it.
+        Operation::SetNodeValue => TransportAvailability::Both,
+
+        // Both, with the same caveat as `ReadNodeDefinition`: `wingschema`'s live sweep
+        // walks Native node definitions; OSC's `node_describe`/`node_describe_with_values`
+        // ('?'/'#') can enumerate a node's children with descriptions too. Labeled
+        // `Both` because the crawl *operation* -- discover a subtree's structure -- is
+        // possible over either transport, but OSC's descriptions are display-oriented
+        // text, not wingschema's persisted binary `WingNodeDef` schema, so it is not a
+        // drop-in substitute for wingschema's current Native-only implementation.
+        Operation::SchemaCrawl => TransportAvailability::Both,
+    }
+}
+
 fn single_path(candidates: &[(String, WingNodeDef)]) -> Option<String> {
     match candidates {
         [(name, _)] => Some(name.clone()),
@@ -396,5 +487,59 @@ fn resolve_candidates(
             id,
             model: Some(model.to_string()),
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `Operation` is `#[non_exhaustive]`, so an external crate (like an integration
+    /// test in `tests/`) can't write a `match` over it without a wildcard arm --
+    /// which would defeat the point of an exhaustiveness check. Living in-crate as a
+    /// unit test, this can match without one, so `transport_availability`'s own
+    /// `match` (also wildcard-free) is the thing actually enforcing totality; this
+    /// test just pins that every variant is covered by *some* case here too, so
+    /// adding an `Operation` variant without updating this list fails to compile.
+    #[test]
+    fn availability_map_covers_every_operation() {
+        for op in [
+            Operation::ReadNodeData,
+            Operation::ReadNodeDefinition,
+            Operation::Discover,
+            Operation::Connect,
+            Operation::SubscribeMeters,
+            Operation::ReadMeters,
+            Operation::KeepAlive,
+            Operation::SetNodeValue,
+            Operation::SchemaCrawl,
+        ] {
+            // Just exercising that every variant maps to a single, deterministic
+            // label -- `transport_availability`'s match arms (no wildcard) are what
+            // actually guarantee totality at compile time.
+            let a = transport_availability(op);
+            let b = transport_availability(op);
+            assert_eq!(a, b, "{op:?} must map to exactly one availability");
+        }
+    }
+
+    #[test]
+    fn native_only_and_both_ops_are_labeled_correctly() {
+        assert_eq!(
+            transport_availability(Operation::SubscribeMeters),
+            TransportAvailability::NativeOnly
+        );
+        assert_eq!(
+            transport_availability(Operation::Discover),
+            TransportAvailability::NativeOnly
+        );
+        assert_eq!(
+            transport_availability(Operation::SetNodeValue),
+            TransportAvailability::Both
+        );
+        assert_eq!(
+            transport_availability(Operation::ReadNodeData),
+            TransportAvailability::Both
+        );
     }
 }

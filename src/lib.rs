@@ -113,7 +113,8 @@ pub use meters::{
 pub use node::{FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingNodeData, WingNodeDef};
 pub use safety::{risk_class, ConfirmationGuard, ConfirmationRequired, Operation, RiskClass};
 pub use schema::{
-    LiveSchema, MapMetadata, Provenance, Resolution, Schema, Staleness, FIRMWARE_BASELINE,
+    transport_availability, LiveSchema, MapMetadata, Provenance, Resolution, Schema, Staleness,
+    TransportAvailability, FIRMWARE_BASELINE,
 };
 
 type Result<T> = std::result::Result<T, Error>;
