@@ -1,0 +1,14 @@
+# scenario: native_connect_get_set
+# source: synthetic
+# sanitizer: n/a
+# note: wire bytes are spec-derived, built with the same frame-encoding style as
+# note: tests/attended_get.rs (0xd7 id-select, 0xd4 int32, 0xde RequestEnd). No
+# note: hardware capture exists yet -- this proves the replay harness end-to-end
+# note: ahead of one.
+# request: get_node_data id=1234
+# request: set_int id=1234 value=42
+N> d7000004d2dc
+N> d7000004d22a
+N< d7000004d2d400000309de
+# expect: NodeData id=1234 int=777
+# expect: RequestEnd

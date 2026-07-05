@@ -1,0 +1,10 @@
+# scenario: discovery
+# source: synthetic
+# sanitizer: n/a
+# note: demonstrates the REDACTION.md replacement conventions -- serial NGC0000000
+# note: (zeroed), IP 192.0.2.10 (TEST-NET-1), name WING-FIXTURE -- rather than
+# note: replaying a real broadcast reply (none captured yet). Shares its
+# note: "WING,ip,name,model,serial,firmware" body with the OSC console-info reply
+# note: (see osc::parse_console_info), reused here instead of a separate parser.
+D< 57494e472c3139322e302e322e31302c57494e472d464958545552452c5241434b2c4e4743303030303030302c312e392e39
+# expect: Discovery ip=192.0.2.10 name=WING-FIXTURE model=RACK serial=NGC0000000 firmware=1.9.9

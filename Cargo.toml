@@ -47,3 +47,7 @@ path = "tools/wingschema.rs"
 [[example]]
 name = "wingprop"
 path = "tools/wingprop.rs"
+
+[[example]]
+name = "wingcapture"
+path = "tools/wingcapture.rs"

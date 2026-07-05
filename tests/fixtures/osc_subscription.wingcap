@@ -1,0 +1,13 @@
+# scenario: osc_subscription
+# source: synthetic
+# sanitizer: n/a
+# note: golden vectors built by hand from src/osc.rs's own encode() logic (see
+# note: tests/osc_encode.rs for the byte-exact conventions this mirrors). No
+# note: hardware OSC capture exists yet.
+O> 2f2a7300
+O< 2f63682f312f6664720000002c736666000000002d312e30000000003f000000bf800000
+# expect: Osc addr=/ch/1/fdr args=3
+O< 2f63682f312f6d75746500002c73666900000000310000003f80000000000001
+# expect: Osc addr=/ch/1/mute args=3
+O< 2f0000002c62000000000004deadbeef
+# expect: Osc addr=/ args=1
