@@ -707,9 +707,14 @@ impl WingConsole {
                     .keep_alive_timer
                     .saturating_duration_since(std::time::Instant::now());
                 let read_timeout = match r.op_deadline {
-                    Some(deadline) => {
-                        keep_alive_timeout.min(deadline.saturating_duration_since(Instant::now()))
-                    }
+                    // Floor at 1ms: if the deadline lands in the window between the explicit
+                    // check above and here, `remaining` rounds to zero and
+                    // `set_read_timeout(Some(ZERO))` is an OS error (it would surface as
+                    // Error::Io, not Error::Timeout). One more short read then re-checks the
+                    // deadline and returns Timeout cleanly. Mirrors osc.rs poll_event's guard.
+                    Some(deadline) => keep_alive_timeout
+                        .min(deadline.saturating_duration_since(Instant::now()))
+                        .max(Duration::from_millis(1)),
                     None => keep_alive_timeout,
                 };
                 self.rsock
