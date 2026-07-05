@@ -109,9 +109,9 @@ int                wing_node_definition_get_max_string_len        (const Respons
 int                wing_node_definition_get_string_enum_count     (const Response* handle);
 int                wing_node_definition_get_float_enum_count      (const Response* handle);
 int                wing_node_definition_get_float_enum_item       (const Response* handle, int index, float* ret);
-int                wing_node_definition_get_float_enum_long_item  (const Response* handle, int index, char** ret);
-int                wing_node_definition_get_string_enum_item      (const Response* handle, int index, char** ret);
-int                wing_node_definition_get_string_enum_long_item (const Response* handle, int index, char** ret);
+int                wing_node_definition_get_float_enum_long_item  (const Response* handle, int index, char** ret); // On success (returns 1), *ret must be freed by wing_string_destroy()
+int                wing_node_definition_get_string_enum_item      (const Response* handle, int index, char** ret); // On success (returns 1), *ret must be freed by wing_string_destroy()
+int                wing_node_definition_get_string_enum_long_item (const Response* handle, int index, char** ret); // On success (returns 1), *ret must be freed by wing_string_destroy()
 
 int                wing_name_to_id                                (const char* name, int32_t* out_id);
 

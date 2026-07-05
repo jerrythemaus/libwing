@@ -54,11 +54,30 @@ pub struct WingNodeDef {
     pub max_string_len: Option<u16>,
     pub string_enum: Option<Vec<StringEnumItem>>,
     pub float_enum: Option<Vec<FloatEnumItem>>,
+    /// The original wire bytes this definition was parsed from. Retained only for defs
+    /// parsed off the live console (used by `wingschema` to re-serialize the property map).
+    /// Definitions sourced from the embedded property map leave this empty — see
+    /// [`from_bytes_without_raw`](Self::from_bytes_without_raw).
     pub raw: Vec<u8>,
 }
 
 impl WingNodeDef {
+    /// Parse a node definition from its wire encoding, retaining a copy of the original
+    /// bytes in [`raw`](Self::raw).
     pub fn from_bytes(raw: &[u8]) -> Result<Self> {
+        Self::from_bytes_inner(raw, true)
+    }
+
+    /// Like [`from_bytes`](Self::from_bytes) but leaves [`raw`](Self::raw) empty.
+    ///
+    /// Used by the embedded property map, where the raw bytes are never read back and
+    /// keeping one copy per node would duplicate the entire embedded blob (several
+    /// megabytes) on the heap for the lifetime of the process.
+    pub fn from_bytes_without_raw(raw: &[u8]) -> Result<Self> {
+        Self::from_bytes_inner(raw, false)
+    }
+
+    fn from_bytes_inner(raw: &[u8], keep_raw: bool) -> Result<Self> {
         let mut i = 0;
 
         let parent_id = read_i32(raw, &mut i)?;
@@ -164,7 +183,7 @@ impl WingNodeDef {
             max_string_len,
             string_enum,
             float_enum,
-            raw: raw.to_vec(),
+            raw: if keep_raw { raw.to_vec() } else { Vec::new() },
         })
     }
 }
@@ -506,3 +525,158 @@ impl WingNodeDef {
     }
 }
 use crate::{Error, Result};
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Minimal builder for a node-definition byte stream in the wire format that
+    /// `WingNodeDef::from_bytes` parses.
+    struct DefBuilder {
+        buf: Vec<u8>,
+    }
+
+    impl DefBuilder {
+        fn new(parent_id: i32, id: i32, index: u16, name: &str, long_name: &str, node_type: u8, unit: u8, read_only: bool) -> Self {
+            let mut buf = Vec::new();
+            buf.extend_from_slice(&parent_id.to_be_bytes());
+            buf.extend_from_slice(&id.to_be_bytes());
+            buf.extend_from_slice(&index.to_be_bytes());
+            buf.push(name.len() as u8);
+            buf.extend_from_slice(name.as_bytes());
+            buf.push(long_name.len() as u8);
+            buf.extend_from_slice(long_name.as_bytes());
+            let flags: u16 = ((node_type as u16 & 0x0F) << 4)
+                | (unit as u16 & 0x0F)
+                | if read_only { 1 << 9 } else { 0 };
+            buf.extend_from_slice(&flags.to_be_bytes());
+            Self { buf }
+        }
+        fn u16(mut self, v: u16) -> Self { self.buf.extend_from_slice(&v.to_be_bytes()); self }
+        fn i32(mut self, v: i32) -> Self { self.buf.extend_from_slice(&v.to_be_bytes()); self }
+        fn f32(mut self, v: f32) -> Self { self.buf.extend_from_slice(&v.to_be_bytes()); self }
+        fn str(mut self, s: &str) -> Self { self.buf.push(s.len() as u8); self.buf.extend_from_slice(s.as_bytes()); self }
+        fn build(self) -> Vec<u8> { self.buf }
+    }
+
+    #[test]
+    fn parses_plain_node() {
+        // node_type 0 = Node, unit 0 = None
+        let bytes = DefBuilder::new(1, 2, 3, "gain", "Gain", 0, 0, true).build();
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.parent_id, 1);
+        assert_eq!(def.id, 2);
+        assert_eq!(def.index, 3);
+        assert_eq!(def.name, "gain");
+        assert_eq!(def.long_name, "Gain");
+        assert_eq!(def.node_type, NodeType::Node);
+        assert_eq!(def.unit, NodeUnit::None);
+        assert!(def.read_only);
+    }
+
+    #[test]
+    fn parses_integer_node_with_min_max() {
+        // node_type 4 = Integer, unit 1 = Db
+        let bytes = DefBuilder::new(0, 10, 0, "vol", "Volume", 4, 1, false)
+            .i32(-100).i32(100).build();
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.node_type, NodeType::Integer);
+        assert_eq!(def.unit, NodeUnit::Db);
+        assert_eq!(def.min_int, Some(-100));
+        assert_eq!(def.max_int, Some(100));
+    }
+
+    #[test]
+    fn parses_linear_float_node() {
+        // node_type 1 = LinearFloat
+        let bytes = DefBuilder::new(0, 11, 0, "f", "F", 1, 0, false)
+            .f32(-1.5).f32(3.5).i32(256).build();
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.node_type, NodeType::LinearFloat);
+        assert_eq!(def.min_float, Some(-1.5));
+        assert_eq!(def.max_float, Some(3.5));
+        assert_eq!(def.steps, Some(256));
+    }
+
+    #[test]
+    fn parses_string_enum_node() {
+        // node_type 5 = StringEnum, 2 items
+        let bytes = DefBuilder::new(0, 12, 0, "e", "E", 5, 0, false)
+            .u16(2)
+            .str("a").str("Alpha")
+            .str("b").str("Bravo")
+            .build();
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.node_type, NodeType::StringEnum);
+        let items = def.string_enum.unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].item, "a");
+        assert_eq!(items[0].long_item, "Alpha");
+        assert_eq!(items[1].item, "b");
+        assert_eq!(items[1].long_item, "Bravo");
+    }
+
+    #[test]
+    fn parses_float_enum_node() {
+        // node_type 6 = FloatEnum, 1 item
+        let bytes = DefBuilder::new(0, 13, 0, "fe", "FE", 6, 0, false)
+            .u16(1)
+            .f32(0.25).str("Quarter")
+            .build();
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.node_type, NodeType::FloatEnum);
+        let items = def.float_enum.unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].item, 0.25);
+        assert_eq!(items[0].long_item, "Quarter");
+    }
+
+    #[test]
+    fn parses_string_node_with_max_len() {
+        // node_type 7 = String
+        let bytes = DefBuilder::new(0, 14, 0, "s", "S", 7, 0, false).u16(256).build();
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.node_type, NodeType::String);
+        assert_eq!(def.max_string_len, Some(256));
+    }
+
+    #[test]
+    fn parses_256_byte_name_without_panic() {
+        let name = "n".repeat(255); // name_len is a u8, so 255 is the max
+        let bytes = DefBuilder::new(0, 15, 0, &name, "", 0, 0, false).build();
+        let def = WingNodeDef::from_bytes(&bytes).unwrap();
+        assert_eq!(def.name.len(), 255);
+    }
+
+    #[test]
+    fn truncated_input_returns_error_not_panic() {
+        // A full Integer def, then progressively truncate every prefix. None may panic;
+        // every short read must surface as Err(InvalidData) via the bounds-checked take().
+        let full = DefBuilder::new(0, 10, 0, "vol", "Volume", 4, 1, false)
+            .i32(-100).i32(100).build();
+        for len in 0..full.len() {
+            let res = WingNodeDef::from_bytes(&full[..len]);
+            assert!(res.is_err(), "expected error for truncated len {len}");
+            assert!(matches!(res, Err(Error::InvalidData)));
+        }
+    }
+
+    #[test]
+    fn invalid_utf8_name_returns_error() {
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(&0i32.to_be_bytes()); // parent_id
+        bytes.extend_from_slice(&1i32.to_be_bytes()); // id
+        bytes.extend_from_slice(&0u16.to_be_bytes()); // index
+        bytes.push(2); // name_len
+        bytes.extend_from_slice(&[0xff, 0xfe]); // invalid utf-8
+        assert!(matches!(WingNodeDef::from_bytes(&bytes), Err(Error::InvalidData)));
+    }
+
+    #[test]
+    fn string_enum_count_larger_than_data_errors_without_panic() {
+        // Claim 1000 items but provide none: the per-item reads must run out of bytes
+        // and return Err rather than panicking or looping unboundedly.
+        let bytes = DefBuilder::new(0, 12, 0, "e", "E", 5, 0, false).u16(1000).build();
+        assert!(matches!(WingNodeDef::from_bytes(&bytes), Err(Error::InvalidData)));
+    }
+}

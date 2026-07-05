@@ -174,7 +174,9 @@ Do you have a backup snapshot you can restore after, and want to continue?
     writeln!(rust_file, "            i += namelen;").unwrap();
     writeln!(rust_file, "            let deflen = u16::from_be_bytes([d[i], d[i + 1]]) as usize;").unwrap();
     writeln!(rust_file, "            i += 2;").unwrap();
-    writeln!(rust_file, "            let def = WingNodeDef::from_bytes(&d[i..i + deflen]);").unwrap();
+    // Use the raw-free constructor: the property map never reads WingNodeDef::raw back,
+    // and retaining it here would duplicate the entire embedded blob on the heap.
+    writeln!(rust_file, "            let def = WingNodeDef::from_bytes_without_raw(&d[i..i + deflen]).expect(\"valid embedded propmap definition\");").unwrap();
     writeln!(rust_file, "            i += deflen;").unwrap();
     writeln!(rust_file, "            m.insert(name, def);").unwrap();
     writeln!(rust_file, "        }}").unwrap();

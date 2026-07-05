@@ -14,7 +14,7 @@ lazy_static::lazy_static! {
             i += namelen;
             let deflen = u16::from_be_bytes([d[i], d[i + 1]]) as usize;
             i += 2;
-            let def = WingNodeDef::from_bytes(&d[i..i + deflen]).expect("valid embedded propmap definition");
+            let def = WingNodeDef::from_bytes_without_raw(&d[i..i + deflen]).expect("valid embedded propmap definition");
             i += deflen;
             m.insert(name, def);
         }

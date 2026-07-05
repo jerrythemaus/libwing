@@ -1,7 +1,6 @@
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_float};
 use std::ptr;
-use std::sync::Mutex;
 use crate::{WingConsole, NodeType, NodeUnit, WingResponse, console::Meter};
 
 // Opaque type wrappers
@@ -10,9 +9,15 @@ pub struct WingDiscoveryInfoHandle {
     info: Vec<crate::DiscoveryInfo>
 }
 
+// WingConsole is already Clone and internally synchronized (its rsock/wsock/main/mtrs
+// fields are each Arc<Mutex<..>>), so it is Send+Sync and safe to share across the FFI
+// boundary directly. Wrapping it in an *outer* Mutex would serialize every C call — a
+// blocking wing_console_read() would then starve concurrent setters/requesters. Instead,
+// each entry point clones this handle (a cheap Arc bump) and lets the internal
+// per-resource locks provide the concurrency the split-lock design was built for.
 #[repr(C)]
 pub struct WingConsoleHandle {
-    pub console: Mutex<WingConsole>,
+    pub console: WingConsole,
 }
 
 #[repr(C)]
@@ -119,12 +124,12 @@ pub extern "C" fn wing_discover_get_firmware(handle: *const WingDiscoveryInfoHan
 pub extern "C" fn wing_console_connect(ip: *const c_char) -> *mut WingConsoleHandle {
     if ip.is_null() {
         match WingConsole::connect(None) {
-            Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console: Mutex::new(console) })),
+            Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console })),
             Err(_) => ptr::null_mut()
         }
     } else if let Some(ip) = unsafe { cstr_to_str(ip) } {
         match WingConsole::connect(Some(ip)) {
-            Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console: Mutex::new(console) })),
+            Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console })),
             Err(_) => ptr::null_mut()
         }
     } else {
@@ -147,9 +152,7 @@ pub extern "C" fn wing_console_read(handle: *mut WingConsoleHandle) -> *mut Resp
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return ptr::null_mut();
     };
-    let Ok(mut console) = handle.console.lock() else {
-        return ptr::null_mut();
-    };
+    let mut console = handle.console.clone();
     if let Ok(response) = console.read() {
         Box::into_raw(Box::new(ResponseHandle { response }))
     } else {
@@ -176,9 +179,7 @@ pub extern "C" fn wing_console_set_string(handle: *mut WingConsoleHandle, id: i3
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
-    let Ok(mut console) = handle.console.lock() else {
-        return -1;
-    };
+    let mut console = handle.console.clone();
     if console.set_string(id, value).is_ok() {
         0
     } else {
@@ -191,9 +192,7 @@ pub extern "C" fn wing_console_set_float(handle: *mut WingConsoleHandle, id: i32
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
-    let Ok(mut console) = handle.console.lock() else {
-        return -1;
-    };
+    let mut console = handle.console.clone();
     if console.set_float(id, value).is_ok() {
         0
     } else {
@@ -206,9 +205,7 @@ pub extern "C" fn wing_console_set_int(handle: *mut WingConsoleHandle, id: i32, 
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
-    let Ok(mut console) = handle.console.lock() else {
-        return -1;
-    };
+    let mut console = handle.console.clone();
     if console.set_int(id, value).is_ok() {
         0
     } else {
@@ -221,9 +218,7 @@ pub extern "C" fn wing_console_request_node_definition(handle: *mut WingConsoleH
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
-    let Ok(mut console) = handle.console.lock() else {
-        return -1;
-    };
+    let mut console = handle.console.clone();
     if console.request_node_definition(id).is_ok() {
         0
     } else {
@@ -236,9 +231,7 @@ pub extern "C" fn wing_console_request_node_data(handle: *mut WingConsoleHandle,
     let Some(handle) = (unsafe { handle.as_ref() }) else {
         return -1;
     };
-    let Ok(mut console) = handle.console.lock() else {
-        return -1;
-    };
+    let mut console = handle.console.clone();
     if console.request_node_data(id).is_ok() {
         0
     } else {
@@ -645,9 +638,7 @@ pub extern "C" fn wing_console_request_meter(handle: *mut WingConsoleHandle, met
         return 0;
     };
 
-    let Ok(mut console) = handle.console.lock() else {
-        return 0;
-    };
+    let mut console = handle.console.clone();
     console.request_meter(&meters).unwrap_or_default()
 }
 
@@ -659,9 +650,7 @@ pub extern "C" fn wing_console_read_meter(handle: *mut WingConsoleHandle, ret_id
     if ret_id.is_null() || (ret_data_capacity > 0 && ret_data.is_null()) {
         return -1;
     }
-    let Ok(mut console) = handle.console.lock() else {
-        return -1;
-    };
+    let mut console = handle.console.clone();
     if let Ok((id, data)) = console.read_meters() {
         unsafe { *ret_id = id; }
         if data.len() > ret_data_capacity {

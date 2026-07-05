@@ -44,6 +44,7 @@ lazy_static::lazy_static! {
 const RX_BUFFER_SIZE: usize = 2048;
 const DATA_KEEP_ALIVE_SECONDS: u64 = 7;
 const METERS_KEEP_ALIVE_SECONDS: u64 = 3;
+const WRITE_TIMEOUT_SECONDS: u64 = 5;
 
 pub struct DiscoveryInfo {
     pub ip:       String,
@@ -119,6 +120,10 @@ impl WingConsole {
                 }
                 Err(_) => {
                     attempts += 1;
+                    // Re-broadcast the probe on each receive timeout. UDP broadcast is
+                    // unreliable; sending "WING?" only once means a single dropped packet
+                    // yields an empty scan even though a console is present.
+                    let _ = dsock.send_to(b"WING?", "255.255.255.255:2222");
                 }
             }
         }
@@ -146,6 +151,10 @@ impl WingConsole {
         let mut stream = TcpStream::connect_timeout(&addr, Duration::from_secs(5))?;
         // stream.set_nonblocking(true)?;
         stream.set_nodelay(true)?;
+        // Bound writes: without a write timeout, write_all() can block forever if the
+        // peer's receive window stays full (dead/stalled console), permanently hanging
+        // any thread that sends a command or keep-alive.
+        stream.set_write_timeout(Some(Duration::from_secs(WRITE_TIMEOUT_SECONDS)))?;
         stream.write_all(&[0xdf, 0xd1])?;
 
         Ok(Self {
@@ -195,11 +204,16 @@ impl WingConsole {
                 let v = String::new();
                 return Ok(WingResponse::NodeData(main.current_node_id, WingNodeData::with_string(v)));
             } else if cmd == 0xd1 {
-                let len = self.read_u8(&mut main, ch, &mut raw)? + 1;
-                let v = self.read_string(&mut main, ch, len as usize, &mut raw)?;
+                // Length is transmitted as (real_len - 1), so real_len can be up to 256.
+                // Widen to usize before the +1 so a 0xff length byte (256-byte string) does
+                // not overflow u8 (panic in debug, wrap-to-0 stream desync in release).
+                let len = self.read_u8(&mut main, ch, &mut raw)? as usize + 1;
+                let v = self.read_string(&mut main, ch, len, &mut raw)?;
                 return Ok(WingResponse::NodeData(main.current_node_id, WingNodeData::with_string(v)));
             } else if cmd == 0xd2 {
-                let _v = self.read_u16(&mut main, ch, &mut raw)? + 1;
+                // Widen before +1: a 0xffff index would overflow u16 (debug panic on
+                // otherwise-valid protocol input).
+                let _v = self.read_u16(&mut main, ch, &mut raw)? as u32 + 1;
                 // println!("REQUEST: NODE INDEX: {}", v);
             } else if cmd == 0xd3 {
                 let v = self.read_i16(&mut main, ch, &mut raw)?;
@@ -228,8 +242,12 @@ impl WingConsole {
             } else if cmd == 0xde {
                 return Ok(WingResponse::RequestEnd);
             } else if cmd == 0xdf {
-                let def_len = self.read_u16(&mut main, ch, &mut raw)? as u32;
-                if def_len == 0 { let _ = self.read_u32(&mut main, ch, &mut raw)?; }
+                // A u16 length of 0 is the sentinel for "length does not fit in 16 bits";
+                // the real length then follows as a u32. The value must be *used*, not
+                // discarded, otherwise every extended-length node definition is truncated
+                // to an empty body and rejected by WingNodeDef::from_bytes.
+                let mut def_len = self.read_u16(&mut main, ch, &mut raw)? as u32;
+                if def_len == 0 { def_len = self.read_u32(&mut main, ch, &mut raw)?; }
                 raw.clear();
                 for _ in 0..def_len { self.decode_next(&mut main, &mut raw)?; } 
                 return Ok(WingResponse::NodeDef(WingNodeDef::from_bytes(&raw)?));
