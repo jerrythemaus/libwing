@@ -1,12 +1,37 @@
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::net::{IpAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Shutdown, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crate::node::{WingNodeData, WingNodeDef};
 use crate::propmap::NAME_TO_DEF;
 use crate::{Error, Result, WingResponse};
+
+/// A duplex byte stream `WingConsole` can read/write commands over.
+///
+/// `Read`/`Write` alone aren't enough: [`WingConsole::decode_next`] dynamically
+/// re-arms the read timeout (bounded by the keep-alive cadence, and by an attended-get
+/// deadline when one is active) between reads, so the transport must expose that knob.
+/// `shutdown` defaults to a no-op so non-socket transports (tests, replay) don't need to
+/// implement teardown semantics; [`TcpStream`] overrides it to actually close the socket.
+pub trait Transport: Read + Write + Send {
+    fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()>;
+
+    fn shutdown(&self, _how: Shutdown) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Transport for TcpStream {
+    fn set_read_timeout(&mut self, dur: Option<Duration>) -> std::io::Result<()> {
+        TcpStream::set_read_timeout(self, dur)
+    }
+
+    fn shutdown(&self, how: Shutdown) -> std::io::Result<()> {
+        TcpStream::shutdown(self, how)
+    }
+}
 
 pub enum Meter {
     Channel(u8),
@@ -69,6 +94,11 @@ struct _WingConsoleMain {
     rx_current_channel: i8,
     rx_has_in_pipe: Option<u8>,
     current_node_id: i32,
+    /// Overall deadline for an in-flight attended-get operation (R16/R17), consulted by
+    /// `decode_next` so a stuck socket read can't run past it. `None` outside of
+    /// attended-get, in which case reads are bounded only by the keep-alive cadence, same
+    /// as before this field existed.
+    op_deadline: Option<Instant>,
 }
 
 struct _WingConsoleMeters {
@@ -79,8 +109,8 @@ struct _WingConsoleMeters {
 
 #[derive(Clone)]
 pub struct WingConsole {
-    rsock: Arc<Mutex<TcpStream>>,
-    wsock: Arc<Mutex<TcpStream>>,
+    rsock: Arc<Mutex<Box<dyn Transport>>>,
+    wsock: Arc<Mutex<Box<dyn Transport>>>,
     main: Arc<Mutex<_WingConsoleMain>>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
     peer_ip: IpAddr,
@@ -220,6 +250,23 @@ impl WingConsole {
     }
 
     fn from_streams(wsock: TcpStream, rsock: TcpStream, peer_ip: IpAddr) -> Self {
+        Self::from_boxed(Box::new(wsock), Box::new(rsock), peer_ip)
+    }
+
+    /// Construct a [`WingConsole`] over arbitrary reader/writer transports instead of a
+    /// live TCP connection to a physical console.
+    ///
+    /// This is the replay/testing entry point (the record-replay fixture harness builds
+    /// on it) -- normal use should go through [`connect`](Self::connect).
+    pub fn from_transports(
+        reader: impl Transport + 'static,
+        writer: impl Transport + 'static,
+        peer_ip: IpAddr,
+    ) -> Self {
+        Self::from_boxed(Box::new(writer), Box::new(reader), peer_ip)
+    }
+
+    fn from_boxed(wsock: Box<dyn Transport>, rsock: Box<dyn Transport>, peer_ip: IpAddr) -> Self {
         Self {
             wsock: Arc::new(Mutex::new(wsock)),
             rsock: Arc::new(Mutex::new(rsock)),
@@ -233,6 +280,7 @@ impl WingConsole {
                 rx_current_channel: -1,
                 rx_has_in_pipe: None,
                 current_node_id: 0,
+                op_deadline: None,
             })),
             mtrs: Arc::new(Mutex::new(_WingConsoleMeters {
                 keep_alive_meters_timer: std::time::Instant::now()
@@ -465,10 +513,28 @@ impl WingConsole {
         loop {
             self._keep_alive(r)?;
             if r.rx_buf_size == 0 {
-                self.rsock.clone().lock().unwrap().set_read_timeout(Some(
-                    r.keep_alive_timer
-                        .saturating_duration_since(std::time::Instant::now()),
-                ))?;
+                // Check before arming the socket timeout, not just after: this is what
+                // caps a stuck read to at most one capped-timeout interval past the
+                // deadline rather than one keep-alive interval (up to 7s) past it.
+                if let Some(deadline) = r.op_deadline {
+                    if Instant::now() >= deadline {
+                        return Err(Error::Timeout);
+                    }
+                }
+                let keep_alive_timeout = r
+                    .keep_alive_timer
+                    .saturating_duration_since(std::time::Instant::now());
+                let read_timeout = match r.op_deadline {
+                    Some(deadline) => {
+                        keep_alive_timeout.min(deadline.saturating_duration_since(Instant::now()))
+                    }
+                    None => keep_alive_timeout,
+                };
+                self.rsock
+                    .clone()
+                    .lock()
+                    .unwrap()
+                    .set_read_timeout(Some(read_timeout))?;
                 match self.rsock.clone().lock().unwrap().read(&mut r.rx_buf) {
                     Ok(n) if n > 0 => {
                         // println!("got n {}...", n);
@@ -484,6 +550,11 @@ impl WingConsole {
                                 | std::io::ErrorKind::Interrupted
                         ) =>
                     {
+                        if let Some(deadline) = r.op_deadline {
+                            if Instant::now() >= deadline {
+                                return Err(Error::Timeout);
+                            }
+                        }
                         std::thread::sleep(Duration::from_millis(10));
                         continue;
                     }
@@ -574,6 +645,110 @@ impl WingConsole {
         };
         self.wsock.clone().lock().unwrap().write_all(&buf)?;
         Ok(())
+    }
+
+    fn set_op_deadline(&mut self, deadline: Option<Instant>) {
+        self.main.clone().lock().unwrap().op_deadline = deadline;
+    }
+
+    /// Reads until `matcher` returns `Ok`, buffering everything else so it isn't lost.
+    ///
+    /// Every response `read()` produces goes through `matcher`: a match ends the loop and
+    /// returns the matched value plus everything buffered along the way; a non-match is
+    /// pushed onto the buffer (in arrival order) and the loop continues. Bails out with
+    /// `Error::Timeout` once `deadline` passes -- enforced primarily inside `decode_next`
+    /// (which bounds the underlying socket read), with a check here too so a run of
+    /// already-buffered bytes that never matches can't loop forever without ever touching
+    /// the socket again.
+    fn attended_read_until<T>(
+        &mut self,
+        deadline: Instant,
+        matcher: impl Fn(WingResponse) -> std::result::Result<T, WingResponse>,
+    ) -> Result<(T, Vec<WingResponse>)> {
+        let mut buffered = Vec::new();
+        loop {
+            let resp = self.read()?;
+            match matcher(resp) {
+                Ok(matched) => return Ok((matched, buffered)),
+                Err(unrelated) => buffered.push(unrelated),
+            }
+            if Instant::now() >= deadline {
+                return Err(Error::Timeout);
+            }
+        }
+    }
+
+    /// Requests node `id`'s current value and waits for it, with a timeout (R16, R17).
+    ///
+    /// Unrelated responses that arrive while waiting -- `NodeData` for other ids, node
+    /// definitions, `RequestEnd` markers -- are buffered and returned alongside the match
+    /// (in arrival order) instead of being dropped, so a caller layering this over its own
+    /// `read()` loop can still forward them to normal handling.
+    ///
+    /// **`RequestEnd` semantics:** the wire protocol has no correlation ID, so a
+    /// `RequestEnd` can't be proven to belong to *this* request -- it might mark the end of
+    /// an earlier request's response batch, or of unrelated interleaved traffic. Rather
+    /// than guess and risk a false "not found" on live traffic that just happens to
+    /// interleave a `RequestEnd`, a `RequestEnd` with no matching `NodeData` is treated as
+    /// inconclusive: it's buffered like any other unrelated response and waiting continues
+    /// until either the target arrives or the deadline does. A request for a genuinely
+    /// invalid id therefore always resolves via timeout, not a fast "not found" -- callers
+    /// that care about that distinction should pass a short timeout.
+    pub fn get_node_data(
+        &mut self,
+        id: i32,
+        timeout: Duration,
+    ) -> Result<(WingNodeData, Vec<WingResponse>)> {
+        self.request_node_data(id)?;
+        let deadline = Instant::now() + timeout;
+        self.set_op_deadline(Some(deadline));
+        let result = self.attended_read_until(deadline, |resp| match resp {
+            WingResponse::NodeData(rid, data) if rid == id => Ok(data),
+            other => Err(other),
+        });
+        self.set_op_deadline(None);
+        result
+    }
+
+    /// [`get_node_data`](Self::get_node_data), addressing the node by its property-map
+    /// name instead of numeric id.
+    pub fn get_node_data_by_name(
+        &mut self,
+        fullname: &str,
+        timeout: Duration,
+    ) -> Result<(WingNodeData, Vec<WingResponse>)> {
+        let id = Self::name_to_id(fullname).ok_or(Error::InvalidInput)?;
+        self.get_node_data(id, timeout)
+    }
+
+    /// Requests node `id`'s definition and waits for it, with a timeout (R16, R17). See
+    /// [`get_node_data`](Self::get_node_data) for the buffering and `RequestEnd`
+    /// semantics, which are identical here.
+    pub fn get_node_definition(
+        &mut self,
+        id: i32,
+        timeout: Duration,
+    ) -> Result<(WingNodeDef, Vec<WingResponse>)> {
+        self.request_node_definition(id)?;
+        let deadline = Instant::now() + timeout;
+        self.set_op_deadline(Some(deadline));
+        let result = self.attended_read_until(deadline, |resp| match resp {
+            WingResponse::NodeDef(def) if def.id == id => Ok(def),
+            other => Err(other),
+        });
+        self.set_op_deadline(None);
+        result
+    }
+
+    /// [`get_node_definition`](Self::get_node_definition), addressing the node by its
+    /// property-map name instead of numeric id.
+    pub fn get_node_definition_by_name(
+        &mut self,
+        fullname: &str,
+        timeout: Duration,
+    ) -> Result<(WingNodeDef, Vec<WingResponse>)> {
+        let id = Self::name_to_id(fullname).ok_or(Error::InvalidInput)?;
+        self.get_node_definition(id, timeout)
     }
 
     /// Subscribes to meters from the Wing mixer and returns a meter ID that can be used to

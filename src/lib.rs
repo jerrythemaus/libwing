@@ -89,7 +89,7 @@ mod propmap;
 mod safety;
 mod schema;
 
-pub use console::{DiscoveryInfo, Meter, WingConsole};
+pub use console::{DiscoveryInfo, Meter, Transport, WingConsole};
 pub use ffi::{ResponseHandle, WingConsoleHandle};
 pub use node::{NodeType, NodeUnit, WingNodeData, WingNodeDef};
 pub use safety::{risk_class, ConfirmationGuard, ConfirmationRequired, Operation, RiskClass};
