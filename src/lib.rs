@@ -81,6 +81,7 @@
 mod console;
 mod ffi;
 mod helpers;
+mod meters;
 mod node;
 #[cfg(not(feature = "propmap"))]
 #[path = "empty-propmap.rs"]
@@ -97,6 +98,11 @@ pub use console::{
 pub use ffi::{ResponseHandle, WingConsoleHandle};
 pub use helpers::{
     decode_enum, encode_enum, write_enum, EnumDecode, EnumKey, EnumValue, RawEnumValue,
+};
+pub use meters::{
+    decode_frame, fx_band_gr_db, level_db, ChannelMeter, ChannelMeterV2, DcaMeter, FxMeter,
+    MeterFrameEntry, MonitorMeter, CHANNEL_V2_WORDS, CHANNEL_WORDS, DCA_WORDS, FX_WORDS,
+    MONITOR_WORDS, OUTPUT_WORDS, RTA_WORDS, SOURCE_WORDS,
 };
 pub use node::{FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingNodeData, WingNodeDef};
 pub use safety::{risk_class, ConfirmationGuard, ConfirmationRequired, Operation, RiskClass};
@@ -126,6 +132,12 @@ pub enum Error {
     MeterNotInitialized,
     #[error("Operation timed out waiting for a response")]
     Timeout,
+    /// A raw meter frame's length didn't match what the request it was decoded against
+    /// implies (see [`decode_frame`]) -- either a short/truncated UDP datagram or a
+    /// mismatch between the `request` passed to `decode_frame` and the one that actually
+    /// produced `raw`.
+    #[error("meter frame length mismatch: expected {expected} i16 words, got {actual}")]
+    MeterFrameLength { expected: usize, actual: usize },
 }
 
 pub enum WingResponse {

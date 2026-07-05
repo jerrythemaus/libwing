@@ -33,6 +33,7 @@ impl Transport for TcpStream {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Meter {
     Channel(u8),
     Aux(u8),
