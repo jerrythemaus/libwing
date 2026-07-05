@@ -84,6 +84,7 @@ pub struct WingConsole {
     main: Arc<Mutex<_WingConsoleMain>>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
     peer_ip: IpAddr,
+    firmware: Arc<Mutex<Option<String>>>,
 }
 
 impl WingConsole {
@@ -133,12 +134,17 @@ impl WingConsole {
     }
 
     pub fn connect(host_or_ip: Option<&str>) -> Result<Self> {
-        let ip = if let Some(i) = host_or_ip {
-            i.to_string()
+        // Discovery's broadcast scan reply already carries firmware; reuse it
+        // instead of re-probing. Connecting to an explicit IP has no such
+        // reply, so `firmware_hint` stays `None` there and a targeted probe
+        // runs after the connection is up (R37: capability-detect, don't
+        // assume).
+        let (ip, firmware_hint) = if let Some(i) = host_or_ip {
+            (i.to_string(), None)
         } else {
             let devices = WingConsole::scan(true)?;
             if !devices.is_empty() {
-                devices[0].ip.clone()
+                (devices[0].ip.clone(), Some(devices[0].firmware.clone()))
             } else {
                 return Err(Error::DiscoveryError);
             }
@@ -159,7 +165,13 @@ impl WingConsole {
                     Ok(Self::from_streams(wsock, stream, addr.ip()))
                 });
             match attempt {
-                Ok(console) => return Ok(console),
+                Ok(console) => {
+                    let firmware = firmware_hint
+                        .clone()
+                        .or_else(|| Self::probe_firmware(addr.ip()));
+                    *console.firmware.lock().unwrap() = firmware;
+                    return Ok(console);
+                }
                 Err(err) => last_connect_error = Some(err),
             }
         }
@@ -169,6 +181,42 @@ impl WingConsole {
         } else {
             Err(Error::ConnectionError)
         }
+    }
+
+    /// Best-effort unicast firmware probe used by `connect()` when connecting
+    /// to an explicit IP (no broadcast scan reply to read firmware from).
+    /// Sends the same `"WING?"` discovery query [`scan`](Self::scan)
+    /// broadcasts, but unicast to the target so it doesn't depend on subnet
+    /// broadcast reachability. Non-fatal by design (R37): any failure --
+    /// socket error, timeout, malformed reply -- yields `None` rather than
+    /// failing `connect()` or guessing a firmware value.
+    fn probe_firmware(ip: IpAddr) -> Option<String> {
+        let dsock = UdpSocket::bind("0.0.0.0:0").ok()?;
+        dsock
+            .set_read_timeout(Some(Duration::from_millis(300)))
+            .ok()?;
+        dsock.send_to(b"WING?", (ip, 2222)).ok()?;
+
+        let mut buf = [0u8; 1024];
+        let (received, _) = dsock.recv_from(&mut buf).ok()?;
+        let response = String::from_utf8(buf[..received].to_vec()).ok()?;
+        let tokens: Vec<&str> = response.split(',').collect();
+        if tokens.len() >= 6 && tokens[0] == "WING" {
+            Some(tokens[5].to_string())
+        } else {
+            None
+        }
+    }
+
+    /// The connected console's firmware version, if known (R37).
+    ///
+    /// Populated at [`connect`](Self::connect) time: from the broadcast scan
+    /// reply when connecting via discovery, or from a best-effort unicast
+    /// probe when connecting to an explicit IP. `None` if neither produced a
+    /// reply (e.g. probing blocked by network policy) -- never a guessed or
+    /// default value. Feeds [`crate::Schema::staleness`].
+    pub fn firmware(&self) -> Option<String> {
+        self.firmware.lock().unwrap().clone()
     }
 
     fn from_streams(wsock: TcpStream, rsock: TcpStream, peer_ip: IpAddr) -> Self {
@@ -193,6 +241,7 @@ impl WingConsole {
                 next_meter_id: 0,
             })),
             peer_ip,
+            firmware: Arc::new(Mutex::new(None)),
         }
     }
 

@@ -93,7 +93,9 @@ pub use console::{DiscoveryInfo, Meter, WingConsole};
 pub use ffi::{ResponseHandle, WingConsoleHandle};
 pub use node::{NodeType, NodeUnit, WingNodeData, WingNodeDef};
 pub use safety::{risk_class, ConfirmationGuard, ConfirmationRequired, Operation, RiskClass};
-pub use schema::{Provenance, Resolution, Schema};
+pub use schema::{
+    LiveSchema, MapMetadata, Provenance, Resolution, Schema, Staleness, FIRMWARE_BASELINE,
+};
 
 type Result<T> = std::result::Result<T, Error>;
 
@@ -115,6 +117,8 @@ pub enum Error {
     DiscoveryError,
     #[error("Metering has not been initialized")]
     MeterNotInitialized,
+    #[error("Operation timed out waiting for a response")]
+    Timeout,
 }
 
 pub enum WingResponse {
