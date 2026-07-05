@@ -9,9 +9,12 @@
 //! exercise the wire *parser*; that's not needed here).
 
 use libwing::{
-    LiveSchema, NodeType, NodeUnit, Provenance, Resolution, Schema, Staleness, WingConsole,
-    WingNodeDef,
+    LiveSchema, NodeType, NodeUnit, Provenance, Resolution, Schema, Staleness, WingNodeDef,
 };
+// Only used by the propmap-gated tests below (embedded-map lookups); importing it
+// unconditionally would warn as unused under `--no-default-features`.
+#[cfg(feature = "propmap")]
+use libwing::WingConsole;
 
 fn def(id: i32, parent_id: i32, name: &str, min: f32, max: f32) -> WingNodeDef {
     WingNodeDef {
@@ -114,6 +117,7 @@ fn non_numeric_leading_segment_is_unknown() {
 // --- R8, R35, R36: map metadata ---
 
 #[test]
+#[cfg(feature = "propmap")]
 fn metadata_reports_pinned_baseline_and_entry_count() {
     let meta = Schema::metadata();
     assert_eq!(meta.firmware_baseline, "3.1");
@@ -131,9 +135,11 @@ fn metadata_reports_pinned_baseline_and_entry_count() {
 // (-60..0 vs -80..0), the same reused-id-per-model pattern the rest of the
 // embedded map relies on.
 
+#[cfg(feature = "propmap")]
 const GATE_DEQ_THR_ID: i32 = -1952441044;
 
 #[test]
+#[cfg(feature = "propmap")]
 fn firmware_3_1_dual_band_dynamic_eq_addition_resolves() {
     let deq = assert_confirmed(
         Schema::resolve_id(GATE_DEQ_THR_ID, Some("DEQ")).expect("id is in the embedded map"),
@@ -153,6 +159,7 @@ fn firmware_3_1_dual_band_dynamic_eq_addition_resolves() {
 // --- R12: LiveSchema overlay ---
 
 #[test]
+#[cfg(feature = "propmap")]
 fn overlay_hit_resolves_live_untouched_id_still_resolves_embedded() {
     let mut live = LiveSchema::new();
 

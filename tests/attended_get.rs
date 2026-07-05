@@ -238,6 +238,7 @@ fn get_node_definition_correlates_by_def_id() {
 }
 
 #[test]
+#[cfg(feature = "propmap")]
 fn by_name_variants_resolve_through_the_propmap() {
     let name = "/ch/1/fdr";
     let id = WingConsole::name_to_id(name).expect("propmap should know this path");

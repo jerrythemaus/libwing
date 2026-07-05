@@ -9,6 +9,11 @@
 //! source sweep again (which is exactly what happened before: the embedded
 //! map was built from a default-model-only sweep and was missing per-model
 //! subtrees like `/fx/1/HALL/...`).
+//!
+//! The whole point of this file is the embedded map, so it's gated on the
+//! `propmap` feature: under `--no-default-features` `NAME_TO_DEF` is empty by
+//! design and these consistency checks don't apply.
+#![cfg(feature = "propmap")]
 
 use libwing::WingConsole;
 use std::collections::HashSet;

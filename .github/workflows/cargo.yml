@@ -1,6 +1,8 @@
 name: Release Build
 
 on:
+  push:
+  pull_request:
   workflow_dispatch:
 
 env:
@@ -10,7 +12,30 @@ permissions:
   contents: write
 
 jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+    - name: cargo fmt --check
+      run: cargo fmt --check
+
+    - name: cargo test (default features)
+      run: cargo test --all-targets
+
+    - name: cargo build (--no-default-features)
+      run: cargo build --no-default-features
+
+    - name: cargo test (--no-default-features)
+      run: cargo test --no-default-features
+
   build:
+    # Only the manual release dispatch builds/packages/publishes; every push
+    # and PR runs just the `test` job above. Gated on `test` passing so a
+    # broken build can't cut a release even when triggered manually (R49).
+    if: github.event_name == 'workflow_dispatch'
+    needs: test
     strategy:
       matrix:
         include:

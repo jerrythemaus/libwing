@@ -7,6 +7,13 @@
 //! `resolve_path` picking the candidate that matches the live model value,
 //! rather than defaulting to whichever candidate the map happens to list
 //! first.
+//!
+//! Every test here resolves against the embedded property map, so the whole
+//! file is gated on the `propmap` feature (see `--no-default-features` in
+//! `.github/workflows/cargo.yml`): without it `NAME_TO_DEF` is empty and every
+//! lookup below would fail, not exercise the empty-propmap path this file
+//! doesn't cover.
+#![cfg(feature = "propmap")]
 
 use libwing::{Provenance, Resolution, Schema, WingConsole};
 
