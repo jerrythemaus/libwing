@@ -86,10 +86,12 @@ mod node;
 mod propmap;
 #[cfg(feature = "propmap")]
 mod propmap;
+mod schema;
 
 pub use console::{DiscoveryInfo, Meter, WingConsole};
 pub use ffi::{ResponseHandle, WingConsoleHandle};
 pub use node::{NodeType, NodeUnit, WingNodeData, WingNodeDef};
+pub use schema::{Provenance, Resolution, Schema};
 
 type Result<T> = std::result::Result<T, Error>;
 
