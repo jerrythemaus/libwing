@@ -446,25 +446,92 @@ pub extern "C" fn wing_node_definition_get_index(def: *const ResponseHandle) -> 
     }
 }
 
-#[no_mangle]
-pub extern "C" fn wing_node_definition_get_type(def: *const ResponseHandle) -> NodeType {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        def.node_type
-    } else {
-        NodeType::Node
+/// C ABI mirror of [`NodeType`]. `NodeType` itself is not `#[repr(C)]` (it carries a
+/// raw discriminant in `Unknown(u8)`, R20), so this fieldless copy is what actually
+/// crosses the FFI boundary; the existing 0-7 values match `libwing.h`'s
+/// `WingNodeType` exactly, and `Unknown` is an additive sentinel (R21) for
+/// discriminants no known variant covers.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub enum FfiNodeType {
+    Node = 0,
+    LinearFloat = 1,
+    LogarithmicFloat = 2,
+    FaderLevel = 3,
+    Integer = 4,
+    StringEnum = 5,
+    FloatEnum = 6,
+    String = 7,
+    Unknown = 8,
+}
+
+impl From<NodeType> for FfiNodeType {
+    fn from(t: NodeType) -> Self {
+        match t {
+            NodeType::Node => FfiNodeType::Node,
+            NodeType::LinearFloat => FfiNodeType::LinearFloat,
+            NodeType::LogarithmicFloat => FfiNodeType::LogarithmicFloat,
+            NodeType::FaderLevel => FfiNodeType::FaderLevel,
+            NodeType::Integer => FfiNodeType::Integer,
+            NodeType::StringEnum => FfiNodeType::StringEnum,
+            NodeType::FloatEnum => FfiNodeType::FloatEnum,
+            NodeType::String => FfiNodeType::String,
+            NodeType::Unknown(_) => FfiNodeType::Unknown,
+        }
+    }
+}
+
+/// C ABI mirror of [`NodeUnit`]; see [`FfiNodeType`] for why a separate type is
+/// needed.
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub enum FfiNodeUnit {
+    None = 0,
+    Db = 1,
+    Percent = 2,
+    Milliseconds = 3,
+    Hertz = 4,
+    Meters = 5,
+    Seconds = 6,
+    Octaves = 7,
+    Unknown = 8,
+}
+
+impl From<NodeUnit> for FfiNodeUnit {
+    fn from(u: NodeUnit) -> Self {
+        match u {
+            NodeUnit::None => FfiNodeUnit::None,
+            NodeUnit::Db => FfiNodeUnit::Db,
+            NodeUnit::Percent => FfiNodeUnit::Percent,
+            NodeUnit::Milliseconds => FfiNodeUnit::Milliseconds,
+            NodeUnit::Hertz => FfiNodeUnit::Hertz,
+            NodeUnit::Meters => FfiNodeUnit::Meters,
+            NodeUnit::Seconds => FfiNodeUnit::Seconds,
+            NodeUnit::Octaves => FfiNodeUnit::Octaves,
+            NodeUnit::Unknown(_) => FfiNodeUnit::Unknown,
+        }
     }
 }
 
 #[no_mangle]
-pub extern "C" fn wing_node_definition_get_unit(def: *const ResponseHandle) -> NodeUnit {
+pub extern "C" fn wing_node_definition_get_type(def: *const ResponseHandle) -> FfiNodeType {
     if let Some(WingResponse::NodeDef(def)) =
         unsafe { response_ref(def).map(|handle| &handle.response) }
     {
-        def.unit
+        def.node_type.into()
     } else {
-        NodeUnit::None
+        FfiNodeType::Node
+    }
+}
+
+#[no_mangle]
+pub extern "C" fn wing_node_definition_get_unit(def: *const ResponseHandle) -> FfiNodeUnit {
+    if let Some(WingResponse::NodeDef(def)) =
+        unsafe { response_ref(def).map(|handle| &handle.response) }
+    {
+        def.unit.into()
+    } else {
+        FfiNodeUnit::None
     }
 }
 

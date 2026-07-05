@@ -1,27 +1,30 @@
 mod utils;
-use utils::Args;
+use eframe::egui::{self, vec2, Color32, FontId, Pos2, Rect, RichText};
+use libwing::{Meter, WingConsole};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use eframe::egui::{self, vec2, Rect, Color32, RichText, FontId, Pos2};
-use libwing::{WingConsole, Meter};
+use utils::Args;
 
 // Number of channels to request meters for max 40
 const CHANNEL_COUNT: u8 = 16;
 
 fn main() -> Result<(), libwing::Error> {
-    let mut args = Args::new(r#"
+    let mut args = Args::new(
+        r#"
 Usage: wingmeters [-h host]
 
    -h host : IP address or hostname of Wing mixer. Default is to discover and connect to the first mixer found.
-"#);
+"#,
+    );
     let mut host = None;
-    if args.has_next() && args.next() == "-h" { host = Some(args.next()); }
+    if args.has_next() && args.next() == "-h" {
+        host = Some(args.next());
+    }
 
     let options = eframe::NativeOptions::default();
 
     // Request meters for first 32 channels
     let meters: Vec<Meter> = (0..CHANNEL_COUNT).map(Meter::Channel).collect();
-
 
     let mut wing = WingConsole::connect(host.as_deref())?;
     wing.request_meter(&meters)?;
@@ -30,7 +33,8 @@ Usage: wingmeters [-h host]
         "Wing Meters",
         options,
         Box::new(|_cc| Ok(Box::new(WingMetersApp::new(wing)))),
-    ).unwrap();
+    )
+    .unwrap();
 
     Ok(())
 }
@@ -44,40 +48,40 @@ impl WingMetersApp {
         let meters = Arc::new(RwLock::new(vec![0.0; (CHANNEL_COUNT * 2).into()]));
         let m = meters.clone();
 
-        let _ = thread::spawn(move || {
-            loop {
-                if let Ok((_, values)) = wing.read_meters() {
-                    if values.len() < usize::from(CHANNEL_COUNT) * 8 {
-                        continue;
-                    }
-                    let mut vals = m.write().unwrap();
-                    for i in 0..CHANNEL_COUNT.into() {
-                        vals[2*i]   = ((values[i*8 + 2] as f32 / 256.0 + 60.0) / 60.0).clamp(0.0, 1.0);
-                        vals[2*i+1] = ((values[i*8 + 3] as f32 / 256.0 + 60.0) / 60.0).clamp(0.0, 1.0);
-                    }
+        let _ = thread::spawn(move || loop {
+            if let Ok((_, values)) = wing.read_meters() {
+                if values.len() < usize::from(CHANNEL_COUNT) * 8 {
+                    continue;
+                }
+                let mut vals = m.write().unwrap();
+                for i in 0..CHANNEL_COUNT.into() {
+                    vals[2 * i] =
+                        ((values[i * 8 + 2] as f32 / 256.0 + 60.0) / 60.0).clamp(0.0, 1.0);
+                    vals[2 * i + 1] =
+                        ((values[i * 8 + 3] as f32 / 256.0 + 60.0) / 60.0).clamp(0.0, 1.0);
                 }
             }
         });
 
-        Self {
-            meters,
-        }
+        Self { meters }
     }
 }
 
 impl eframe::App for WingMetersApp {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let vals = self.meters.read().unwrap();
-        let num_cols = vals.len()/2;
+        let num_cols = vals.len() / 2;
 
         ui.columns(num_cols, |col| {
             for i in 0..num_cols {
-                let left = vals[2*i];
-                let right = vals[2*i+1];
+                let left = vals[2 * i];
+                let right = vals[2 * i + 1];
 
                 col[i].vertical(|ui| {
                     ui.vertical_centered(|ui| {
-                        ui.label(RichText::new(format!("CH{}", i + 1)).font(FontId::proportional(10.0)));
+                        ui.label(
+                            RichText::new(format!("CH{}", i + 1)).font(FontId::proportional(10.0)),
+                        );
                     });
                     ui.style_mut().spacing.item_spacing = vec2(0.0, 0.0);
                     ui.columns(2, |c| {
@@ -107,7 +111,7 @@ impl eframe::App for WingMetersApp {
                     ui.painter().rect_filled(
                         Rect::from_min_size(
                             Pos2::new(rect.left(), rect.bottom() - meter_height),
-                            vec2(rect.width()/2.0-1.0, meter_height),
+                            vec2(rect.width() / 2.0 - 1.0, meter_height),
                         ),
                         0.0,
                         Color32::from_gray(64),
@@ -116,7 +120,7 @@ impl eframe::App for WingMetersApp {
                     ui.painter().rect_filled(
                         Rect::from_min_size(
                             Pos2::new(rect.left(), rect.bottom() - meter_height * left),
-                            vec2(rect.width()/2.0-1.0, meter_height * left),
+                            vec2(rect.width() / 2.0 - 1.0, meter_height * left),
                         ),
                         0.0,
                         color,
@@ -125,7 +129,10 @@ impl eframe::App for WingMetersApp {
                     // bg right
                     ui.painter().rect_filled(
                         Rect::from_min_max(
-                            Pos2::new(rect.left() + rect.width()/2.0+1.0, rect.bottom() - meter_height),
+                            Pos2::new(
+                                rect.left() + rect.width() / 2.0 + 1.0,
+                                rect.bottom() - meter_height,
+                            ),
                             rect.max,
                         ),
                         0.0,
@@ -134,7 +141,10 @@ impl eframe::App for WingMetersApp {
                     // fg right
                     ui.painter().rect_filled(
                         Rect::from_min_max(
-                            Pos2::new(rect.left() + rect.width()/2.0+1.0, rect.bottom() - meter_height * right),
+                            Pos2::new(
+                                rect.left() + rect.width() / 2.0 + 1.0,
+                                rect.bottom() - meter_height * right,
+                            ),
                             rect.max,
                         ),
                         0.0,

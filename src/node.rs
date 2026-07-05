@@ -1,27 +1,44 @@
-#[repr(C)]
+/// A node's value kind, decoded from the 4-bit type nibble in a def's wire flags.
+///
+/// `#[non_exhaustive]` plus [`Unknown`](Self::Unknown) is the crate's compatibility
+/// policy (R21): newer firmware may introduce type discriminants this version of
+/// libwing has never seen. Rather than coercing such a discriminant into one of the
+/// known variants (which would misrepresent the node) or failing the whole parse,
+/// it is preserved verbatim so callers can tell "unknown to this libwing version"
+/// apart from every known type (R20).
+#[non_exhaustive]
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum NodeType {
-    Node = 0,
-    LinearFloat = 1,
-    LogarithmicFloat = 2,
-    FaderLevel = 3,
-    Integer = 4,
-    StringEnum = 5,
-    FloatEnum = 6,
-    String = 7,
+    Node,
+    LinearFloat,
+    LogarithmicFloat,
+    FaderLevel,
+    Integer,
+    StringEnum,
+    FloatEnum,
+    String,
+    /// A type nibble (0-15) not recognized by this version of libwing, carrying the
+    /// raw wire value.
+    Unknown(u8),
 }
 
-#[repr(C)]
+/// A node's engineering unit, decoded from the 4-bit unit nibble in a def's wire
+/// flags. See [`NodeType`] for the `Unknown`/non-exhaustive compatibility policy
+/// (R20, R21); the same reasoning applies here.
+#[non_exhaustive]
 #[derive(Copy, Clone, PartialEq, Debug)]
 pub enum NodeUnit {
-    None = 0,
-    Db = 1,
-    Percent = 2,
-    Milliseconds = 3,
-    Hertz = 4,
-    Meters = 5,
-    Seconds = 6,
-    Octaves = 7,
+    None,
+    Db,
+    Percent,
+    Milliseconds,
+    Hertz,
+    Meters,
+    Seconds,
+    Octaves,
+    /// A unit nibble (0-15) not recognized by this version of libwing, carrying the
+    /// raw wire value.
+    Unknown(u8),
 }
 
 #[derive(Clone)]
@@ -95,7 +112,8 @@ impl WingNodeDef {
         let long_name = read_string(raw, &mut i, long_name_len as usize)?;
         let flags = read_u16(raw, &mut i)?;
 
-        let node_type = match (flags >> 4) & 0x0F {
+        let type_nibble = ((flags >> 4) & 0x0F) as u8;
+        let node_type = match type_nibble {
             0 => NodeType::Node,
             1 => NodeType::LinearFloat,
             2 => NodeType::LogarithmicFloat,
@@ -104,10 +122,11 @@ impl WingNodeDef {
             5 => NodeType::StringEnum,
             6 => NodeType::FloatEnum,
             7 => NodeType::String,
-            _ => NodeType::Node,
+            n => NodeType::Unknown(n),
         };
 
-        let unit = match flags & 0x0F {
+        let unit_nibble = (flags & 0x0F) as u8;
+        let unit = match unit_nibble {
             0 => NodeUnit::None,
             1 => NodeUnit::Db,
             2 => NodeUnit::Percent,
@@ -116,7 +135,7 @@ impl WingNodeDef {
             5 => NodeUnit::Meters,
             6 => NodeUnit::Seconds,
             7 => NodeUnit::Octaves,
-            _ => NodeUnit::None,
+            n => NodeUnit::Unknown(n),
         };
 
         let read_only = ((flags >> 9) & 0x01) != 0;
@@ -132,6 +151,10 @@ impl WingNodeDef {
 
         match node_type {
             NodeType::Node => {}
+            // An unrecognized type nibble carries an unknown payload shape, so no
+            // type-specific fields are read; the full framed def is still preserved
+            // verbatim in `raw` (R20).
+            NodeType::Unknown(_) => {}
             NodeType::String => {
                 max_string_len = Some(read_u16(raw, &mut i)?);
             }
@@ -235,6 +258,24 @@ fn read_string(raw: &[u8], i: &mut usize, len: usize) -> Result<String> {
     String::from_utf8(bytes.to_vec()).map_err(|_| Error::InvalidData)
 }
 
+/// A node's decoded value, in whichever wire encoding the console actually sent
+/// (string, float, or integer).
+///
+/// Value facets (R14): the wire protocol only ever gives libwing one raw value per
+/// node plus, for enum-typed nodes, a def that maps it to a label. So the facets
+/// this crate exposes are:
+/// - **raw**: [`get_string`](Self::get_string), [`get_float`](Self::get_float),
+///   [`get_int`](Self::get_int) — the value exactly as decoded off the wire.
+/// - **display**: [`display_string`](Self::display_string) — the raw value resolved
+///   through the owning [`WingNodeDef`] to what a user would read (an enum item's
+///   label rather than its numeric index/value); falls back to the raw rendering for
+///   non-enum types, since the wire carries no separate display encoding for them.
+///
+/// There is no separate normalized/real facet to expose: for `FaderLevel` /
+/// `LinearFloat` / `LogarithmicFloat` nodes the wire float *is* already the real
+/// engineering-unit value (bounded by the def's `min_float`/`max_float`), not a
+/// normalized 0..1 encoding libwing would need to denormalize. Inventing one would
+/// misrepresent a facet the protocol doesn't actually carry.
 pub struct WingNodeData {
     string_value: Option<String>,
     float_value: Option<f32>,
@@ -326,6 +367,39 @@ impl WingNodeData {
     pub fn has_int(&self) -> bool {
         self.int_value.is_some()
     }
+
+    /// The display facet (R14): resolves this value through `def` to what a user
+    /// would read, rather than the raw wire encoding.
+    ///
+    /// - `StringEnum`: the raw value is an index into `def.string_enum`; returns the
+    ///   matching item's short label.
+    /// - `FloatEnum`: the raw value is one of `def.float_enum`'s item values; returns
+    ///   the matching item's long label.
+    /// - Anything else, or an index/value with no matching entry (e.g. an index a
+    ///   newer firmware added that this def snapshot doesn't have): falls back to
+    ///   [`get_string`](Self::get_string) rather than guessing, so an unrecognized
+    ///   enum value is never silently mislabeled (R20).
+    pub fn display_string(&self, def: &WingNodeDef) -> String {
+        match def.node_type {
+            NodeType::StringEnum => {
+                if let (Some(items), Some(idx)) = (&def.string_enum, self.int_value) {
+                    if let Some(item) = usize::try_from(idx).ok().and_then(|i| items.get(i)) {
+                        return item.item.clone();
+                    }
+                }
+                self.get_string()
+            }
+            NodeType::FloatEnum => {
+                if let (Some(items), Some(v)) = (&def.float_enum, self.float_value) {
+                    if let Some(item) = items.iter().find(|i| i.item == v) {
+                        return item.long_item.clone();
+                    }
+                }
+                self.get_string()
+            }
+            _ => self.get_string(),
+        }
+    }
 }
 
 impl WingNodeDef {
@@ -377,28 +451,30 @@ impl WingNodeDef {
         r.push_str(&format!(
             "\nType:      {}",
             match self.node_type {
-                NodeType::Node => "node",
-                NodeType::LinearFloat => "linear float",
-                NodeType::LogarithmicFloat => "log float",
-                NodeType::Integer => "integer",
-                NodeType::String => "string",
-                NodeType::FaderLevel => "fader level (float)",
-                NodeType::StringEnum => "string enum",
-                NodeType::FloatEnum => "float enum",
+                NodeType::Node => "node".to_string(),
+                NodeType::LinearFloat => "linear float".to_string(),
+                NodeType::LogarithmicFloat => "log float".to_string(),
+                NodeType::Integer => "integer".to_string(),
+                NodeType::String => "string".to_string(),
+                NodeType::FaderLevel => "fader level (float)".to_string(),
+                NodeType::StringEnum => "string enum".to_string(),
+                NodeType::FloatEnum => "float enum".to_string(),
+                NodeType::Unknown(n) => format!("unknown (0x{n:x})"),
             }
         ));
         if self.unit != NodeUnit::None {
             r.push_str(&format!(
                 "\nUnit:      {}",
                 match self.unit {
-                    NodeUnit::Db => "dB",
-                    NodeUnit::Percent => "%",
-                    NodeUnit::Milliseconds => "ms",
-                    NodeUnit::Hertz => "Hz",
-                    NodeUnit::Meters => "meters",
-                    NodeUnit::Seconds => "seconds",
-                    NodeUnit::Octaves => "octaves",
-                    _ => "UNKNOWN",
+                    NodeUnit::Db => "dB".to_string(),
+                    NodeUnit::Percent => "%".to_string(),
+                    NodeUnit::Milliseconds => "ms".to_string(),
+                    NodeUnit::Hertz => "Hz".to_string(),
+                    NodeUnit::Meters => "meters".to_string(),
+                    NodeUnit::Seconds => "seconds".to_string(),
+                    NodeUnit::Octaves => "octaves".to_string(),
+                    NodeUnit::Unknown(n) => format!("unknown (0x{n:x})"),
+                    NodeUnit::None => String::new(),
                 }
             ));
         }
@@ -514,9 +590,17 @@ impl WingNodeDef {
             NodeType::FloatEnum => {
                 json.insert("type", "float enum").unwrap();
             }
+            NodeType::Unknown(n) => {
+                json.insert("type", "unknown").unwrap();
+                json.insert("type_raw", n).unwrap();
+            }
         }
         match self.unit {
             NodeUnit::None => {}
+            NodeUnit::Unknown(n) => {
+                json.insert("unit", "unknown").unwrap();
+                json.insert("unit_raw", n).unwrap();
+            }
             NodeUnit::Db => {
                 json.insert("unit", "dB").unwrap();
             }

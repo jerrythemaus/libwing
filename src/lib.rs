@@ -93,6 +93,10 @@ pub use node::{NodeType, NodeUnit, WingNodeData, WingNodeDef};
 
 type Result<T> = std::result::Result<T, Error>;
 
+/// `#[non_exhaustive]` (R21): new failure modes may be added in a minor release
+/// without that being a breaking change for callers who already match with a
+/// wildcard arm.
+#[non_exhaustive]
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("IO error: {0}")]
