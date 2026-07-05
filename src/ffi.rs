@@ -1423,6 +1423,8 @@ mod tests {
         assert_eq!(data, [1, 2]);
     }
 
+    // Needs a populated embedded map; under --no-default-features NAME_TO_DEF is empty.
+    #[cfg(feature = "propmap")]
     #[test]
     fn name_to_def_matches_rust_lookup_for_known_name() {
         let name = CString::new("/ch/1/fdr").unwrap();
@@ -1458,6 +1460,7 @@ mod tests {
             .contains("not found"));
     }
 
+    #[cfg(feature = "propmap")]
     #[test]
     fn id_to_defs_enumerates_same_candidate_as_name_to_def() {
         let rust_def = WingConsole::name_to_def("/ch/1/fdr").expect("known propmap entry");
@@ -1486,6 +1489,7 @@ mod tests {
         wing_response_destroy(def_handle);
     }
 
+    #[cfg(feature = "propmap")]
     #[test]
     fn id_to_defs_get_name_reports_short_buffer_without_writing() {
         let rust_def = WingConsole::name_to_def("/ch/1/fdr").expect("known propmap entry");

@@ -380,24 +380,15 @@ impl WingNodeData {
     ///   [`get_string`](Self::get_string) rather than guessing, so an unrecognized
     ///   enum value is never silently mislabeled (R20).
     pub fn display_string(&self, def: &WingNodeDef) -> String {
-        match def.node_type {
-            NodeType::StringEnum => {
-                if let (Some(items), Some(idx)) = (&def.string_enum, self.int_value) {
-                    if let Some(item) = usize::try_from(idx).ok().and_then(|i| items.get(i)) {
-                        return item.item.clone();
-                    }
-                }
-                self.get_string()
-            }
-            NodeType::FloatEnum => {
-                if let (Some(items), Some(v)) = (&def.float_enum, self.float_value) {
-                    if let Some(item) = items.iter().find(|i| i.item == v) {
-                        return item.long_item.clone();
-                    }
-                }
-                self.get_string()
-            }
-            _ => self.get_string(),
+        // Single source of truth for enum raw->label resolution: reuse
+        // `decode_enum` (R19) so this facet can't silently diverge from it.
+        // The display facet wants the short label for a StringEnum and the long
+        // label for a FloatEnum; any unresolved/unknown value falls back to the
+        // raw rendering rather than guessing (R20).
+        match crate::helpers::decode_enum(def, self) {
+            crate::helpers::EnumDecode::StringEnum { item, .. } => item,
+            crate::helpers::EnumDecode::FloatEnum { long_item, .. } => long_item,
+            crate::helpers::EnumDecode::Unknown(_) => self.get_string(),
         }
     }
 }

@@ -106,7 +106,7 @@ If you want to eliminate the list of name-to-ID mappings built into the code,
 disable the default `propmap` feature:
 
 ```toml
-libwing = { version = "1.0.4", default-features = false }
+libwing = { version = "2.0.0", default-features = false }
 ```
 
 Note, you will break some of the utility of the utility programs if you do

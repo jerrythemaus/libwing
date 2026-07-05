@@ -1,11 +1,9 @@
 //! Integration tests for the risk taxonomy + confirmation-hook layer (R40, R41).
 //!
-//! NOTE: these test the crate's *public* API (`libwing::{Operation, RiskClass,
-//! risk_class, ConfirmationGuard, ConfirmationRequired}`), so they only compile
-//! once `libwing/src/lib.rs` has `mod safety;` plus the re-exports described in
-//! this unit's final report. Until that wiring lands, this file is expected to
-//! fail to compile — the equivalent coverage already runs today via
-//! `cargo test --lib safety` against `src/safety.rs`'s own `#[cfg(test)]` module.
+//! These exercise the crate's *public* API (`libwing::{Operation, RiskClass,
+//! risk_class, ConfirmationGuard, ConfirmationRequired}`) from the consumer
+//! side, mirroring `src/safety.rs`'s own `#[cfg(test)]` unit tests that cover
+//! the same logic from inside the crate.
 
 use libwing::{risk_class, ConfirmationGuard, Operation, RiskClass};
 

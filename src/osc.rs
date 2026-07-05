@@ -852,8 +852,8 @@ impl WingOscClient {
 
     /// Sends `msg` and waits up to `timeout` for its reply: a message whose address
     /// equals `msg.addr` (the normal get/set-single-parameter case), or the node-ack
-    /// address it implies (`<msg.addr>*`, covering [`node_set_local`]; `/*` also
-    /// matches, covering [`node_set_root`]).
+    /// address it implies (`<msg.addr>*`, covering [`node_set_local`]; `/*` covering
+    /// [`node_set_root`], but only when this request was itself a root op).
     ///
     /// Robustness (R75): anything else received while waiting -- an out-of-order
     /// unrelated message -- is buffered (arrival order preserved) rather than dropped,
@@ -871,7 +871,12 @@ impl WingOscClient {
                 return Err(OscError::Timeout);
             }
             let reply = self.recv(remaining)?;
-            if reply.addr == msg.addr || reply.addr == node_ack_addr || reply.addr == "/*" {
+            // `/*` is the ack for a *root* node op only (msg.addr == "/"); accepting it for
+            // every request would let a stray root-ack satisfy an unrelated get/set. The
+            // per-request `<msg.addr>*` form is already request-specific, so it needs no such
+            // guard.
+            let root_ack = msg.addr == "/" && reply.addr == "/*";
+            if reply.addr == msg.addr || reply.addr == node_ack_addr || root_ack {
                 self.drain_duplicate_replies(&reply);
                 return Ok(reply);
             }
