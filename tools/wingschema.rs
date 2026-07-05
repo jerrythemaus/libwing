@@ -6,7 +6,91 @@ use std::fs::File;
 use std::io::Write;
 use std::result::Result;
 
-use libwing::{WingConsole, WingNodeDef, WingResponse};
+use libwing::{WingConsole, WingNodeData, WingNodeDef, WingResponse};
+
+/// One model selector's pre-crawl state: its node id, its full path (for
+/// reporting), and the value it held before the crawl started flipping it.
+type SelectorSnapshot = (i32, String, String);
+
+/// Read a node's current value directly (`request_node_data` + read loop),
+/// bypassing the propmap so this works during the crawl itself, before any
+/// def has been embedded. Returns `None` if the console never replies with
+/// data for `id` (e.g. a write-only node).
+fn read_node_data(wing: &mut WingConsole, id: i32) -> Option<WingNodeData> {
+    wing.request_node_data(id).ok()?;
+    let mut found = None;
+    loop {
+        match wing.read().ok()? {
+            WingResponse::NodeData(rid, data) => {
+                if rid == id {
+                    found = Some(data);
+                }
+            }
+            WingResponse::NodeDef(_) => {}
+            WingResponse::RequestEnd => break,
+        }
+    }
+    found
+}
+
+/// Pure: dedup a snapshot by node id, keeping the first (closest to true
+/// pre-crawl) value recorded for each. Separating "what to restore" from
+/// "how to restore it" keeps this testable without a console.
+fn plan_restore(snapshot: &[SelectorSnapshot]) -> Vec<SelectorSnapshot> {
+    let mut seen = std::collections::HashSet::new();
+    snapshot
+        .iter()
+        .filter(|(id, _, _)| seen.insert(*id))
+        .cloned()
+        .collect()
+}
+
+/// Outcome of one restore attempt, used to build a [`RestoreReport`].
+struct RestoreOutcome {
+    id: i32,
+    fullname: String,
+    restored: bool,
+}
+
+/// Summary of a snapshot-restore pass (R32/OQ8): a full restore is never
+/// assumed, only reported once every selector's outcome is known.
+struct RestoreReport {
+    attempted: usize,
+    failed: Vec<(i32, String)>,
+}
+
+impl RestoreReport {
+    /// Pure: builds the report from already-executed outcomes.
+    fn from_outcomes(outcomes: &[RestoreOutcome]) -> Self {
+        RestoreReport {
+            attempted: outcomes.len(),
+            failed: outcomes
+                .iter()
+                .filter(|o| !o.restored)
+                .map(|o| (o.id, o.fullname.clone()))
+                .collect(),
+        }
+    }
+
+    fn is_degraded(&self) -> bool {
+        !self.failed.is_empty()
+    }
+}
+
+/// Restore every snapshotted selector to its pre-crawl value on a
+/// best-effort basis: one failure doesn't stop the rest from being
+/// attempted, and every outcome is recorded for the degraded report.
+fn restore_selectors(wing: &mut WingConsole, snapshot: &[SelectorSnapshot]) -> RestoreReport {
+    let outcomes: Vec<RestoreOutcome> = plan_restore(snapshot)
+        .into_iter()
+        .map(|(id, fullname, value)| RestoreOutcome {
+            restored: wing.set_string(id, &value).is_ok(),
+            id,
+            fullname,
+        })
+        .collect();
+    RestoreReport::from_outcomes(&outcomes)
+}
 
 /// Append one `[flag u8][namelen u16][name][deflen u16][def]` entry to the raw
 /// blob that gets embedded into `propmap.rs`. Shared by the live sweep and the
@@ -23,8 +107,10 @@ fn push_entry(raw: &mut Vec<u8>, flag: u8, fullname: &str, def_bytes: &[u8]) {
 /// The loader emitted here must stay in lockstep with the one already compiled
 /// into `src/propmap.rs` (and `src/empty-propmap.rs`'s empty fallback).
 fn write_propmap_rs(rust_file: &mut File, raw: &[u8]) -> std::io::Result<()> {
-    writeln!(rust_file, "use std::collections::HashMap;")?;
+    // rustfmt import order (crate before std), so a fmt pass over the
+    // generated file is a no-op and regeneration produces no diff noise.
     writeln!(rust_file, "use crate::node::WingNodeDef;")?;
+    writeln!(rust_file, "use std::collections::HashMap;")?;
     writeln!(rust_file, "lazy_static::lazy_static! {{")?;
     writeln!(
         rust_file,
@@ -101,6 +187,7 @@ fn add(
     parent_fullname: &str,
     nodes: &[WingNodeDef],
     ignore: bool,
+    snapshot: &mut Vec<SelectorSnapshot>,
 ) -> usize {
     let mut cnt = cnt;
     if !ignore {
@@ -127,7 +214,33 @@ fn add(
                 writeln!(json_file, "{}", jzon::stringify(json)).unwrap();
                 push_entry(raw, 0, &fullname, &def.raw);
 
-                cnt = add(cnt, wing, json_file, raw, &fullname, &children[i], false);
+                cnt = add(
+                    cnt,
+                    wing,
+                    json_file,
+                    raw,
+                    &fullname,
+                    &children[i],
+                    false,
+                    snapshot,
+                );
+            }
+
+            // This is the crawl's one destructive act: it's about to flip `mdl_def`
+            // through every model in turn. Capture what it's currently set to
+            // (resolved to the enum item's name via `display_string`, since a
+            // StringEnum's raw NodeData is an index, not the name `set_string`
+            // expects) before the first mutation, so it can be restored after.
+            let mdl_fullname = String::new() + parent_fullname + "/mdl";
+            match read_node_data(wing, mdl_def.id) {
+                Some(data) => {
+                    snapshot.push((mdl_def.id, mdl_fullname, data.display_string(mdl_def)))
+                }
+                None => eprintln!(
+                    "\nwarning: could not read current value of {mdl_fullname} ({}) before crawl; \
+                     it will not be restored afterward",
+                    mdl_def.id
+                ),
             }
 
             for item in mdl_def.string_enum.as_ref().unwrap().iter() {
@@ -142,6 +255,7 @@ fn add(
                     &parent_fullname,
                     &children[0],
                     true,
+                    snapshot,
                 );
             }
 
@@ -172,7 +286,16 @@ fn add(
                 &def.raw,
             );
 
-            cnt = add(cnt, wing, json_file, raw, &fullname, &children[i], false);
+            cnt = add(
+                cnt,
+                wing,
+                json_file,
+                raw,
+                &fullname,
+                &children[i],
+                false,
+                snapshot,
+            );
         }
     }
     print!("\rReceived {} nodes", cnt);
@@ -417,23 +540,33 @@ fn main() -> Result<(), libwing::Error> {
 
     let mut args = Args::new(
         r#"
-Usage: wingschema [-h host]
+Usage: wingschema [-h host] [--yes]
        wingschema embed [sweep.jsonl]
 
    -h host : IP address or hostname of Wing mixer. Default is to discover and connect to the first mixer found.
+   --yes   : Skip the interactive confirmation prompt (for automation). The crawl is still
+             destructive; only pass this once you've accepted that.
    embed   : Offline regeneration. Rebuilds src/propmap.rs and src/propmap.jsonl from an
              existing full-sweep JSONL file (default: propmap.jsonl in the current directory)
              without connecting to a live console.
 "#,
     );
     let mut host = None;
-    if args.has_next() && args.next() == "-h" {
-        host = Some(args.next());
+    let mut skip_confirm = false;
+    while args.has_next() {
+        match args.next().as_str() {
+            "-h" => host = Some(args.next()),
+            "--yes" => skip_confirm = true,
+            other => {
+                args.print_help(Some(&format!("unknown argument: {other}")));
+                std::process::exit(1);
+            }
+        }
     }
 
-    // print out a message asking the user if it is ok to connect and get the schema, which WILL
-    // change the properties of the device, so you should have had a saved snapshot. ask them on
-    // the commandline and let them type "yes" to continue.
+    // Warn that this sweep is destructive (it flips every model selector on the
+    // console — RiskClass::DestructiveSchemaCrawl) and require confirmation,
+    // either interactively or via `--yes` for automation.
     println!(
         r#"
 This tool will connect to a Behringer Wing Mixer on your network and get the
@@ -441,19 +574,25 @@ schema of all properties. It will change the properties of the device in a
 destructive manner, so you should have had a saved snapshot you can restore
 after this process is complete.
 
-THIS IS A DESTRUCTIVE OPERATION AND CAN NOT BE UNDONE WITHOUT
-REINITIALIZING YOUR MIXER FROM SCRATCH.
+THIS IS A DESTRUCTIVE OPERATION. The crawl snapshots each model selector's
+current value before flipping it and restores it afterward on a best-effort
+basis, but if the restore itself fails partway through, recovering fully may
+require reinitializing your mixer from a backup.
 
 Do you have a backup snapshot you can restore after, and want to continue?
 "#
     );
-    print!("Enter 'yes' to continue: ");
-    std::io::stdout().flush().unwrap();
-    let mut input = String::new();
-    std::io::stdin().read_line(&mut input).unwrap();
-    if input.trim().to_lowercase() != "yes" {
-        println!("Aborting");
-        return Ok(());
+    if skip_confirm {
+        println!("--yes passed: skipping interactive confirmation.");
+    } else {
+        print!("Enter 'yes' to continue: ");
+        std::io::stdout().flush().unwrap();
+        let mut input = String::new();
+        std::io::stdin().read_line(&mut input).unwrap();
+        if input.trim().to_lowercase() != "yes" {
+            println!("Aborting");
+            return Ok(());
+        }
     }
 
     let mut wing = WingConsole::connect(host.as_deref())?;
@@ -473,21 +612,125 @@ Do you have a backup snapshot you can restore after, and want to continue?
         .unwrap();
 
     let mut raw = Vec::<u8>::new();
+    let mut snapshot: Vec<SelectorSnapshot> = Vec::new();
     let children = get_node_def(&mut wing, Vec::from([0]));
-    add(
-        1,
-        &mut wing,
-        &mut json_file,
-        &mut raw,
-        "",
-        &children[0],
-        false,
+
+    // The crawl mutates every model selector it finds. If it panics partway
+    // through (e.g. a dropped connection hitting one of its `.unwrap()`s),
+    // still restore whatever selectors were captured before the panic rather
+    // than leaving the console in a half-swept state with no attempt made.
+    let crawl_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        add(
+            1,
+            &mut wing,
+            &mut json_file,
+            &mut raw,
+            "",
+            &children[0],
+            false,
+            &mut snapshot,
+        )
+    }));
+
+    print!(
+        "\nRestoring {} pre-crawl model selector(s)... ",
+        snapshot.len()
     );
-    print!("\nFinishing up... ");
     std::io::stdout().flush().unwrap();
-
-    write_propmap_rs(&mut rust_file, &raw).unwrap();
-
+    let report = restore_selectors(&mut wing, &snapshot);
     println!("done");
+
+    if crawl_result.is_err() {
+        eprintln!("\nSchema crawl aborted partway through (see panic above).");
+    } else {
+        // The sweep data is complete and valid regardless of how the restore
+        // went — a destructive crawl is expensive, so never discard its output
+        // over a restore failure (that gets its own report + nonzero exit).
+        print!("\nFinishing up... ");
+        std::io::stdout().flush().unwrap();
+        write_propmap_rs(&mut rust_file, &raw).unwrap();
+        println!("done");
+    }
+
+    if report.is_degraded() {
+        eprintln!(
+            "\nDEGRADED: {} of {} selector(s) could not be restored:",
+            report.failed.len(),
+            report.attempted
+        );
+        for (id, fullname) in &report.failed {
+            eprintln!("  - {fullname} (id {id})");
+        }
+        std::process::exit(1);
+    }
+
+    if crawl_result.is_err() {
+        std::process::exit(1);
+    }
+
     Ok(())
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+
+    fn snap(id: i32, fullname: &str, value: &str) -> SelectorSnapshot {
+        (id, fullname.to_string(), value.to_string())
+    }
+
+    #[test]
+    fn plan_restore_dedups_by_id_keeping_first_value() {
+        let snapshot = vec![
+            snap(1, "/fx/1/mdl", "HALL"),
+            snap(2, "/fx/2/mdl", "PLATE"),
+            // A later (bogus) duplicate entry for id 1 must not shadow the
+            // real pre-crawl value captured first.
+            snap(1, "/fx/1/mdl", "SPRING"),
+        ];
+        let plan = plan_restore(&snapshot);
+        assert_eq!(plan.len(), 2);
+        assert_eq!(plan[0], snap(1, "/fx/1/mdl", "HALL"));
+        assert_eq!(plan[1], snap(2, "/fx/2/mdl", "PLATE"));
+    }
+
+    #[test]
+    fn report_is_not_degraded_when_all_outcomes_succeed() {
+        let outcomes = vec![
+            RestoreOutcome {
+                id: 1,
+                fullname: "/fx/1/mdl".to_string(),
+                restored: true,
+            },
+            RestoreOutcome {
+                id: 2,
+                fullname: "/fx/2/mdl".to_string(),
+                restored: true,
+            },
+        ];
+        let report = RestoreReport::from_outcomes(&outcomes);
+        assert_eq!(report.attempted, 2);
+        assert!(!report.is_degraded());
+        assert!(report.failed.is_empty());
+    }
+
+    #[test]
+    fn report_is_degraded_and_lists_failures() {
+        let outcomes = vec![
+            RestoreOutcome {
+                id: 1,
+                fullname: "/fx/1/mdl".to_string(),
+                restored: true,
+            },
+            RestoreOutcome {
+                id: 2,
+                fullname: "/fx/2/mdl".to_string(),
+                restored: false,
+            },
+        ];
+        let report = RestoreReport::from_outcomes(&outcomes);
+        assert_eq!(report.attempted, 2);
+        assert!(report.is_degraded());
+        assert_eq!(report.failed, vec![(2, "/fx/2/mdl".to_string())]);
+    }
 }
