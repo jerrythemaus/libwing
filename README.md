@@ -34,19 +34,51 @@ cargo build --all-targets
 Check out the code in the tools/ subdir for simple utilities that discovers,
 connects, and do various simple things with **libwing**.
 
+### Rust API overview
+
+libwing is a Rust library first (the C API below is a best-effort mirror).
+Beyond the low-level primitives (`connect`/`read`/`request_node_*`/`set_*`),
+the crate provides:
+
+- **Dynamic schema**: the embedded per-model property map plus
+  `Schema::resolve_id`/`resolve_path` (model-aware resolution of ids reused
+  across FX/EQ/gate/dyn models), `LiveSchema` (runtime subtree refresh after a
+  model change), and `Schema::staleness` (embedded-map vs console firmware).
+- **Attended gets**: `get_node_data`/`get_node_definition` (+ `_by_name`) —
+  request, correlate, and await with a timeout, buffering unrelated traffic.
+- **Reconnect**: `WingConsole::reconnect` with bounded backoff; the
+  `SessionGap` result states exactly what was lost.
+- **Typed helpers**: enum encode/decode by item/long-item/index, bulk
+  get/set, and `dump_subtree`/`restore` with model-first ordering.
+- **Meters**: typed per-family frame decode (`decode_frame`, `ChannelMeter`,
+  RTA, V2 families) with dB scaling helpers — layouts are spec-derived,
+  hardware verification pending.
+- **OSC** (`libwing::osc`): a sibling UDP transport — get/set, node ops,
+  subscriptions with renewal, robustness policies, plus a
+  Native/OSC `transport_availability` map per operation.
+- **Safety**: an operation risk taxonomy with confirmation hooks
+  (`RiskClass`, `ConfirmationGuard`).
+
+Unknown future firmware values (node types, units, enum items) are preserved
+explicitly rather than coerced (`NodeType::Unknown(..)` etc.), and public
+enums are `#[non_exhaustive]` so additions don't break consumers.
+
 ## FFI/C API
 
-The library provides a complete C API through FFI bindings. This allows
-seamless integration with existing C/C++ code while maintaining memory safety
-through Rust's ownership model.
-
-See [libwing.h](libwing.h) for the complete C API.
+The library provides a C API through FFI bindings covering connection,
+get/set, node definitions, meters, property-map lookups, keepalives, and
+structured last-error retrieval. The C surface is best-effort: it tracks the
+Rust API but does not cover all of it (no OSC, schema resolution, or
+dump/restore helpers yet) — see [COVERAGE.md](COVERAGE.md) for the current
+status and [libwing.h](libwing.h) for the available declarations, including
+per-function ownership and out-parameter rules.
 
 ## [propmap.rs](src/propmap.rs), [empty-propmap.rs](src/empty-propmap.rs), and [propmap.jsonl](propmap.jsonl)
 
 This library includes a very large mapping of property names, IDs, types, and
-parent IDs in `propmap.rs`. It's over 78,000 entries and adds about 1MB to your
-binary. It will also use a few MB of RAM when loaded.
+parent IDs in `propmap.rs`. It carries 60,748 entries (the full per-model
+dynamic sweep — see below) and adds about 1MB to your binary. It will also use
+a few MB of RAM when loaded.
 
 The Wing's Native protocol only really deals with IDs, so if you ever want to
 print a property name or look up a property ID by name, you need this mapping.
@@ -81,9 +113,14 @@ Note, you will break some of the utility of the utility programs if you do
 this. The `empty-propmap.rs` file is used automatically when this feature is
 disabled.
 
-The default `propmap.rs` and `propmap.jsonl` included in this repo was
-generated from a Wing Compact running 3.0.5 firmware and contains over 78,000
-entries.
+The embedded `src/propmap.rs`/`src/propmap.jsonl` in this repo are generated
+from the full sweep at `propmap.jsonl` (60,748 entries), captured from a WING
+Rack (24 local in / 8 out) running firmware **3.1** — the pinned baseline the
+library reports via `libwing::FIRMWARE_BASELINE` and checks connected consoles
+against (`Schema::staleness`). Source provenance and known data caveats are
+recorded in [PROVENANCE.md](PROVENANCE.md); per-surface implementation status
+in [COVERAGE.md](COVERAGE.md). Other console models (full WING, WING Compact,
+WING-BK) remain unverified against this map.
 
 ### The dynamic nature of the Wing's properties, especially FX slots
 
@@ -123,9 +160,12 @@ meters jump around. Run `wingmeters --help` to see the options.
 ## wingschema utility
 
 **wingschema** will request every property schema and save them to two files.
-As of firmware 3.0.5, there are over 78,000 entries. See above about more
-information about the two files as well as how you can use this to update the
-property map in the library. Run `wingschema --help` to see the options.
+As of the pinned 3.1 WING Rack sweep, there are 60,748 entries. See above about
+more information about the two files as well as how you can use this to update
+the property map in the library. The live sweep is destructive (it flips every
+model selector); it warns, snapshots the selectors, and restores them
+afterwards, reporting anything it could not restore. Run `wingschema --help` to
+see the options.
 
 ## wingmon utility
 

@@ -6,13 +6,13 @@
 //!
 //! # Libwing SDK Documentation
 //!
-//! Libwing is a C++ library for interfacing with Behringer Wing digital mixing
+//! Libwing is a Rust library for interfacing with Behringer Wing digital mixing
 //! consoles. It provides functionality for discovering Wing consoles on the
 //! network, connecting to them, reading/writing console parameters, and receiving
 //! any changes made on the mixer itself.
 //!
-//! There is a C wrapper for this library. It generally follows the C++ API. You
-//! can find it in `wing_c_api.h`.
+//! There is a C wrapper for this library. It generally follows the Rust API. You
+//! can find it in `libwing.h`.
 //!
 //! ## Basic Concepts
 //!
