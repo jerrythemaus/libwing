@@ -587,6 +587,27 @@ impl WingConsole {
         }
     }
 
+    /// [`read`](Self::read), bounded by `timeout`: returns `Err(Error::Timeout)` if nothing
+    /// arrives in time instead of blocking indefinitely.
+    ///
+    /// Plain `read()` has no such bound when the socket goes quiet — `decode_next`'s
+    /// WouldBlock/TimedOut retry only checks `op_deadline`, which is `None` outside an attended
+    /// fetch (`get_node_data`/`get_node_definition`/`fetch_subtree_definitions`), so it just
+    /// re-arms the socket timeout and loops forever, sending automatic keepalives but never
+    /// returning control to the caller. A reader loop that also needs to service outbound writes
+    /// between reads (e.g. `Controller::reader_loop`) would starve indefinitely once the console
+    /// stops replying for even one read cycle: it can never get back to draining newly-queued
+    /// commands, so nothing queued after that point ever reaches the wire. This wraps `read()`
+    /// with the same deadline mechanism the attended-get paths already use, so a caller can poll
+    /// with a short timeout and loop back to check its own outbound work on every `Timeout`.
+    pub fn read_timeout(&mut self, timeout: Duration) -> Result<WingResponse> {
+        let deadline = Instant::now() + timeout;
+        self.set_op_deadline(Some(deadline));
+        let result = self.read();
+        self.set_op_deadline(None);
+        result
+    }
+
     fn read_i8(&mut self, r: &mut _WingConsoleMain, _ch: i8, raw: &mut Vec<u8>) -> Result<i8> {
         Ok(self.decode_next(r, raw)?.1 as i8)
     }
@@ -724,7 +745,6 @@ impl WingConsole {
                     .set_read_timeout(Some(read_timeout))?;
                 match self.rsock.clone().lock().unwrap().read(&mut r.rx_buf) {
                     Ok(n) if n > 0 => {
-                        // println!("got n {}...", n);
                         r.rx_buf_size = n;
                         r.rx_buf_tail = 0;
                     }
@@ -783,6 +803,85 @@ impl WingConsole {
                     raw.push(byte);
                     break Ok((r.rx_current_channel, byte));
                 }
+            }
+        }
+    }
+
+    /// Encode one [`Meter`] request entry into `request_meter`'s subscribe buffer: an opcode byte
+    /// followed by an escaped 0-based index byte for every indexed variant (no index byte for
+    /// `Monitor`/`Rta`).
+    ///
+    /// Every indexed variant's `n` is documented (and used throughout wing-core, e.g.
+    /// `Controller::default_meter_request`) as the 1-based channel/strip number matching the
+    /// console's own numbering (`/ch/1/...`-style). The binary meter-subscribe protocol's index
+    /// byte is 0-based, confirmed against a real WING rack console 2026-07-06: requesting
+    /// `Meter::Channel(1)` (intending physical channel 1) returned physical channel 2's live level
+    /// as the first decoded object — a uniform one-channel shift reproduced with live signal on
+    /// channels 2 and 4 landing at decoded slots 1 and 3. Subtract 1 here, once, so every caller
+    /// can keep using the 1-based convention the rest of this crate and wing-core already assume.
+    fn encode_meter(buf: &mut Vec<u8>, meter: &Meter) {
+        match meter {
+            Meter::Channel(n) => {
+                buf.push(0xa0);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Aux(n) => {
+                buf.push(0xa1);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Bus(n) => {
+                buf.push(0xa2);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Main(n) => {
+                buf.push(0xa3);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Matrix(n) => {
+                buf.push(0xa4);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Dca(n) => {
+                buf.push(0xa5);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Fx(n) => {
+                buf.push(0xa6);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Source(n) => {
+                buf.push(0xa7);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Output(n) => {
+                buf.push(0xa8);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Monitor => {
+                buf.push(0xa9);
+            }
+            Meter::Rta => {
+                buf.push(0xaa);
+            }
+            Meter::Channel2(n) => {
+                buf.push(0xab);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Aux2(n) => {
+                buf.push(0xac);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Bus2(n) => {
+                buf.push(0xad);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Main2(n) => {
+                buf.push(0xae);
+                Self::push_escaped(buf, *n - 1);
+            }
+            Meter::Matrix2(n) => {
+                buf.push(0xaf);
+                Self::push_escaped(buf, *n - 1);
             }
         }
     }
@@ -969,70 +1068,7 @@ impl WingConsole {
         buf.push(0xdc);
 
         for meter in meters {
-            match meter {
-                Meter::Channel(n) => {
-                    buf.push(0xa0);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Aux(n) => {
-                    buf.push(0xa1);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Bus(n) => {
-                    buf.push(0xa2);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Main(n) => {
-                    buf.push(0xa3);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Matrix(n) => {
-                    buf.push(0xa4);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Dca(n) => {
-                    buf.push(0xa5);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Fx(n) => {
-                    buf.push(0xa6);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Source(n) => {
-                    buf.push(0xa7);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Output(n) => {
-                    buf.push(0xa8);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Monitor => {
-                    buf.push(0xa9);
-                }
-                Meter::Rta => {
-                    buf.push(0xaa);
-                }
-                Meter::Channel2(n) => {
-                    buf.push(0xab);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Aux2(n) => {
-                    buf.push(0xac);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Bus2(n) => {
-                    buf.push(0xad);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Main2(n) => {
-                    buf.push(0xae);
-                    Self::push_escaped(&mut buf, *n);
-                }
-                Meter::Matrix2(n) => {
-                    buf.push(0xaf);
-                    Self::push_escaped(&mut buf, *n);
-                }
-            }
+            Self::encode_meter(&mut buf, meter);
         }
 
         buf.push(0xde); // end of def
@@ -1463,6 +1499,69 @@ mod tests {
         bytes.push(b'N');
         bytes.extend_from_slice(&0_u16.to_be_bytes());
         bytes
+    }
+
+    // Regression (confirmed against a real WING rack console, 2026-07-06): every indexed Meter
+    // variant's wire index byte must be one less than its 1-based `n`, or the console streams a
+    // uniform one-channel-shifted set of levels (channel N's live signal lands on decoded slot
+    // N-1). See `encode_meter`'s doc comment for the full incident.
+    #[test]
+    fn encode_meter_channel_index_is_zero_based_on_the_wire() {
+        let mut buf = Vec::new();
+        WingConsole::encode_meter(&mut buf, &Meter::Channel(1));
+        assert_eq!(
+            buf,
+            vec![0xa0, 0],
+            "Meter::Channel(1) must address wire index 0"
+        );
+
+        let mut buf = Vec::new();
+        WingConsole::encode_meter(&mut buf, &Meter::Channel(4));
+        assert_eq!(
+            buf,
+            vec![0xa0, 3],
+            "Meter::Channel(4) must address wire index 3"
+        );
+    }
+
+    #[test]
+    fn encode_meter_every_indexed_variant_subtracts_one() {
+        let cases: &[(Meter, u8)] = &[
+            (Meter::Channel(2), 0xa0),
+            (Meter::Aux(2), 0xa1),
+            (Meter::Bus(2), 0xa2),
+            (Meter::Main(2), 0xa3),
+            (Meter::Matrix(2), 0xa4),
+            (Meter::Dca(2), 0xa5),
+            (Meter::Fx(2), 0xa6),
+            (Meter::Source(2), 0xa7),
+            (Meter::Output(2), 0xa8),
+            (Meter::Channel2(2), 0xab),
+            (Meter::Aux2(2), 0xac),
+            (Meter::Bus2(2), 0xad),
+            (Meter::Main2(2), 0xae),
+            (Meter::Matrix2(2), 0xaf),
+        ];
+        for (meter, opcode) in cases {
+            let mut buf = Vec::new();
+            WingConsole::encode_meter(&mut buf, meter);
+            assert_eq!(
+                buf,
+                vec![*opcode, 1],
+                "{meter:?} must encode n-1 after its opcode"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_meter_monitor_and_rta_have_no_index_byte() {
+        let mut buf = Vec::new();
+        WingConsole::encode_meter(&mut buf, &Meter::Monitor);
+        assert_eq!(buf, vec![0xa9]);
+
+        let mut buf = Vec::new();
+        WingConsole::encode_meter(&mut buf, &Meter::Rta);
+        assert_eq!(buf, vec![0xaa]);
     }
 
     #[test]

@@ -261,10 +261,10 @@ fn request_meter_encodes_port_id_and_meter_tokens_structurally() {
     assert_eq!(buf[i], 0xdc);
     i += 1;
 
-    // Meter::Channel(1): token 0xa0, then escaped index 1.
+    // Meter::Channel(1): token 0xa0, then escaped zero-based wire index 0.
     assert_eq!(buf[i], 0xa0);
     i += 1;
-    assert_eq!(take_escaped(&buf, &mut i, 1), vec![1]);
+    assert_eq!(take_escaped(&buf, &mut i, 1), vec![0]);
 
     // Meter::Rta: token 0xaa, no index.
     assert_eq!(buf[i], 0xaa);

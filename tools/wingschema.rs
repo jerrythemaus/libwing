@@ -179,6 +179,7 @@ fn get_node_def(wing: &mut WingConsole, parents: Vec<i32>) -> Vec<Vec<WingNodeDe
     ret
 }
 
+#[allow(clippy::too_many_arguments)]
 fn add(
     cnt: usize,
     wing: &mut WingConsole,
@@ -425,6 +426,7 @@ fn build_payload(row: &jzon::JsonValue, tcode: u8) -> Vec<u8> {
     payload
 }
 
+#[allow(clippy::too_many_arguments)]
 fn encode_def_bytes(
     parent_id: i32,
     id: i32,

@@ -149,7 +149,10 @@ pub fn load(path: &Path) -> Fixture {
 
 pub fn decode_hex(s: &str) -> Vec<u8> {
     let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    assert!(compact.len() % 2 == 0, "odd-length hex string: {compact:?}");
+    assert!(
+        compact.len().is_multiple_of(2),
+        "odd-length hex string: {compact:?}"
+    );
     (0..compact.len())
         .step_by(2)
         .map(|i| {

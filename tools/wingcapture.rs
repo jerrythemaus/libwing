@@ -141,7 +141,7 @@ fn split_prefix(line: &str) -> Option<(&str, &str)> {
 
 fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
     let compact: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    if compact.len() % 2 != 0 {
+    if !compact.len().is_multiple_of(2) {
         return Err("odd-length hex string".to_string());
     }
     (0..compact.len())

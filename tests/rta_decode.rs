@@ -20,7 +20,7 @@ fn decodes_120_bins_with_expected_db_values() {
             assert_eq!(bins.len(), RTA_BINS);
             assert_eq!(bins, &raw);
             assert_eq!(level_db(bins[0]), -1.0);
-            assert_eq!(level_db(bins[1]), -1.00390625); // -257 / 256
+            assert_eq!(level_db(bins[1]), -1.003_906_3); // -257 / 256
         }
         other => panic!("expected Rta, got {other:?}"),
     }
