@@ -1217,6 +1217,13 @@ impl WingConsole {
         NAME_TO_DEF.get(fullname)
     }
 
+    /// Iterate every `(fullname, def)` in the embedded property map. Used by offline discovery
+    /// (`wing-core::tools::search`, U1) which must rank over the whole tree. Empty when the
+    /// `propmap` feature is off.
+    pub fn propmap_iter() -> impl Iterator<Item = (&'static str, &'static WingNodeDef)> {
+        NAME_TO_DEF.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
     /// Total number of entries in the embedded property map. Exposed for the
     /// regeneration consistency tests (see `tests/propmap_consistency.rs`),
     /// which have no other way to see the size of the private `NAME_TO_DEF` map.
