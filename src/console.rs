@@ -8,6 +8,28 @@ use crate::node::{NodeType, WingNodeData, WingNodeDef};
 use crate::propmap::NAME_TO_DEF;
 use crate::{Error, Result, WingResponse};
 
+/// Lock a `Mutex`, recovering the guard if a panic in another thread poisoned it (U4 hardening).
+///
+/// `WingConsole` shares its transports and state across threads (a meter-reading loop alongside
+/// command writers) via `Arc<Mutex<_>>`. With `.lock_recover()`, one thread panicking while
+/// holding any of these locks would poison it and turn *every* subsequent console operation on
+/// every thread into a panic — a single fault cascading into a total, unrecoverable brick.
+///
+/// libwing's guarded sections are short and leave their data structurally valid across an unwind,
+/// so recovering the guard is safe and deliberate: a peer-thread panic no longer bricks the
+/// console. For the transport locks this also degrades cleanly — a genuinely broken socket still
+/// surfaces as an I/O error on the next read/write, which the caller maps to
+/// [`Error::ConnectionError`] and recovers via reconnect, exactly as before.
+trait LockRecover<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockRecover<T> for Mutex<T> {
+    fn lock_recover(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// A duplex byte stream `WingConsole` can read/write commands over.
 ///
 /// `Read`/`Write` alone aren't enough: [`WingConsole::decode_next`] dynamically
@@ -275,7 +297,7 @@ impl WingConsole {
                     let firmware = firmware_hint
                         .clone()
                         .or_else(|| Self::probe_firmware(addr.ip()));
-                    *console.firmware.lock().unwrap() = firmware;
+                    *console.firmware.lock_recover() = firmware;
                     return Ok(console);
                 }
                 Err(err) => last_connect_error = Some(err),
@@ -296,7 +318,7 @@ impl WingConsole {
     /// always probed).
     pub fn connect_addr(addr: SocketAddr) -> Result<Self> {
         let console = Self::handshake(addr)?;
-        *console.firmware.lock().unwrap() = Self::probe_firmware(addr.ip());
+        *console.firmware.lock_recover() = Self::probe_firmware(addr.ip());
         Ok(console)
     }
 
@@ -355,7 +377,7 @@ impl WingConsole {
     /// reply (e.g. probing blocked by network policy) -- never a guessed or
     /// default value. Feeds [`crate::Schema::staleness`].
     pub fn firmware(&self) -> Option<String> {
-        self.firmware.lock().unwrap().clone()
+        self.firmware.lock_recover().clone()
     }
 
     fn from_streams(wsock: TcpStream, rsock: TcpStream, peer_ip: IpAddr, peer_port: u16) -> Self {
@@ -439,10 +461,10 @@ impl WingConsole {
         for attempt in 1..=policy.max_attempts {
             match Self::handshake_streams(addr) {
                 Ok((wsock, rsock)) => {
-                    *self.wsock.lock().unwrap() = Box::new(wsock);
-                    *self.rsock.lock().unwrap() = Box::new(rsock);
+                    *self.wsock.lock_recover() = Box::new(wsock);
+                    *self.rsock.lock_recover() = Box::new(rsock);
                     {
-                        let mut main = self.main.lock().unwrap();
+                        let mut main = self.main.lock_recover();
                         main.rx_buf_tail = 0;
                         main.rx_buf_size = 0;
                         main.rx_esc = false;
@@ -453,7 +475,7 @@ impl WingConsole {
                         main.keep_alive_timer =
                             Instant::now() + Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
                     }
-                    let meters_invalidated = self.mtrs.lock().unwrap().meters.is_some();
+                    let meters_invalidated = self.mtrs.lock_recover().meters.is_some();
                     return Ok(ReconnectOutcome {
                         attempts: attempt,
                         gap: SessionGap {
@@ -478,7 +500,7 @@ impl WingConsole {
     pub fn read(&mut self) -> Result<WingResponse> {
         loop {
             let mainptr = self.main.clone();
-            let mut main = mainptr.lock().unwrap();
+            let mut main = mainptr.lock_recover();
             let mut raw = Vec::new();
             let (ch, cmd) = self.decode_next(&mut main, &mut raw)?;
             //println!("Channel: {}, Command: {:X}", ch, cmd);
@@ -661,7 +683,7 @@ impl WingConsole {
     /// hang up the connection after a 10 seconds of no activity. You should call this yourself
     /// periodically if you are not calling read().
     pub fn keep_alive(&mut self) -> Result<()> {
-        self._keep_alive(&mut self.main.clone().lock().unwrap())
+        self._keep_alive(&mut self.main.clone().lock_recover())
     }
 
     fn _keep_alive(&mut self, r: &mut _WingConsoleMain) -> Result<()> {
@@ -669,8 +691,7 @@ impl WingConsole {
             // println!("keep_alive");
             self.wsock
                 .clone()
-                .lock()
-                .unwrap()
+                .lock_recover()
                 .write_all(&[0xdf, 0xd1])?;
             r.keep_alive_timer =
                 std::time::Instant::now() + std::time::Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
@@ -682,7 +703,7 @@ impl WingConsole {
     /// hang up the connection after a 5 seconds of no activity. You should call this yourself
     /// periodically if you are not calling read_meters().
     pub fn keep_alive_meters(&mut self) -> Result<()> {
-        self._keep_alive_meters(&mut self.mtrs.clone().lock().unwrap())
+        self._keep_alive_meters(&mut self.mtrs.clone().lock_recover())
     }
 
     fn _keep_alive_meters(&mut self, m: &mut _WingConsoleMeters) -> Result<()> {
@@ -696,7 +717,7 @@ impl WingConsole {
                 Self::extend_escaped(&mut keepalive, &meters.port.to_be_bytes());
                 keepalive.push(0xdf);
                 keepalive.push(0xd1);
-                self.wsock.clone().lock().unwrap().write_all(&keepalive)?;
+                self.wsock.clone().lock_recover().write_all(&keepalive)?;
                 i -= 1;
             }
             m.keep_alive_meters_timer = std::time::Instant::now()
@@ -740,10 +761,9 @@ impl WingConsole {
                 };
                 self.rsock
                     .clone()
-                    .lock()
-                    .unwrap()
+                    .lock_recover()
                     .set_read_timeout(Some(read_timeout))?;
-                match self.rsock.clone().lock().unwrap().read(&mut r.rx_buf) {
+                match self.rsock.clone().lock_recover().read(&mut r.rx_buf) {
                     Ok(n) if n > 0 => {
                         r.rx_buf_size = n;
                         r.rx_buf_tail = 0;
@@ -917,7 +937,7 @@ impl WingConsole {
         } else {
             Self::format_id(id, &mut buf, 0xd7, Some(0xdd));
         };
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
 
@@ -929,12 +949,12 @@ impl WingConsole {
         } else {
             Self::format_id(id, &mut buf, 0xd7, Some(0xdc));
         };
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
 
     fn set_op_deadline(&mut self, deadline: Option<Instant>) {
-        self.main.clone().lock().unwrap().op_deadline = deadline;
+        self.main.clone().lock_recover().op_deadline = deadline;
     }
 
     /// Reads until `matcher` returns `Ok`, buffering everything else so it isn't lost.
@@ -1041,7 +1061,7 @@ impl WingConsole {
     /// associate the values that come back when you call read_meter()
     pub fn request_meter(&mut self, meters: &[Meter]) -> Result<u16> {
         let mtrsptr = self.mtrs.clone();
-        let mut mtrs = mtrsptr.lock().unwrap();
+        let mut mtrs = mtrsptr.lock_recover();
         mtrs.next_meter_id = mtrs
             .next_meter_id
             .checked_add(1)
@@ -1075,7 +1095,7 @@ impl WingConsole {
         buf.push(0xdf);
         buf.push(0xd1);
 
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        self.wsock.clone().lock_recover().write_all(&buf)?;
 
         Ok(mtrs.next_meter_id)
     }
@@ -1085,7 +1105,7 @@ impl WingConsole {
     pub fn read_meters(&mut self) -> Result<(u16, Vec<i16>)> {
         loop {
             let mptr = self.mtrs.clone();
-            let mut m = mptr.lock().unwrap();
+            let mut m = mptr.lock_recover();
 
             self._keep_alive_meters(&mut m)?;
             let md = m.meters.as_ref().ok_or(Error::MeterNotInitialized)?;
@@ -1127,19 +1147,19 @@ impl WingConsole {
 
     pub fn set_string(&mut self, id: i32, value: &str) -> Result<()> {
         let buf = Self::set_string_message(id, value)?;
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
 
     pub fn set_float(&mut self, id: i32, value: f32) -> Result<()> {
         let buf = Self::set_float_message(id, value);
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
 
     pub fn set_int(&mut self, id: i32, value: i32) -> Result<()> {
         let buf = Self::set_int_message(id, value);
-        self.wsock.clone().lock().unwrap().write_all(&buf)?;
+        self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
 
@@ -1214,7 +1234,7 @@ impl WingConsole {
         let console = Self::from_streams(client.try_clone().unwrap(), client, peer_ip, addr.port());
 
         {
-            let mut meters = console.mtrs.lock().unwrap();
+            let mut meters = console.mtrs.lock_recover();
             meters.meters = Some(Meters { socket, port });
             meters.next_meter_id = 1;
             meters.keep_alive_meters_timer = std::time::Instant::now()
@@ -1473,6 +1493,22 @@ impl Drop for WingConsole {
 mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
+
+    // U4: a mutex poisoned by a peer thread's panic is recovered rather than cascading into a
+    // panic on every subsequent lock. `lock_recover` returns the guard (and the intact data).
+    #[test]
+    fn lock_recover_recovers_a_poisoned_mutex_without_panicking() {
+        let m = Arc::new(Mutex::new(42u32));
+        let m_panic = m.clone();
+        let _ = std::thread::spawn(move || {
+            let _guard = m_panic.lock().unwrap();
+            panic!("poison the mutex while holding the guard");
+        })
+        .join();
+        assert!(m.lock().is_err(), "the mutex must be poisoned by the panic");
+        // `.lock().unwrap()` here would panic; `lock_recover` yields the guard and the value.
+        assert_eq!(*m.lock_recover(), 42);
+    }
 
     fn console_with_input(input: &[u8]) -> WingConsole {
         let listener = TcpListener::bind("127.0.0.1:0").unwrap();
