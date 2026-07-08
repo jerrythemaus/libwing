@@ -81,6 +81,8 @@
 mod console;
 mod ffi;
 mod helpers;
+/// WING icon index ↔ name map (decoded from the protocol-spec "WING Icons" appendix).
+pub mod icons;
 mod meters;
 mod node;
 /// OSC-over-UDP transport (U10: R3), a sibling to the Native transport above.
@@ -105,6 +107,7 @@ pub use ffi::{ResponseHandle, WingConsoleHandle};
 pub use helpers::{
     decode_enum, encode_enum, write_enum, EnumDecode, EnumKey, EnumValue, RawEnumValue,
 };
+pub use icons::{icon_category, icon_index, icon_name};
 pub use meters::{
     decode_frame, fx_band_gr_db, level_db, ChannelMeter, ChannelMeterV2, DcaMeter, FxMeter,
     MeterFrameEntry, MonitorMeter, CHANNEL_V2_WORDS, CHANNEL_WORDS, DCA_WORDS, FX_WORDS,
