@@ -363,6 +363,100 @@ pub extern "C" fn wing_console_set_int(
     }
 }
 
+/// Toggles a 0/1 parameter in one write (`wToggleTokenInt`). Returns 0 on success, -1 on
+/// error.
+#[no_mangle]
+pub extern "C" fn wing_console_toggle(handle: *mut WingConsoleHandle, id: i32) -> c_int {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        record_ffi_usage_error("wing_console_toggle: null console handle");
+        return -1;
+    };
+    let mut console = handle.console.clone();
+    match console.toggle(id) {
+        Ok(()) => 0,
+        Err(err) => {
+            record_error(&err);
+            -1
+        }
+    }
+}
+
+/// Captures the raw, hash-addressed native byte stream for the subtree rooted at `id`
+/// (`wGetBinaryNode`/`wGetBinaryData`) into `out_buf`, up to `out_capacity` bytes. Returns
+/// the number of bytes written on success, `-2` if `out_capacity` is too small (nothing
+/// copied), or `-1` on error. The captured buffer round-trips through
+/// `wing_console_set_binary_node`.
+#[no_mangle]
+pub extern "C" fn wing_console_get_binary_node(
+    handle: *mut WingConsoleHandle,
+    id: i32,
+    timeout_ms: c_int,
+    out_buf: *mut u8,
+    out_capacity: usize,
+) -> c_int {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        record_ffi_usage_error("wing_console_get_binary_node: null console handle");
+        return -1;
+    };
+    if out_capacity > 0 && out_buf.is_null() {
+        record_ffi_usage_error(
+            "wing_console_get_binary_node: null out buffer for requested capacity",
+        );
+        return -1;
+    }
+    let timeout = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+    let mut console = handle.console.clone();
+    match console.get_binary_node(id, timeout) {
+        Ok(bytes) => {
+            if bytes.len() > out_capacity {
+                return -2;
+            }
+            if !bytes.is_empty() {
+                unsafe {
+                    ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+                }
+            }
+            bytes.len() as c_int
+        }
+        Err(err) => {
+            record_error(&err);
+            -1
+        }
+    }
+}
+
+/// Replays a buffer captured by `wing_console_get_binary_node` (`wSetBinaryNode`). Returns
+/// the number of bytes written to the wire on success (`>= len` when escaping expands it),
+/// or `-1` on error.
+#[no_mangle]
+pub extern "C" fn wing_console_set_binary_node(
+    handle: *mut WingConsoleHandle,
+    data: *const u8,
+    len: usize,
+) -> c_int {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        record_ffi_usage_error("wing_console_set_binary_node: null console handle");
+        return -1;
+    };
+    if len > 0 && data.is_null() {
+        record_ffi_usage_error("wing_console_set_binary_node: null data buffer for nonzero len");
+        return -1;
+    }
+    let slice = if len == 0 {
+        &[][..]
+    } else {
+        unsafe { std::slice::from_raw_parts(data, len) }
+    };
+    let mut console = handle.console.clone();
+    match console.set_binary_node(slice) {
+        Ok(written) => written as c_int,
+        Err(err) => {
+            record_error(&err);
+            -1
+        }
+    }
+}
+
 #[no_mangle]
 pub extern "C" fn wing_console_request_node_definition(
     handle: *mut WingConsoleHandle,

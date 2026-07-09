@@ -81,6 +81,12 @@ Response*          wing_console_read                              (WingConsole* 
 int                wing_console_set_string                        (WingConsole* handle, int32_t id, const char* value);
 int                wing_console_set_float                         (WingConsole* handle, int32_t id, float value);
 int                wing_console_set_int                           (WingConsole* handle, int32_t id, int value);
+int                wing_console_toggle                            (WingConsole* handle, int32_t id); // flip a 0/1 parameter in one write
+// Capture the raw hash-addressed native byte stream for the subtree at `id` into out_buf (up to out_capacity).
+// Returns bytes written, -2 if out_capacity is too small (nothing copied), or -1 on error. Round-trips through wing_console_set_binary_node().
+int                wing_console_get_binary_node                   (WingConsole* handle, int32_t id, int timeout_ms, uint8_t* out_buf, size_t out_capacity);
+// Replay a buffer captured by wing_console_get_binary_node(). Returns bytes written to the wire (>= len when escaped), or -1 on error.
+int                wing_console_set_binary_node                   (WingConsole* handle, const uint8_t* data, size_t len);
 int                wing_console_request_node_definition           (WingConsole* handle, int32_t id);
 int                wing_console_request_node_data                 (WingConsole* handle, int32_t id);
 uint16_t           wing_console_request_meter                     (WingConsole* handle, uint16_t *meter_ids, size_t len); // see above about meter ids

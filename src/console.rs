@@ -179,6 +179,11 @@ struct _WingConsoleMain {
     /// attended-get, in which case reads are bounded only by the keep-alive cadence, same
     /// as before this field existed.
     op_deadline: Option<Instant>,
+    /// When `Some`, every de-escaped logical byte `decode_next` yields is also appended
+    /// here, tapping the raw native token stream without disturbing normal parsing. Set by
+    /// `get_binary_node` for the span of one attended data request and taken back out when
+    /// it completes; `None` (no capture) at all other times.
+    capture: Option<Vec<u8>>,
 }
 
 struct _WingConsoleMeters {
@@ -421,6 +426,7 @@ impl WingConsole {
                 rx_has_in_pipe: None,
                 current_node_id: 0,
                 op_deadline: None,
+                capture: None,
             })),
             mtrs: Arc::new(Mutex::new(_WingConsoleMeters {
                 keep_alive_meters_timer: std::time::Instant::now()
@@ -689,10 +695,7 @@ impl WingConsole {
     fn _keep_alive(&mut self, r: &mut _WingConsoleMain) -> Result<()> {
         if r.keep_alive_timer <= std::time::Instant::now() {
             // println!("keep_alive");
-            self.wsock
-                .clone()
-                .lock_recover()
-                .write_all(&[0xdf, 0xd1])?;
+            self.wsock.clone().lock_recover().write_all(&[0xdf, 0xd1])?;
             r.keep_alive_timer =
                 std::time::Instant::now() + std::time::Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
         }
@@ -726,7 +729,23 @@ impl WingConsole {
         Ok(())
     }
 
+    /// Decodes one logical byte off the wire, teeing it into `r.capture` when a capture is
+    /// active (see `get_binary_node`). All decoding lives in `decode_next_inner`; this
+    /// wrapper is the single choke point every emitted byte passes through, so the tee here
+    /// records the exact de-escaped stream `read()` consumes -- nothing more, nothing less.
     fn decode_next(&mut self, r: &mut _WingConsoleMain, raw: &mut Vec<u8>) -> Result<(i8, u8)> {
+        let (ch, byte) = self.decode_next_inner(r, raw)?;
+        if let Some(cap) = r.capture.as_mut() {
+            cap.push(byte);
+        }
+        Ok((ch, byte))
+    }
+
+    fn decode_next_inner(
+        &mut self,
+        r: &mut _WingConsoleMain,
+        raw: &mut Vec<u8>,
+    ) -> Result<(i8, u8)> {
         if let Some(value) = r.rx_has_in_pipe {
             // println!("has in pipe");
             r.rx_has_in_pipe = None;
@@ -1163,6 +1182,170 @@ impl WingConsole {
         Ok(())
     }
 
+    /// Toggles a 0/1 parameter in one write via the native `click` token (`0xd7 <hash>
+    /// 0xd8`), the `wToggleTokenInt` primitive. Flips the parameter server-side without a
+    /// read-before-write, so it can't race a concurrent change the way get-then-set would.
+    pub fn toggle(&mut self, id: i32) -> Result<()> {
+        let mut buf = Vec::new();
+        Self::format_id(id, &mut buf, 0xd7, Some(0xd8));
+        self.wsock.clone().lock_recover().write_all(&buf)?;
+        Ok(())
+    }
+
+    /// Captures the raw, hash-addressed native byte stream for the subtree (or single
+    /// parameter) rooted at `id` -- the `wGetBinaryNode`/`wGetBinaryData` primitive.
+    ///
+    /// Issues one data request (`0xd7 <hash> 0xdc`, or `0xda 0xdc` at the root) and streams
+    /// the reply, returning the de-escaped token bytes verbatim (`0xd7 <hash> <value>`
+    /// pairs, terminated by the `0xde` end token) *without* decoding them to typed values.
+    /// Unlike a dump of parsed/string values, this form round-trips losslessly through
+    /// [`set_binary_node`](Self::set_binary_node): every parameter is addressed by numeric
+    /// hash, so the dynamically-named model parameters (EQ/gate/comp) that a string dump
+    /// can't replay are preserved. This is the correct primitive for external scene
+    /// save/restore, and it fetches a whole subtree in a single request rather than the
+    /// per-leaf round-trips [`dump_subtree`](Self::dump_subtree) makes.
+    ///
+    /// **Attended operation.** It assumes a quiescent connection and drains until the first
+    /// end-of-data token, so it must not run concurrently with another reader on the same
+    /// session -- interleaved unrelated traffic would be captured into the buffer. Bounded
+    /// by `timeout`, returning [`Error::Timeout`] if the stream doesn't terminate in time.
+    pub fn get_binary_node(&mut self, id: i32, timeout: Duration) -> Result<Vec<u8>> {
+        self.request_node_data(id)?;
+        let deadline = Instant::now() + timeout;
+        {
+            let mainptr = self.main.clone();
+            let mut main = mainptr.lock_recover();
+            main.capture = Some(Vec::new());
+            main.op_deadline = Some(deadline);
+        }
+        // Drain the reply stream; the tee in `decode_next` fills `capture` underneath. Read
+        // responses themselves are discarded -- the raw bytes are the product here.
+        let result = loop {
+            match self.read() {
+                Ok(WingResponse::RequestEnd) => break Ok(()),
+                Ok(_) => {}
+                Err(e) => break Err(e),
+            }
+            if Instant::now() >= deadline {
+                break Err(Error::Timeout);
+            }
+        };
+        let mainptr = self.main.clone();
+        let mut main = mainptr.lock_recover();
+        main.op_deadline = None;
+        let captured = main.capture.take().unwrap_or_default();
+        result.map(|()| captured)
+    }
+
+    /// Replays a buffer captured by [`get_binary_node`](Self::get_binary_node) -- the
+    /// `wSetBinaryNode` primitive. Sends the native command bytes verbatim (re-applying the
+    /// `0xdf` wire escaping), setting every `0xd7 <hash> <value>` pair in the buffer in a
+    /// single write. That makes it an effective bulk push -- one write for a whole subtree,
+    /// versus one write per parameter through [`set_int`](Self::set_int) et al. Returns the
+    /// number of bytes written to the wire (`>= data.len()` when escaping expands it).
+    pub fn set_binary_node(&mut self, data: &[u8]) -> Result<usize> {
+        let mut buf = Vec::with_capacity(data.len());
+        Self::extend_escaped(&mut buf, data);
+        self.wsock.clone().lock_recover().write_all(&buf)?;
+        Ok(buf.len())
+    }
+
+    /// Reads the console's current state back and reports every **writable** parameter in `data`
+    /// whose live value no longer matches -- a confidence check to run right after
+    /// [`set_binary_node`](Self::set_binary_node), since a blind bulk push has no per-write ack
+    /// and the console can silently drop writes under load.
+    ///
+    /// `data` is a buffer as captured by [`get_binary_node`](Self::get_binary_node). The check
+    /// **re-captures the whole desk in a single request** (`get_binary_node(0, ..)`, a superset of
+    /// any restored subtree) and compares each of `data`'s `0xd7 <hash> <value>` pairs against it.
+    /// This is deliberately *not* one read per leaf: a per-leaf sweep of a full desk is thousands
+    /// of sequential requests, which is slow and (observed on a real WING) makes the console reset
+    /// the connection mid-sweep. One re-capture is ~0.4 s for the whole desk.
+    ///
+    /// Read-only entries are skipped (a raw capture carries them, but a restore never sets them,
+    /// so they'd only produce false positives from values that drift on their own).
+    ///
+    /// **Settle / second pass:** some parameters apply *asynchronously* -- observed on a real WING,
+    /// head-amp gain (`/io/in/*/g`) and phantom (`vph`) don't reflect a fresh write within the
+    /// ~0.4 s of the first capture, so they'd show as false mismatches. When the first pass finds
+    /// any mismatch and `settle` is non-zero, this waits `settle`, re-captures once more, and keeps
+    /// only the leaves that *still* mismatch -- transient async ones reconcile and are dropped, a
+    /// genuinely dropped write persists. A clean first pass pays no settle cost. The re-check is
+    /// again a single whole-desk capture, so it stays reset-safe no matter how many suspects there
+    /// are. Pass `Duration::ZERO` to report the first pass verbatim (no second capture).
+    ///
+    /// Returns a [`VerifyReport`] whose `checked`/`skipped` counts distinguish a genuine clean pass
+    /// from an empty/malformed buffer. A parameter absent from the re-capture is reported with
+    /// `actual: None`. `capture_timeout` bounds each re-capture.
+    pub fn verify_binary_node(
+        &mut self,
+        data: &[u8],
+        capture_timeout: Duration,
+        settle: Duration,
+    ) -> Result<VerifyReport> {
+        let expected = parse_binary_values(data)?;
+        let current = self.capture_value_map(capture_timeout)?;
+
+        let mut report = VerifyReport::default();
+        let mut suspects: Vec<(i32, NodeValue, Option<NodeValue>)> = Vec::new();
+        for (id, want) in expected {
+            if id_is_read_only(id) {
+                report.skipped += 1;
+                continue;
+            }
+            report.checked += 1;
+            let actual = current.get(&id).cloned();
+            if !actual
+                .as_ref()
+                .is_some_and(|a| values_match_at(id, a, &want))
+            {
+                suspects.push((id, want, actual));
+            }
+        }
+
+        if suspects.is_empty() {
+            return Ok(report);
+        }
+
+        // Second pass: give async-applying params (head-amp gain/phantom) time to land, then
+        // re-check only the suspects against a fresh whole-desk capture. Those that now match were
+        // transient; the rest are real.
+        if settle.is_zero() {
+            report.mismatches = suspects
+                .into_iter()
+                .map(|(id, expected, actual)| BinaryMismatch {
+                    id,
+                    expected,
+                    actual,
+                })
+                .collect();
+            return Ok(report);
+        }
+        std::thread::sleep(settle);
+        let recheck = self.capture_value_map(capture_timeout)?;
+        for (id, want, _first) in suspects {
+            let actual = recheck.get(&id).cloned();
+            if !actual
+                .as_ref()
+                .is_some_and(|a| values_match_at(id, a, &want))
+            {
+                report.mismatches.push(BinaryMismatch {
+                    id,
+                    expected: want,
+                    actual,
+                });
+            }
+        }
+        Ok(report)
+    }
+
+    /// Whole-desk re-capture (`get_binary_node(0)`) decoded into an id -> value map, for
+    /// [`verify_binary_node`](Self::verify_binary_node)'s comparisons.
+    fn capture_value_map(&mut self, timeout: Duration) -> Result<HashMap<i32, NodeValue>> {
+        let buf = self.get_binary_node(0, timeout)?;
+        Ok(parse_binary_values(&buf)?.into_iter().collect())
+    }
+
     fn set_string_message(id: i32, value: &str) -> Result<Vec<u8>> {
         let mut buf = Vec::new();
         Self::format_id(id, &mut buf, 0xd7, None);
@@ -1426,6 +1609,211 @@ impl NodeValue {
     }
 }
 
+/// One parameter whose read-back value didn't match a restored buffer, produced by
+/// [`WingConsole::verify_binary_node`]. `actual` is `None` when the read-back timed out.
+#[derive(Clone, Debug, PartialEq)]
+pub struct BinaryMismatch {
+    pub id: i32,
+    pub expected: NodeValue,
+    pub actual: Option<NodeValue>,
+}
+
+/// Outcome of [`WingConsole::verify_binary_node`]: how many writable leaves were read back
+/// (`checked`), how many read-only leaves were skipped (`skipped`), and every mismatch found.
+/// A clean pass is `mismatches.is_empty() && checked > 0`; `checked == 0` means the buffer held
+/// no writable leaves (empty or malformed), which a bare "no mismatches" would hide.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct VerifyReport {
+    pub checked: usize,
+    pub skipped: usize,
+    pub mismatches: Vec<BinaryMismatch>,
+}
+
+/// Whether `id` resolves (through the embedded map) to a definition that is read-only in every
+/// candidate. [`WingConsole::verify_binary_node`] skips such ids because a restore never sets
+/// them, so their live value can drift and would only produce false positives. An id absent from
+/// the map is treated as writable, so it's still checked.
+fn id_is_read_only(id: i32) -> bool {
+    match ID_TO_NAME.get(&id) {
+        Some(names) if !names.is_empty() => names
+            .iter()
+            .all(|n| NAME_TO_DEF.get(n).is_some_and(|d| d.read_only)),
+        _ => false,
+    }
+}
+
+/// Compares a read-back value against the expected one, tolerating float requantization: WING
+/// rounds some floats on write, so an exact bit-compare would flag benign differences. Ints and
+/// strings compare exactly.
+fn values_match(a: &NodeValue, b: &NodeValue) -> bool {
+    match (a, b) {
+        (NodeValue::Float(x), NodeValue::Float(y)) => {
+            (x - y).abs() <= 1e-3_f32.max(x.abs().max(y.abs()) * 1e-4)
+        }
+        _ => a == b,
+    }
+}
+
+/// [`values_match`], but also treats a `StringEnum` written as its wire index as equal to the same
+/// enum read back as its label. The console accepts an enum set as an integer index yet reports it
+/// as a string on capture, so a faithful round-trip (e.g. a scene restore) otherwise shows every
+/// enum node as a spurious mismatch. Resolves the def by `id` to compare index against label.
+fn values_match_at(id: i32, a: &NodeValue, b: &NodeValue) -> bool {
+    if values_match(a, b) {
+        return true;
+    }
+    let (idx, label) = match (a, b) {
+        (NodeValue::Int(i), NodeValue::String(s)) | (NodeValue::String(s), NodeValue::Int(i)) => {
+            (*i, s.as_str())
+        }
+        _ => return false,
+    };
+    let Ok(idx) = usize::try_from(idx) else {
+        return false;
+    };
+    ID_TO_NAME.get(&id).is_some_and(|names| {
+        names.iter().any(|name| {
+            NAME_TO_DEF.get(name).is_some_and(|def| {
+                def.string_enum
+                    .as_ref()
+                    .and_then(|items| items.get(idx))
+                    .is_some_and(|item| item.item == label)
+            })
+        })
+    })
+}
+
+/// Lossy UTF-8 decode of a string payload in the binary stream (WING strings are byte strings).
+fn str_from(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes).into_owned()
+}
+
+/// Parses a de-escaped binary-node buffer (as produced by [`WingConsole::get_binary_node`]) into
+/// `(id, value)` pairs. `0xd7 <hash>` selects the current node; each following value token emits
+/// that node's value. Tree-navigation, click/step and request tokens carry no value and are
+/// skipped; the `0xde` end token stops parsing. Returns [`Error::InvalidData`] on a truncated
+/// buffer, a value token with no preceding node selector, or a definition-response (`0xdf`) token
+/// (which means this is a definition stream, not a value buffer).
+pub fn parse_binary_values(data: &[u8]) -> Result<Vec<(i32, NodeValue)>> {
+    /// Read `n` bytes at the cursor, advancing it; `InvalidData` if the buffer is too short.
+    fn take<'a>(data: &'a [u8], i: &mut usize, n: usize) -> Result<&'a [u8]> {
+        let end = i.checked_add(n).ok_or(Error::InvalidData)?;
+        let slice = data.get(*i..end).ok_or(Error::InvalidData)?;
+        *i = end;
+        Ok(slice)
+    }
+
+    let mut out = Vec::new();
+    let mut i = 0usize;
+    let mut cur: Option<i32> = None;
+    let id = |cur: Option<i32>| cur.ok_or(Error::InvalidData);
+
+    while i < data.len() {
+        let cmd = data[i];
+        i += 1;
+        match cmd {
+            0x00..=0x3f => out.push((id(cur)?, NodeValue::Int(cmd as i32))),
+            0x40..=0x7f => {} // node-index selector (navigation) -- unused with hash addressing
+            0x80..=0xbf => {
+                let len = (cmd - 0x80) as usize + 1;
+                let s = str_from(take(data, &mut i, len)?);
+                out.push((id(cur)?, NodeValue::String(s)));
+            }
+            0xc0..=0xcf => {
+                // node-name selector (navigation): consume its bytes, emit no value.
+                let len = (cmd - 0xc0) as usize + 1;
+                take(data, &mut i, len)?;
+            }
+            0xd0 => out.push((id(cur)?, NodeValue::String(String::new()))),
+            0xd1 => {
+                let len = take(data, &mut i, 1)?[0] as usize + 1;
+                let s = str_from(take(data, &mut i, len)?);
+                out.push((id(cur)?, NodeValue::String(s)));
+            }
+            0xd2 => {
+                take(data, &mut i, 2)?; // node index (word) -- navigation
+            }
+            0xd3 => {
+                let b = take(data, &mut i, 2)?;
+                out.push((
+                    id(cur)?,
+                    NodeValue::Int(i16::from_be_bytes([b[0], b[1]]) as i32),
+                ));
+            }
+            0xd4 => {
+                let b = take(data, &mut i, 4)?;
+                out.push((
+                    id(cur)?,
+                    NodeValue::Int(i32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+                ));
+            }
+            0xd5 | 0xd6 => {
+                let b = take(data, &mut i, 4)?;
+                out.push((
+                    id(cur)?,
+                    NodeValue::Float(f32::from_be_bytes([b[0], b[1], b[2], b[3]])),
+                ));
+            }
+            0xd7 => {
+                let b = take(data, &mut i, 4)?;
+                cur = Some(i32::from_be_bytes([b[0], b[1], b[2], b[3]]));
+            }
+            0xd8 => {} // click
+            0xd9 => {
+                take(data, &mut i, 1)?; // step
+            }
+            0xda..=0xdd => {} // tree nav / data / def requests -- no payload
+            0xde => break,    // end of data
+            0xdf..=0xff => return Err(Error::InvalidData),
+        }
+    }
+    Ok(out)
+}
+
+/// Encodes `(id, value)` pairs into the raw, de-escaped binary-node token stream accepted by
+/// [`WingConsole::set_binary_node`]. Oversized strings are skipped because the WING string token
+/// format carried here can represent at most 256 bytes.
+pub fn encode_binary_values(pairs: &[(i32, NodeValue)]) -> Vec<u8> {
+    let mut out = Vec::new();
+
+    for (id, value) in pairs {
+        let mut encoded_value = Vec::new();
+        match value {
+            NodeValue::Int(v) if (0..=0x3f).contains(v) => encoded_value.push(*v as u8),
+            NodeValue::Int(v) if (-32768..=32767).contains(v) => {
+                encoded_value.push(0xd3);
+                encoded_value.extend_from_slice(&(*v as i16).to_be_bytes());
+            }
+            NodeValue::Int(v) => {
+                encoded_value.push(0xd4);
+                encoded_value.extend_from_slice(&v.to_be_bytes());
+            }
+            NodeValue::Float(v) => {
+                encoded_value.push(0xd5);
+                encoded_value.extend_from_slice(&v.to_be_bytes());
+            }
+            NodeValue::String(s) if s.is_empty() => encoded_value.push(0xd0),
+            NodeValue::String(s) if s.len() <= 64 => {
+                encoded_value.push(0x80 + (s.len() as u8 - 1));
+                encoded_value.extend_from_slice(s.as_bytes());
+            }
+            NodeValue::String(s) if s.len() <= 256 => {
+                encoded_value.push(0xd1);
+                encoded_value.push((s.len() - 1) as u8);
+                encoded_value.extend_from_slice(s.as_bytes());
+            }
+            NodeValue::String(_) => continue,
+        }
+
+        out.push(0xd7);
+        out.extend_from_slice(&id.to_be_bytes());
+        out.extend_from_slice(&encoded_value);
+    }
+
+    out.push(0xde);
+    out
+}
+
 /// One node's fullname, id, and captured value within a [`NodeDump`] (U6).
 #[derive(Clone, Debug, PartialEq)]
 pub struct DumpEntry {
@@ -1634,6 +2022,90 @@ mod tests {
         let value = f32::from_bits(0xdf000001);
         let msg = WingConsole::set_float_message(1, value);
         assert_eq!(msg, vec![0xd7, 0, 0, 0, 1, 0xd5, 0xdf, 0xde, 0, 0, 1]);
+    }
+
+    #[test]
+    fn binary_values_encode_parse_round_trips_value_tokens() {
+        let pairs = vec![
+            (1, NodeValue::Int(5)),
+            (2, NodeValue::Int(-1000)),
+            (3, NodeValue::Int(100000)),
+            (4, NodeValue::Float(60.138_835)),
+            (5, NodeValue::String(String::new())),
+            (6, NodeValue::String("9000G".to_string())),
+            (7, NodeValue::String("x".repeat(64))),
+        ];
+
+        let encoded = encode_binary_values(&pairs);
+
+        assert_eq!(encoded.last(), Some(&0xde));
+        assert_eq!(parse_binary_values(&encoded).unwrap(), pairs);
+    }
+
+    #[test]
+    fn binary_values_parse_raw_token_variants_and_navigation() {
+        let mut data = vec![
+            0xc0, b'x', // node-name selector, ignored
+            0xd2, 0, 7, // word node-index selector, ignored
+            0xd7, 0, 0, 0, 9, // id selector
+            0xd6,
+        ];
+        data.extend_from_slice(&1.5f32.to_be_bytes());
+        data.push(0x05);
+        data.push(0xd1);
+        data.push(64);
+        data.extend_from_slice(&vec![b'a'; 65]);
+        data.push(0xde);
+
+        assert_eq!(
+            parse_binary_values(&data).unwrap(),
+            vec![
+                (9, NodeValue::Float(1.5)),
+                (9, NodeValue::Int(5)),
+                (9, NodeValue::String("a".repeat(65)))
+            ]
+        );
+    }
+
+    #[test]
+    fn binary_values_parse_rejects_malformed_buffers() {
+        assert!(matches!(
+            parse_binary_values(&[0x05]),
+            Err(Error::InvalidData)
+        ));
+        assert!(matches!(
+            parse_binary_values(&[0xd7, 0]),
+            Err(Error::InvalidData)
+        ));
+        assert!(matches!(
+            parse_binary_values(&[0xd7, 0, 0, 0, 1, 0xd5, 0, 0]),
+            Err(Error::InvalidData)
+        ));
+        assert!(matches!(
+            parse_binary_values(&[0xdf]),
+            Err(Error::InvalidData)
+        ));
+    }
+
+    #[test]
+    fn binary_values_encode_skips_oversized_strings_without_selector() {
+        let encoded = encode_binary_values(&[(1, NodeValue::String("x".repeat(257)))]);
+
+        assert_eq!(encoded, vec![0xde]);
+        assert_eq!(parse_binary_values(&encoded).unwrap(), Vec::new());
+    }
+
+    #[test]
+    fn binary_values_encode_extended_string_boundaries() {
+        let pairs = vec![
+            (1, NodeValue::String("a".repeat(65))),
+            (2, NodeValue::String("b".repeat(256))),
+        ];
+        let encoded = encode_binary_values(&pairs);
+
+        assert!(encoded.windows(2).any(|window| window == [0xd1, 64]));
+        assert!(encoded.windows(2).any(|window| window == [0xd1, 255]));
+        assert_eq!(parse_binary_values(&encoded).unwrap(), pairs);
     }
 
     #[test]

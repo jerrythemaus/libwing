@@ -100,8 +100,9 @@ mod safety;
 mod schema;
 
 pub use console::{
-    DiscoveryInfo, DumpEntry, Meter, NodeDump, NodeValue, ReconnectOutcome, ReconnectPolicy,
-    SessionGap, Transport, WingConsole,
+    encode_binary_values, parse_binary_values, BinaryMismatch, DiscoveryInfo, DumpEntry, Meter,
+    NodeDump, NodeValue, ReconnectOutcome, ReconnectPolicy, SessionGap, Transport, VerifyReport,
+    WingConsole,
 };
 pub use ffi::{ResponseHandle, WingConsoleHandle};
 pub use helpers::{
