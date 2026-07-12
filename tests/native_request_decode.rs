@@ -174,6 +174,29 @@ fn rejects_index_path_flood_and_recovers_after_automatic_reset() {
 }
 
 #[test]
+fn go_up_removes_an_index_before_appending_the_next_path_element() {
+    let mut decoder = NativeRequestDecoder::default();
+    let requests = decoder
+        .push(&framed(
+            1,
+            &[
+                0xda, 0xc1, b'c', b'h', 0x40, 0xdb, 0xc2, b'b', b'u', b's', 0xdc,
+            ],
+        ))
+        .unwrap();
+
+    assert_eq!(
+        requests.last(),
+        Some(&NativeRequest::BulkData {
+            path: vec![
+                PathElement::Name("ch".to_owned()),
+                PathElement::Name("bus".to_owned()),
+            ],
+        })
+    );
+}
+
+#[test]
 fn rejects_named_path_byte_flood_and_recovers_after_automatic_reset() {
     let limits = NativeLimits {
         max_path_bytes: 2,

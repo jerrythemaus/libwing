@@ -375,7 +375,7 @@ fn validate_hardware_matrix(
             NativeRequest::MeterRenew { report_id } => {
                 renew.insert(report_id);
             }
-            NativeRequest::KeepAlive { .. } => keepalive = true,
+            NativeRequest::KeepAlive { channel: 1 } => keepalive = true,
             _ => {}
         }
     }
@@ -424,6 +424,8 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
     let mut previous_offset = 0u64;
     let mut event_count = 0usize;
     let mut matrix = MatrixEvidence::default();
+    let mut declared_version = None;
+    let mut saw_data = false;
 
     for raw in text.lines() {
         let line = raw.trim_end();
@@ -435,16 +437,28 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
                 return Err(format!("sensitive identifier in metadata: {line:?}"));
             }
             if let Some((key, value)) = rest.trim().split_once(':') {
+                if key.trim() == "wingcap_version" {
+                    if saw_data {
+                        return Err("wingcap_version must precede data".to_string());
+                    }
+                    if declared_version.replace(value.trim()).is_some() {
+                        return Err("duplicate wingcap_version headers".to_string());
+                    }
+                    if value.trim() != "2" {
+                        return Err("unsupported wingcap_version".to_string());
+                    }
+                }
                 headers
                     .entry(key.trim().to_string())
                     .or_insert_with(|| value.trim().to_string());
             }
             continue;
         }
+        saw_data = true;
         let (prefix, hex) = split_capture_line(line)
             .ok_or_else(|| format!("unrecognized capture line {line:?}"))?;
         if !prefix.starts_with('@') {
-            continue;
+            return Err(format!("V2 data lines must use timed @ events: {line:?}"));
         }
         let mut fields = prefix.split_whitespace();
         let ordinal = fields
@@ -505,10 +519,8 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
         event_count += 1;
     }
 
-    let version = headers
-        .get("wingcap_version")
-        .map(String::as_str)
-        .unwrap_or("1")
+    let version = declared_version
+        .ok_or_else(|| "promotion requires wingcap_version: 2".to_string())?
         .parse::<u8>()
         .map_err(|error| format!("invalid wingcap_version: {error}"))?;
     if version != 2 {
@@ -529,6 +541,14 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
                 return Err(format!("complete V2 capture is missing {channel} events"));
             }
         }
+    }
+    if promotion
+        && !matches!(
+            headers.get("source").map(String::as_str),
+            Some("synthetic" | "hardware")
+        )
+    {
+        return Err("capture source must be exactly synthetic or hardware".to_string());
     }
     if promotion
         && headers
@@ -1041,6 +1061,9 @@ fn proxy_direction(
     source
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|error| format!("setting proxy read timeout: {error}"))?;
+    destination
+        .set_write_timeout(Some(Duration::from_millis(100)))
+        .map_err(|error| format!("setting proxy write timeout: {error}"))?;
     let mut buffer = [0u8; 8192];
     while !stop.load(Ordering::Acquire) && Instant::now() < deadline {
         match source.read(&mut buffer) {
@@ -1078,7 +1101,11 @@ fn proxy_direction(
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
             Err(error) if stop.load(Ordering::Acquire) => return Ok(()),
-            Err(error) => return Err(format!("reading {channel}: {error}")),
+            Err(error) => {
+                stop.store(true, Ordering::Release);
+                let _ = destination.shutdown(Shutdown::Both);
+                return Err(format!("reading {channel}: {error}"));
+            }
         }
     }
     stop.store(true, Ordering::Release);
@@ -1135,10 +1162,18 @@ fn run_native_proxy(
         let stop = Arc::clone(&stop);
         move || proxy_direction(upstream, client, "N<", recorder, stop, deadline)
     });
+    let mut worker_error = None;
     for worker in [client_to_console, console_to_client] {
-        worker
+        let result = worker
             .join()
-            .map_err(|_| "Native proxy worker panicked".to_string())??;
+            .map_err(|_| "Native proxy worker panicked".to_string())
+            .and_then(|result| result);
+        if worker_error.is_none() {
+            worker_error = result.err();
+        }
+    }
+    if let Some(error) = worker_error {
+        return Err(error);
     }
     let recorder = Arc::try_unwrap(recorder)
         .map_err(|_| "Native proxy recorder still shared during teardown".to_string())?
@@ -1264,6 +1299,12 @@ fn capture_meter_session(
     let mut datagrams = 0usize;
     let mut events = Vec::new();
     let mut buffer = [0u8; 8192];
+    let handshake =
+        encode_channel(1, &[]).map_err(|error| format!("encoding Native handshake: {error}"))?;
+    native
+        .write_all(&handshake)
+        .map_err(|error| format!("sending Native handshake: {error}"))?;
+    events.push((0, "N>", handshake));
     for (token, meter) in [(1u16, &[0xa0, 0x00][..]), (2u16, &[0xaa][..])] {
         let report_id = u32::from(token) << 16 | u32::from(port);
         let subscribe = meter_subscribe_wire(port, report_id, meter)?;
@@ -1682,9 +1723,27 @@ mod tests {
     }
 
     #[test]
+    fn v2_structure_rejects_duplicate_late_and_legacy_versioned_lines() {
+        for text in [
+            "# wingcap_version: 2\n# wingcap_version: 2\n@1 +0us N> dfd1\n",
+            "@1 +0us N> dfd1\n# wingcap_version: 2\n",
+            "# wingcap_version: 2\nN> dfd1\n",
+        ] {
+            assert!(parse_capture_structure(text).is_err(), "accepted {text:?}");
+        }
+    }
+
+    #[test]
     fn hardware_promotion_requires_the_typed_complete_matrix() {
         let complete = complete_hardware_matrix();
         parse_capture(&complete).unwrap();
+
+        for source in ["Hardware", "real-hardware", "hardwrae"] {
+            let unknown = complete.replace("# source: hardware", &format!("# source: {source}"));
+            assert!(parse_capture(&unknown)
+                .unwrap_err()
+                .contains("source must be exactly"));
+        }
 
         let missing_approval = complete.replace("# state_changing_write_approved: true\n", "");
         assert!(parse_capture(&missing_approval)
@@ -1815,6 +1874,36 @@ mod tests {
     }
 
     #[test]
+    fn native_proxy_deadline_interrupts_a_stalled_upstream_writer() {
+        let upstream = TcpListener::bind("127.0.0.1:0").unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_thread = thread::spawn(move || {
+            let (mut socket, _) = upstream.accept().unwrap();
+            let mut bytes = Vec::new();
+            let _ = socket.read_to_end(&mut bytes);
+        });
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = listener.local_addr().unwrap();
+        let started = Instant::now();
+        let proxy = thread::spawn(move || {
+            run_native_proxy(listener, upstream_addr, Duration::from_millis(150))
+        });
+        let mut client = TcpStream::connect(proxy_addr).unwrap();
+        client
+            .set_write_timeout(Some(Duration::from_millis(500)))
+            .unwrap();
+        let writer = thread::spawn(move || {
+            let block = [0x55; 8192];
+            while client.write_all(&block).is_ok() {}
+        });
+
+        let _ = proxy.join().unwrap();
+        assert!(started.elapsed() < Duration::from_secs(1));
+        writer.join().unwrap();
+        upstream_thread.join().unwrap();
+    }
+
+    #[test]
     fn native_proxy_is_bounded_and_loopback_only() {
         let mut recorder = ProxyRecorder::new();
         assert!(recorder
@@ -1864,12 +1953,14 @@ mod tests {
             let mut decoder = NativeRequestDecoder::default();
             let mut subscriptions = BTreeSet::new();
             let mut renewals = BTreeSet::new();
+            let mut handshaken = false;
             let mut buffer = [0u8; 1024];
             while subscriptions.len() < 2 || renewals.len() < 2 {
                 let count = stream.read(&mut buffer).unwrap();
                 assert_ne!(count, 0);
                 for request in decoder.push(&buffer[..count]).unwrap() {
                     match request {
+                        NativeRequest::KeepAlive { channel: 1 } => handshaken = true,
                         NativeRequest::MeterSubscribe {
                             port, report_id, ..
                         } => {
@@ -1887,6 +1978,7 @@ mod tests {
                     }
                 }
             }
+            assert!(handshaken);
             assert_eq!(subscriptions, renewals);
             assert_eq!(subscriptions.len(), 2);
             assert_eq!(
@@ -1941,27 +2033,36 @@ mod tests {
         parse_capture(&reviewed).unwrap();
     }
 
+    #[cfg(unix)]
     #[test]
-    fn quarantine_and_files_are_owner_only_where_supported() {
+    fn quarantine_and_files_are_owner_only() {
         let root = temp_root("private");
         let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
         prepare_quarantine(&root, repo).unwrap();
         let file = write_private(&root, Path::new("raw.wingcap"), b"sensitive").unwrap();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            assert_eq!(
-                fs::metadata(&root).unwrap().permissions().mode() & 0o777,
-                0o700
-            );
-            assert_eq!(
-                fs::metadata(&file).unwrap().permissions().mode() & 0o777,
-                0o600
-            );
-            fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
-            assert!(validate_private_permissions(&root).is_err());
-        }
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&root).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        assert_eq!(
+            fs::metadata(&file).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        fs::set_permissions(&root, fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(validate_private_permissions(&root).is_err());
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn private_capture_storage_fails_closed_when_permissions_are_unverifiable() {
+        let root = temp_root("private-unsupported");
+        fs::create_dir(&root).unwrap();
+        assert!(validate_private_permissions(&root)
+            .unwrap_err()
+            .contains("cannot verify owner-only permissions"));
+        fs::remove_dir(root).unwrap();
     }
 
     #[test]

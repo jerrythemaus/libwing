@@ -1193,7 +1193,6 @@ impl WingConsole {
 
     /// Iterate every `(fullname, definition)` in the embedded property map.
     /// Empty when the crate is built without the `propmap` feature.
-    #[cfg(feature = "propmap")]
     pub fn propmap_iter() -> impl Iterator<Item = (&'static str, &'static WingNodeDef)> {
         NAME_TO_DEF.iter().map(|(name, def)| (name.as_str(), def))
     }
