@@ -98,7 +98,8 @@ cargo run --example wingcapture -- --preflight candidate.wingcap PROVENANCE.md
 
 `--record-script` is the offline U8 import path for a complete ordered transcript;
 U12 owns acquiring a real transcript. The older `--record` mode remains for legacy
-one-way diagnostic capture only and cannot produce a promotion-ready V2 contract.
+one-way diagnostic capture only, writes through the same private quarantine, and
+cannot produce a promotion-ready V2 contract.
 Before sanitizing, manually replace console/channel/show/preset/scribble free text
 and set `manual_redaction_attested: true`. Preflight then requires complete metadata,
 contiguous events, all core directions, a raw meter header, a clean mechanical scan,
@@ -122,7 +123,8 @@ No WING Rack was accessed while building this tooling. For the later hardware ru
 1. **Capture the raw traffic in the private quarantine.** For legacy
    unsolicited/keepalive Native diagnostics only:
    ```sh
-   cargo run --example wingcapture -- --record <console-ip> capture.raw.wingcap --seconds 10
+   cargo run --example wingcapture -- --record <console-ip> \
+     /private/local/wing-quarantine capture.raw.wingcap --seconds 10
    ```
    For a scripted get/set or OSC exchange, there's no capture-while-driving tool yet --
    run the exchange with `wingprop`/`wingschema`/`wingmon` while independently
@@ -139,7 +141,8 @@ No WING Rack was accessed while building this tooling. For the later hardware ru
 4. **Run the sanitizer**, which handles the three mechanical classes and refuses to
    emit a file that would still fail the check-in guard:
    ```sh
-   cargo run --example wingcapture -- capture.raw.wingcap capture.wingcap
+   cargo run --example wingcapture -- \
+     /private/local/wing-quarantine/capture.raw.wingcap capture.wingcap
    ```
 5. **Run preflight, verify, and check in.**
    ```sh

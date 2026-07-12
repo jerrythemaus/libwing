@@ -6,7 +6,7 @@
 //!
 //! ```text
 //! Usage: wingcapture <input.raw.wingcap> <output.wingcap>
-//!        wingcapture --record <host> <output.raw.wingcap> [--seconds N]
+//!        wingcapture --record <host> <quarantine> <relative-output> [--seconds N]
 //! ```
 //!
 //! `--record` is best-effort and untested against real hardware (none is reachable
@@ -50,7 +50,7 @@ fn main() {
     let mut args = Args::new(
         r#"
 Usage: wingcapture <input.raw.wingcap> <output.wingcap>
-       wingcapture --record <host> <output.raw.wingcap> [--seconds N]
+       wingcapture --record <host> <quarantine> <relative-output> [--seconds N]
        wingcapture --init-quarantine <off-tree-directory>
        wingcapture --record-script <v2-script> <quarantine> <relative-output>
        wingcapture --sanitize-v2 <quarantine> <relative-raw> <candidate>
@@ -476,24 +476,35 @@ fn quarantine_output(root: &Path, relative: &Path) -> Result<PathBuf, String> {
         .map_err(|error| format!("resolving quarantine {}: {error}", root.display()))?;
     validate_private_permissions(&root)?;
     let candidate = root.join(relative);
-    let parent = candidate
+    let mut parent = root.clone();
+    let parent_components = relative
         .parent()
         .ok_or_else(|| "capture path has no parent".to_string())?;
-    if parent.exists() {
-        let parent = parent
-            .canonicalize()
-            .map_err(|error| format!("resolving capture parent: {error}"))?;
-        if !parent.starts_with(&root) {
-            return Err("capture path escapes quarantine through a symlink".to_string());
+    for component in parent_components.components() {
+        parent.push(component);
+        if parent.exists() {
+            let metadata = parent
+                .symlink_metadata()
+                .map_err(|error| format!("reading capture directory: {error}"))?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err("capture path escapes quarantine through an unsafe entry".to_string());
+            }
+        } else {
+            fs::create_dir(&parent)
+                .map_err(|error| format!("creating capture directory: {error}"))?;
         }
-    } else {
-        fs::create_dir_all(parent)
-            .map_err(|error| format!("creating capture directory: {error}"))?;
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+            fs::set_permissions(&parent, fs::Permissions::from_mode(0o700))
                 .map_err(|error| format!("securing capture directory: {error}"))?;
+        }
+        validate_private_permissions(&parent)?;
+        let resolved = parent
+            .canonicalize()
+            .map_err(|error| format!("resolving capture directory: {error}"))?;
+        if !resolved.starts_with(&root) {
+            return Err("capture path escapes quarantine through a symlink".to_string());
         }
     }
     if candidate.exists() {
@@ -565,18 +576,63 @@ fn cleanup_raw(path: &Path) -> Result<(), String> {
 }
 
 fn purge_expired(root: &Path, retention: Duration) -> Result<Vec<PathBuf>, String> {
-    validate_private_permissions(root)?;
+    if root
+        .symlink_metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_symlink())
+    {
+        return Err("quarantine root cannot be a symlink".to_string());
+    }
+    let root = root
+        .canonicalize()
+        .map_err(|error| format!("resolving quarantine {}: {error}", root.display()))?;
+    validate_private_permissions(&root)?;
     let now = SystemTime::now();
     let mut deleted = Vec::new();
-    let entries = fs::read_dir(root)
-        .map_err(|error| format!("reading quarantine {}: {error}", root.display()))?;
+    purge_directory(&root, &root, retention, now, &mut deleted)?;
+    Ok(deleted)
+}
+
+fn purge_directory(
+    root: &Path,
+    directory: &Path,
+    retention: Duration,
+    now: SystemTime,
+    deleted: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    validate_private_permissions(directory)?;
+    let resolved = directory
+        .canonicalize()
+        .map_err(|error| format!("resolving {}: {error}", directory.display()))?;
+    if !resolved.starts_with(root) {
+        return Err(format!("{} escapes quarantine", directory.display()));
+    }
+    let entries = fs::read_dir(directory)
+        .map_err(|error| format!("reading quarantine {}: {error}", directory.display()))?;
     for entry in entries {
         let entry = entry.map_err(|error| format!("reading quarantine entry: {error}"))?;
-        let metadata = entry
-            .metadata()
-            .map_err(|error| format!("reading {} metadata: {error}", entry.path().display()))?;
-        if !metadata.is_file() {
+        let path = entry.path();
+        let metadata = path
+            .symlink_metadata()
+            .map_err(|error| format!("reading {} metadata: {error}", path.display()))?;
+        if metadata.file_type().is_symlink() {
+            return Err(format!("unsafe symlink in quarantine: {}", path.display()));
+        }
+        if metadata.is_dir() {
+            purge_directory(root, &path, retention, now, deleted)?;
             continue;
+        }
+        if !metadata.is_file() {
+            return Err(format!(
+                "unsafe non-file entry in quarantine: {}",
+                path.display()
+            ));
+        }
+        validate_private_permissions(&path)?;
+        let resolved = path
+            .canonicalize()
+            .map_err(|error| format!("resolving {}: {error}", path.display()))?;
+        if !resolved.starts_with(root) {
+            return Err(format!("{} escapes quarantine", path.display()));
         }
         let age = now
             .duration_since(
@@ -586,11 +642,11 @@ fn purge_expired(root: &Path, retention: Duration) -> Result<Vec<PathBuf>, Strin
             )
             .unwrap_or_default();
         if age >= retention {
-            cleanup_raw(&entry.path())?;
-            deleted.push(entry.path());
+            cleanup_raw(&path)?;
+            deleted.push(path);
         }
     }
-    Ok(deleted)
+    Ok(())
 }
 
 /// Best-effort live capture (see module docs): opens a raw TCP connection and logs
@@ -598,7 +654,11 @@ fn purge_expired(root: &Path, retention: Duration) -> Result<Vec<PathBuf>, Strin
 /// hardware -- no WING Rack is reachable from this development environment.
 fn record(args: &mut Args) {
     let host = args.next();
-    let output_path = args.next();
+    let quarantine = PathBuf::from(args.next());
+    let relative_output = PathBuf::from(args.next());
+    let quarantine = prepare_quarantine(&quarantine, Path::new(env!("CARGO_MANIFEST_DIR")))
+        .unwrap_or_else(|error| fail(&error));
+    quarantine_output(&quarantine, &relative_output).unwrap_or_else(|error| fail(&error));
     let mut seconds = 5u64;
     if args.has_next() {
         let flag = args.next();
@@ -657,15 +717,19 @@ fn record(args: &mut Args) {
         "# capture_date: FILL-ME-IN (YYYY-MM-DD)".to_string(),
         format!("N< {}", encode_hex(&captured)),
     ];
-    if let Err(e) = fs::write(&output_path, lines.join("\n") + "\n") {
-        eprintln!("wingcapture --record: failed to write {output_path}: {e}");
-        return;
-    }
+    let output_path = write_private(
+        &quarantine,
+        &relative_output,
+        (lines.join("\n") + "\n").as_bytes(),
+    )
+    .unwrap_or_else(|error| fail(&error));
     println!(
-        "wrote {} bytes of raw (UNSANITIZED) capture to {output_path} -- fill in the \
+        "wrote {} bytes of raw (UNSANITIZED) capture to {} -- fill in the \
          model/firmware/date headers, then run \
-         `wingcapture {output_path} <sanitized-output>` before checking anything in",
-        captured.len()
+         `wingcapture {} <sanitized-output>` before checking anything in",
+        captured.len(),
+        output_path.display(),
+        output_path.display()
     );
 }
 
@@ -739,6 +803,13 @@ mod tests {
             .unwrap_err()
             .contains("synchronized"));
 
+        let private = temp_root("absolute-output");
+        prepare_quarantine(&private, repo).unwrap();
+        assert!(quarantine_output(&private, Path::new("/tmp/raw.wingcap"))
+            .unwrap_err()
+            .contains("relative path"));
+        fs::remove_dir_all(private).unwrap();
+
         let root = temp_root("symlink");
         let quarantine = root.join("quarantine");
         let outside = root.join("outside");
@@ -788,6 +859,40 @@ mod tests {
             .contains("deleting raw capture"));
         assert!(purge_expired(&root, Duration::ZERO).unwrap().is_empty());
         assert!(cleanup_raw(&root).is_err());
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn retention_recurses_and_rejects_unsafe_entries() {
+        let root = temp_root("nested-retention");
+        prepare_quarantine(&root, Path::new(env!("CARGO_MANIFEST_DIR"))).unwrap();
+        let nested = write_private(&root, Path::new("session/raw.wingcap"), b"raw").unwrap();
+        let deleted = purge_expired(&root, Duration::ZERO).unwrap();
+        assert_eq!(deleted, vec![nested.clone()]);
+        assert!(!nested.exists());
+
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink("outside", root.join("unsafe-link")).unwrap();
+            assert!(purge_expired(&root, Duration::ZERO)
+                .unwrap_err()
+                .contains("unsafe symlink"));
+            fs::remove_file(root.join("unsafe-link")).unwrap();
+
+            let alias = temp_root("quarantine-alias");
+            std::os::unix::fs::symlink(&root, &alias).unwrap();
+            assert!(purge_expired(&alias, Duration::ZERO)
+                .unwrap_err()
+                .contains("root cannot be a symlink"));
+            fs::remove_file(alias).unwrap();
+
+            use std::os::unix::fs::PermissionsExt;
+            let unsafe_file = write_private(&root, Path::new("unsafe.raw"), b"raw").unwrap();
+            fs::set_permissions(&unsafe_file, fs::Permissions::from_mode(0o644)).unwrap();
+            assert!(purge_expired(&root, Duration::ZERO)
+                .unwrap_err()
+                .contains("not owner-only"));
+        }
         fs::remove_dir_all(root).unwrap();
     }
 

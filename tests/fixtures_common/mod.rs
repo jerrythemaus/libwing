@@ -119,10 +119,40 @@ impl Fixture {
 /// something a replay test should have to handle gracefully.
 pub fn load(path: &Path) -> Fixture {
     let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
+    parse(path, &text)
+}
+
+fn parse(path: &Path, text: &str) -> Fixture {
+    let mut declared_version = None;
+    let mut saw_data = false;
+    for raw in text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+    {
+        let Some(rest) = raw.strip_prefix('#') else {
+            saw_data = true;
+            continue;
+        };
+        let Some((key, value)) = rest.trim().split_once(':') else {
+            continue;
+        };
+        if key.trim() != "wingcap_version" {
+            continue;
+        }
+        assert!(!saw_data, "{path:?}: wingcap_version must precede data");
+        assert!(
+            declared_version.is_none(),
+            "{path:?}: duplicate wingcap_version headers"
+        );
+        assert_eq!(value.trim(), "2", "{path:?}: unsupported wingcap_version");
+        declared_version = Some(2);
+    }
+    let version = declared_version.unwrap_or(1);
     let mut headers = Vec::new();
     let mut lines = Vec::new();
     let mut raw_lines = Vec::new();
-    let mut events = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim_end();
@@ -138,10 +168,23 @@ pub fn load(path: &Path) -> Fixture {
                 headers.push((key.trim().to_string(), value.trim().to_string()));
             }
             // A bare `#` comment with no `key: value` shape is decorative only.
-        } else if line.starts_with('@') {
+        } else if version == 2 && line.starts_with('@') {
             let event = parse_v2_event(path, line);
+            let expected_ordinal = events.len() as u64 + 1;
+            assert_eq!(
+                event.ordinal, expected_ordinal,
+                "{path:?}: V2 event ordinal must be contiguous from one"
+            );
+            if let Some(previous) = events.last() {
+                assert!(
+                    event.offset_us >= previous.offset_us,
+                    "{path:?}: V2 event offsets must be monotonic"
+                );
+            }
             lines.push(event.line.clone());
             events.push(event);
+        } else if version == 2 {
+            panic!("{path:?}: V2 data lines must use timed @ events: {line:?}");
         } else if let Some(rest) = line.strip_prefix("N>") {
             lines.push(Line::NativeOut(decode_hex(rest.trim())));
         } else if let Some(rest) = line.strip_prefix("N<") {
@@ -233,4 +276,34 @@ pub fn all_fixture_paths() -> Vec<PathBuf> {
         .collect();
     paths.sort();
     paths
+}
+
+#[cfg(test)]
+mod grammar_tests {
+    use super::*;
+
+    fn rejects(text: &str) -> bool {
+        std::panic::catch_unwind(|| parse(Path::new("grammar.wingcap"), text)).is_err()
+    }
+
+    #[test]
+    fn version_selects_one_strict_grammar() {
+        assert!(!rejects("N> df0100df\n"));
+        assert!(rejects("@1 +0us N> df0100df\n"));
+        assert!(!rejects("# wingcap_version: 2\n@1 +0us N> df0100df\n"));
+        assert!(rejects("# wingcap_version: 2\nN> df0100df\n"));
+        assert!(rejects("# wingcap_version: 1\nN> df0100df\n"));
+        assert!(rejects("@1 +0us N> 01\n# wingcap_version: 2\n"));
+    }
+
+    #[test]
+    fn v2_rejects_duplicate_gap_and_decreasing_offset() {
+        for text in [
+            "# wingcap_version: 2\n@1 +0us N> 01\n@1 +1us N< 02\n",
+            "# wingcap_version: 2\n@1 +0us N> 01\n@3 +1us N< 02\n",
+            "# wingcap_version: 2\n@1 +2us N> 01\n@2 +1us N< 02\n",
+        ] {
+            assert!(rejects(text), "accepted malformed V2 fixture: {text}");
+        }
+    }
 }
