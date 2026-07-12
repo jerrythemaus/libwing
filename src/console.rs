@@ -174,6 +174,10 @@ struct _WingConsoleMain {
     rx_buf_size: usize,
     rx_channels: ChannelDecoder,
     rx_events: VecDeque<ChannelEvent>,
+    /// Decoded bytes replayed after a bounded read timed out mid-response. `read_timeout` is
+    /// cancellation-safe: bytes already removed from the transport are never discarded.
+    replay: VecDeque<(i8, u8)>,
+    read_capture: Vec<(i8, u8)>,
     current_node_id: i32,
     /// Overall deadline for an in-flight attended-get operation (R16/R17), consulted by
     /// `decode_next` so a stuck socket read can't run past it. `None` outside of
@@ -424,6 +428,8 @@ impl WingConsole {
                 rx_channels: ChannelDecoder::with_channel(1)
                     .expect("Audio Engine is a valid Native channel"),
                 rx_events: VecDeque::new(),
+                replay: VecDeque::new(),
+                read_capture: Vec::new(),
                 current_node_id: 0,
                 op_deadline: None,
             })),
@@ -504,6 +510,26 @@ impl WingConsole {
     }
 
     pub fn read(&mut self) -> Result<WingResponse> {
+        let previous_node_id = {
+            let mut main = self.main.lock_recover();
+            main.read_capture.clear();
+            main.current_node_id
+        };
+        let result = self.read_inner();
+        let mut main = self.main.lock_recover();
+        if matches!(result, Err(Error::Timeout)) {
+            let captured = std::mem::take(&mut main.read_capture);
+            for decoded in captured.into_iter().rev() {
+                main.replay.push_front(decoded);
+            }
+            main.current_node_id = previous_node_id;
+        } else {
+            main.read_capture.clear();
+        }
+        result
+    }
+
+    fn read_inner(&mut self) -> Result<WingResponse> {
         loop {
             let mainptr = self.main.clone();
             let mut main = mainptr.lock_recover();
@@ -731,10 +757,17 @@ impl WingConsole {
 
     fn decode_next(&mut self, r: &mut _WingConsoleMain, raw: &mut Vec<u8>) -> Result<(i8, u8)> {
         loop {
+            if let Some((channel, value)) = r.replay.pop_front() {
+                raw.push(value);
+                r.read_capture.push((channel, value));
+                return Ok((channel, value));
+            }
             while let Some(event) = r.rx_events.pop_front() {
                 if let ChannelEvent::Data(channel, value) = event {
                     raw.push(value);
-                    return Ok((channel as i8, value));
+                    let decoded = (channel as i8, value);
+                    r.read_capture.push(decoded);
+                    return Ok(decoded);
                 }
             }
 
@@ -1642,6 +1675,39 @@ mod tests {
             panic!("expected node data");
         };
         assert_eq!(data.get_string(), "A\0B");
+    }
+
+    #[test]
+    fn read_timeout_replays_a_response_fragment_instead_of_corrupting_the_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, peer_addr) = listener.accept().unwrap();
+        let writer = std::thread::spawn(move || {
+            server.write_all(&[0xd7, 0, 0, 0, 7, 0xd5, 0x41]).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            server.write_all(&[0x20, 0, 0]).unwrap();
+        });
+        let mut console = WingConsole::from_streams(
+            client.try_clone().unwrap(),
+            client,
+            peer_addr.ip(),
+            peer_addr.port(),
+        );
+
+        assert!(matches!(
+            console.read_timeout(Duration::from_millis(20)),
+            Err(Error::Timeout)
+        ));
+        let WingResponse::NodeData(id, value) = console
+            .read_timeout(Duration::from_millis(200))
+            .expect("the replayed prefix and remaining suffix form one response")
+        else {
+            panic!("expected node data");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(value.get_float(), 10.0);
+        writer.join().unwrap();
     }
 
     #[test]
