@@ -736,8 +736,15 @@ fn validate_private_permissions(path: &Path) -> Result<(), String> {
                 path.display()
             ));
         }
+        Ok(())
     }
-    Ok(())
+    #[cfg(not(unix))]
+    {
+        Err(format!(
+            "cannot verify owner-only permissions for {} on this platform",
+            path.display()
+        ))
+    }
 }
 
 fn quarantine_output(root: &Path, relative: &Path) -> Result<PathBuf, String> {
