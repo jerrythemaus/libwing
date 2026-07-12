@@ -100,6 +100,86 @@ impl WingNodeDef {
         Self::from_bytes_inner(raw, false)
     }
 
+    /// Serialize this definition from its public metadata fields.
+    ///
+    /// Embedded property-map definitions intentionally do not retain their
+    /// source bytes, so servers and fixture tools must not depend on
+    /// [`raw`](Self::raw) being populated. Incomplete or internally
+    /// inconsistent type metadata is rejected rather than guessed.
+    pub fn to_wire_bytes(&self) -> Result<Vec<u8>> {
+        let mut raw = Vec::new();
+        raw.extend_from_slice(&self.parent_id.to_be_bytes());
+        raw.extend_from_slice(&self.id.to_be_bytes());
+        raw.extend_from_slice(&self.index.to_be_bytes());
+        push_short_string(&mut raw, &self.name)?;
+        push_short_string(&mut raw, &self.long_name)?;
+
+        let unit = match self.unit {
+            NodeUnit::None => 0,
+            NodeUnit::Db => 1,
+            NodeUnit::Percent => 2,
+            NodeUnit::Milliseconds => 3,
+            NodeUnit::Hertz => 4,
+            NodeUnit::Meters => 5,
+            NodeUnit::Seconds => 6,
+            NodeUnit::Octaves => 7,
+            NodeUnit::Unknown(value) => value & 0x0f,
+        };
+        let mut flags =
+            ((crate::native::node_type_nibble(self.node_type) as u16) << 4) | unit as u16;
+        if self.read_only {
+            flags |= 1 << 9;
+        }
+        raw.extend_from_slice(&flags.to_be_bytes());
+
+        match self.node_type {
+            NodeType::Node | NodeType::Unknown(_) => {}
+            NodeType::String => raw.extend_from_slice(
+                &self
+                    .max_string_len
+                    .ok_or(Error::InvalidInput)?
+                    .to_be_bytes(),
+            ),
+            NodeType::LinearFloat | NodeType::LogarithmicFloat => {
+                raw.extend_from_slice(&self.min_float.ok_or(Error::InvalidInput)?.to_be_bytes());
+                raw.extend_from_slice(&self.max_float.ok_or(Error::InvalidInput)?.to_be_bytes());
+                raw.extend_from_slice(&self.steps.ok_or(Error::InvalidInput)?.to_be_bytes());
+            }
+            NodeType::FaderLevel => match (self.min_float, self.max_float, self.steps) {
+                (Some(min), Some(max), Some(steps)) => {
+                    raw.extend_from_slice(&min.to_be_bytes());
+                    raw.extend_from_slice(&max.to_be_bytes());
+                    raw.extend_from_slice(&steps.to_be_bytes());
+                }
+                (None, None, None) => {}
+                _ => return Err(Error::InvalidInput),
+            },
+            NodeType::Integer => {
+                raw.extend_from_slice(&self.min_int.ok_or(Error::InvalidInput)?.to_be_bytes());
+                raw.extend_from_slice(&self.max_int.ok_or(Error::InvalidInput)?.to_be_bytes());
+            }
+            NodeType::StringEnum => {
+                let items = self.string_enum.as_ref().ok_or(Error::InvalidInput)?;
+                let count = u16::try_from(items.len()).map_err(|_| Error::InvalidInput)?;
+                raw.extend_from_slice(&count.to_be_bytes());
+                for item in items {
+                    push_short_string(&mut raw, &item.item)?;
+                    push_short_string(&mut raw, &item.long_item)?;
+                }
+            }
+            NodeType::FloatEnum => {
+                let items = self.float_enum.as_ref().ok_or(Error::InvalidInput)?;
+                let count = u16::try_from(items.len()).map_err(|_| Error::InvalidInput)?;
+                raw.extend_from_slice(&count.to_be_bytes());
+                for item in items {
+                    raw.extend_from_slice(&item.item.to_be_bytes());
+                    push_short_string(&mut raw, &item.long_item)?;
+                }
+            }
+        }
+        Ok(raw)
+    }
+
     fn from_bytes_inner(raw: &[u8], keep_raw: bool) -> Result<Self> {
         let mut i = 0;
 
@@ -223,6 +303,13 @@ impl WingNodeDef {
             raw: if keep_raw { raw.to_vec() } else { Vec::new() },
         })
     }
+}
+
+fn push_short_string(raw: &mut Vec<u8>, value: &str) -> Result<()> {
+    let len = u8::try_from(value.len()).map_err(|_| Error::InvalidInput)?;
+    raw.push(len);
+    raw.extend_from_slice(value.as_bytes());
+    Ok(())
 }
 
 fn take<'a>(raw: &'a [u8], i: &mut usize, len: usize) -> Result<&'a [u8]> {

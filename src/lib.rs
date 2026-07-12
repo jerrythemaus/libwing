@@ -82,6 +82,7 @@ mod console;
 mod ffi;
 mod helpers;
 mod meters;
+pub mod native;
 mod node;
 /// OSC-over-UDP transport (U10: R3), a sibling to the Native transport above.
 /// Namespaced rather than flattened into the root re-exports below: several of its

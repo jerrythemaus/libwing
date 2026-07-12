@@ -1,9 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::native::{ChannelDecoder, ChannelEvent};
 use crate::node::{NodeType, WingNodeData, WingNodeDef};
 use crate::propmap::NAME_TO_DEF;
 use crate::{Error, Result, WingResponse};
@@ -170,9 +171,8 @@ struct _WingConsoleMain {
     rx_buf: [u8; RX_BUFFER_SIZE],
     rx_buf_tail: usize,
     rx_buf_size: usize,
-    rx_esc: bool,
-    rx_current_channel: i8,
-    rx_has_in_pipe: Option<u8>,
+    rx_channels: ChannelDecoder,
+    rx_events: VecDeque<ChannelEvent>,
     current_node_id: i32,
     /// Overall deadline for an in-flight attended-get operation (R16/R17), consulted by
     /// `decode_next` so a stuck socket read can't run past it. `None` outside of
@@ -416,9 +416,12 @@ impl WingConsole {
                 rx_buf: [0; RX_BUFFER_SIZE],
                 rx_buf_tail: 0,
                 rx_buf_size: 0,
-                rx_esc: false,
-                rx_current_channel: -1,
-                rx_has_in_pipe: None,
+                // Captured/test transports historically pass an already-selected
+                // Audio Engine payload. Starting on channel 1 preserves that API;
+                // a real stream's handshake selection simply selects it again.
+                rx_channels: ChannelDecoder::with_channel(1)
+                    .expect("Audio Engine is a valid Native channel"),
+                rx_events: VecDeque::new(),
                 current_node_id: 0,
                 op_deadline: None,
             })),
@@ -467,9 +470,9 @@ impl WingConsole {
                         let mut main = self.main.lock_recover();
                         main.rx_buf_tail = 0;
                         main.rx_buf_size = 0;
-                        main.rx_esc = false;
-                        main.rx_current_channel = -1;
-                        main.rx_has_in_pipe = None;
+                        main.rx_channels = ChannelDecoder::with_channel(1)
+                            .expect("Audio Engine is a valid Native channel");
+                        main.rx_events.clear();
                         main.current_node_id = 0;
                         main.op_deadline = None;
                         main.keep_alive_timer =
@@ -689,10 +692,7 @@ impl WingConsole {
     fn _keep_alive(&mut self, r: &mut _WingConsoleMain) -> Result<()> {
         if r.keep_alive_timer <= std::time::Instant::now() {
             // println!("keep_alive");
-            self.wsock
-                .clone()
-                .lock_recover()
-                .write_all(&[0xdf, 0xd1])?;
+            self.wsock.clone().lock_recover().write_all(&[0xdf, 0xd1])?;
             r.keep_alive_timer =
                 std::time::Instant::now() + std::time::Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
         }
@@ -727,14 +727,14 @@ impl WingConsole {
     }
 
     fn decode_next(&mut self, r: &mut _WingConsoleMain, raw: &mut Vec<u8>) -> Result<(i8, u8)> {
-        if let Some(value) = r.rx_has_in_pipe {
-            // println!("has in pipe");
-            r.rx_has_in_pipe = None;
-            raw.push(value);
-            return Ok((r.rx_current_channel, value));
-        }
-
         loop {
+            while let Some(event) = r.rx_events.pop_front() {
+                if let ChannelEvent::Data(channel, value) = event {
+                    raw.push(value);
+                    return Ok((channel as i8, value));
+                }
+            }
+
             self._keep_alive(r)?;
             if r.rx_buf_size == 0 {
                 // Check before arming the socket timeout, not just after: this is what
@@ -798,32 +798,7 @@ impl WingConsole {
             r.rx_buf_tail += 1;
             r.rx_buf_size -= 1;
 
-            if !r.rx_esc {
-                if byte == 0xdf {
-                    r.rx_esc = true;
-                } else {
-                    raw.push(byte);
-                    break Ok((r.rx_current_channel, byte));
-                }
-            } else if byte == 0xdf {
-                break Ok((r.rx_current_channel, byte));
-            } else {
-                r.rx_esc = false;
-                if byte == 0xde {
-                    raw.push(0xdf);
-                    break Ok((r.rx_current_channel, 0xdf));
-                } else if (0xd0..0xde).contains(&byte) {
-                    r.rx_current_channel = (byte - 0xd0) as i8;
-                    continue;
-                } else if r.rx_current_channel >= 0 {
-                    r.rx_has_in_pipe = Some(byte);
-                    raw.push(0xdf);
-                    break Ok((r.rx_current_channel, 0xdf));
-                } else {
-                    raw.push(byte);
-                    break Ok((r.rx_current_channel, byte));
-                }
-            }
+            r.rx_events.extend(r.rx_channels.push(&[byte])?);
         }
     }
 
@@ -1215,6 +1190,13 @@ impl WingConsole {
     }
     pub fn name_to_def(fullname: &str) -> Option<&WingNodeDef> {
         NAME_TO_DEF.get(fullname)
+    }
+
+    /// Iterate every `(fullname, definition)` in the embedded property map.
+    /// Empty when the crate is built without the `propmap` feature.
+    #[cfg(feature = "propmap")]
+    pub fn propmap_iter() -> impl Iterator<Item = (&'static str, &'static WingNodeDef)> {
+        NAME_TO_DEF.iter().map(|(name, def)| (name.as_str(), def))
     }
 
     /// Total number of entries in the embedded property map. Exposed for the
