@@ -885,16 +885,11 @@ impl WingConsole {
     }
 
     fn push_escaped(buf: &mut Vec<u8>, byte: u8) {
-        buf.push(byte);
-        if byte == 0xdf {
-            buf.push(0xde);
-        }
+        crate::native::append_escaped(buf, &[byte]);
     }
 
     fn extend_escaped(buf: &mut Vec<u8>, bytes: &[u8]) {
-        for byte in bytes {
-            Self::push_escaped(buf, *byte);
-        }
+        crate::native::append_escaped(buf, bytes);
     }
 
     fn format_id(id: i32, buf: &mut Vec<u8>, prefix: u8, suffix: Option<u8>) {

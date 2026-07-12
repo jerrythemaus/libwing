@@ -11,6 +11,11 @@ golden vectors, `src/meters.rs`'s documented word layouts). They prove the
 record-replay *machinery* end-to-end, ready to accept a real sanitized capture the
 moment one exists.
 
+These fixtures are not a vendor compatibility suite. `synthetic` proves project-owned tooling;
+`hardware` becomes admissible only after private-quarantine handling, manual and mechanical
+redaction, parser validation, provenance review, and promotion. Raw, rejected, quarantined, or
+unsanitized material is never a release asset.
+
 ## Format
 
 A `.wingcap` file is plain text, one scenario per file: `# key: value` header lines,
@@ -30,6 +35,18 @@ contiguous from one and offsets never decrease. `D>`, `D<`, `N>`, `N<`, `M>`, an
 `M<` preserve both directions; OSC may use `O>`/`O<`. Unlike V1, V2 `M<` stores the
 complete UDP datagram, including its four-byte report token. V1 `M<` remains the
 post-header meter body consumed by `decode_frame`.
+
+A promotion candidate with `source: hardware` additionally carries the typed
+`matrix_contract: wing-rack-3.1-v1` contract. Preflight requires affirmative
+`state_changing_write_approved`, an explicit boolean
+`destructive_write_approved`, `restore_verified`,
+`concurrent_definition_write_observed`, and `disconnect_observed` headers plus a
+`meter_cardinality_verdict` of `replaces`, `concurrent`, or `ambiguous`. It also
+decodes the Native request stream and requires get, definition, state-changing
+write, two meter subscriptions, two renewals, at least two raw token-bearing meter
+frames, discovery and Native traffic in both directions, keepalive, and an explicit
+empty `N<` disconnect event. Attestation does not replace encoded evidence; both
+must be present.
 
 ### Headers
 
@@ -92,8 +109,20 @@ cargo run --example wingcapture -- --init-quarantine /private/local/wing-quarant
 cargo run --example wingcapture -- --record-script script-v2.wingcap \
   /private/local/wing-quarantine session.raw.wingcap
 cargo run --example wingcapture -- --sanitize-v2 \
-  /private/local/wing-quarantine session.raw.wingcap candidate.wingcap
-cargo run --example wingcapture -- --preflight candidate.wingcap PROVENANCE.md
+  /private/local/wing-quarantine session.raw.wingcap \
+  /private/local/wing-review/candidate.wingcap
+cargo run --example wingcapture -- --preflight \
+  /private/local/wing-review/candidate.wingcap PROVENANCE.md
+```
+
+The sanitized candidate remains outside the repository and known synchronized
+folders until review succeeds. Compare reviewed hardware and emulator transcripts
+without modifying either input:
+
+```sh
+cargo run --example wingcapture -- --compare-v2 \
+  /private/local/wing-review/candidate.wingcap emulator-reference.wingcap \
+  /private/local/wing-review/deviations.txt
 ```
 
 `--record-script` is the offline U8 import path for a complete ordered transcript;
@@ -120,19 +149,54 @@ or rejected while its raw source remains.
 
 No WING Rack was accessed while building this tooling. For the later hardware run:
 
+The Native leg no longer requires packet hand-transcription. Start the bounded
+loopback-only proxy in one terminal, then point the matrix client at the printed
+effective address in another. The proxy refuses to start without explicit
+state-changing approval and writes its raw strict-V2 `N>`/`N<` transcript only to
+the private quarantine:
+
+```sh
+cargo run --example wingcapture -- --proxy-native \
+  127.0.0.1:0 <console-ip>:2222 /private/local/wing-quarantine \
+  native.raw.wingcap --allow-state-changing --seconds 60
+```
+
+It records bounded timestamped chunks in both directions and an empty event on
+TCP EOF. Acquire discovery and two token-bearing meter subscriptions directly,
+then merge the three private partials without hand transcription:
+
+```sh
+cargo run --example wingcapture -- --capture-discovery \
+  <console-ip>:2222 /private/local/wing-quarantine discovery.raw.wingcap
+
+# Run while --proxy-native is listening; this client drives CHANNEL 1 then RTA,
+# captures each complete UDP datagram, and renews both report IDs.
+cargo run --example wingcapture -- --capture-meters \
+  <printed-proxy-address> <console-ip> \
+  /private/local/wing-quarantine meters.raw.wingcap \
+  --allow-state-changing --seconds 10
+
+cargo run --example wingcapture -- --merge-v2 \
+  /private/local/wing-quarantine matrix.raw.wingcap \
+  --allow-state-changing --destructive-write-approved=false \
+  --restore-verified --concurrent-definition-write-observed \
+  discovery.raw.wingcap native.raw.wingcap meters.raw.wingcap
+```
+
+Merge order defines the rebased monotonic timeline between separately started
+partials; timing within each partial is preserved. The merged raw matrix remains
+inside quarantine for manual metadata/free-text review and sanitization. Promotion
+preflight still rejects it until attestation and every semantic matrix requirement
+pass.
+
 1. **Capture the raw traffic in the private quarantine.** For legacy
    unsolicited/keepalive Native diagnostics only:
    ```sh
    cargo run --example wingcapture -- --record <console-ip> \
      /private/local/wing-quarantine capture.raw.wingcap --seconds 10
    ```
-   For a scripted get/set or OSC exchange, there's no capture-while-driving tool yet --
-   run the exchange with `wingprop`/`wingschema`/`wingmon` while independently
-   packet-capturing the session (e.g. `tcpdump -i <iface> host <console-ip> and (port
-   2222 or port 2223) -w capture.pcap`), then hand-transcribe the relevant frames into
-   `.wingcap` hex lines (see the format above). `capture.raw.wingcap` from `--record`
-   is a starting template either way -- it already has the header/line shape, just
-   with placeholder `FILL-ME-IN` provenance fields.
+   Discovery, Native TCP, and Native meter UDP are captured by the commands above.
+   OSC remains outside the U12 Native-first hardware matrix.
 2. **Fill in provenance.** Edit the raw file's `console_model` / `firmware` /
    `capture_date` headers.
 3. **Redact free-text identifiers by hand.** Replace any console/channel/show/scribble

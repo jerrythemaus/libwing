@@ -26,6 +26,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use libwing::native::{ChannelDecoder, NativeRequest, NativeRequestDecoder};
 use libwing::{decode_frame, osc, Meter, MeterFrameEntry, Transport, WingConsole, WingResponse};
 
 use fixtures_common::{Fixture, Line};
@@ -95,7 +96,66 @@ fn complete_v2_session_preserves_order_directions_and_raw_meter_header() {
             _ => None,
         })
         .expect("raw meter datagram");
-    assert_eq!(&meter[..4], &[0, 0, 0, 1]);
+    assert_eq!(&meter[..4], &[0, 1, 0, 0]);
+
+    let discovery = fx.events.iter().find_map(|event| match &event.line {
+        Line::DiscoveryIn(bytes) => Some(bytes),
+        _ => None,
+    });
+    let discovery =
+        std::str::from_utf8(discovery.expect("discovery reply")).expect("UTF-8 discovery reply");
+    let fields = discovery.split(',').collect::<Vec<_>>();
+    assert_eq!(fields.first(), Some(&"WING"));
+    assert_eq!(fields.get(3), Some(&"RACK"));
+    assert_eq!(fields.get(5), Some(&"3.1"));
+
+    let mut requests = NativeRequestDecoder::default();
+    let mut decoded = Vec::new();
+    for event in &fx.events {
+        if let Line::NativeOut(bytes) | Line::MeterOut(bytes) = &event.line {
+            decoded.extend(requests.push(bytes).expect("semantic Native request"));
+        }
+    }
+    requests.finish().expect("complete Native request stream");
+    assert!(decoded
+        .iter()
+        .any(|request| matches!(request, NativeRequest::Get { id: 1234 })));
+    assert!(decoded
+        .iter()
+        .any(|request| matches!(request, NativeRequest::Definition { id: 1234 })));
+    assert!(decoded
+        .iter()
+        .any(|request| matches!(request, NativeRequest::Set { id: 1234, .. })));
+    assert!(decoded.iter().any(|request| matches!(
+        request,
+        NativeRequest::MeterSubscribe {
+            report_id: 0x0001_1234,
+            ..
+        }
+    )));
+    assert!(decoded.iter().any(|request| matches!(
+        request,
+        NativeRequest::MeterRenew {
+            report_id: 0x0001_1234
+        }
+    )));
+
+    let mut responses = ChannelDecoder::default();
+    for event in &fx.events {
+        if let Line::NativeIn(bytes) = &event.line {
+            responses.push(bytes).expect("framed Native response");
+        }
+    }
+    responses.finish().expect("complete Native response stream");
+
+    assert_eq!(&meter[..4], &[0x00, 0x01, 0x00, 0x00]);
+    let words = meter[4..]
+        .chunks_exact(2)
+        .map(|bytes| i16::from_be_bytes([bytes[0], bytes[1]]))
+        .collect::<Vec<_>>();
+    assert_eq!(words.len() * 2, meter.len() - 4, "odd meter payload");
+    let entries = decode_frame(&[Meter::Channel(1)], &words).expect("semantic meter frame");
+    assert!(matches!(entries.as_slice(), [MeterFrameEntry::Channel(_)]));
 }
 
 // ---------------------------------------------------------------------------

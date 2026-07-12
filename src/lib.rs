@@ -107,9 +107,9 @@ pub use helpers::{
     decode_enum, encode_enum, write_enum, EnumDecode, EnumKey, EnumValue, RawEnumValue,
 };
 pub use meters::{
-    decode_frame, fx_band_gr_db, level_db, ChannelMeter, ChannelMeterV2, DcaMeter, FxMeter,
-    MeterFrameEntry, MonitorMeter, CHANNEL_V2_WORDS, CHANNEL_WORDS, DCA_WORDS, FX_WORDS,
-    MONITOR_WORDS, OUTPUT_WORDS, RTA_WORDS, SOURCE_WORDS,
+    decode_frame, fx_band_gr_db, level_db, meter_word_count, ChannelMeter, ChannelMeterV2,
+    DcaMeter, FxMeter, MeterFrameEntry, MonitorMeter, CHANNEL_V2_WORDS, CHANNEL_WORDS, DCA_WORDS,
+    FX_WORDS, MONITOR_WORDS, OUTPUT_WORDS, RTA_WORDS, SOURCE_WORDS,
 };
 pub use node::{FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingNodeData, WingNodeDef};
 pub use safety::{risk_class, ConfirmationGuard, ConfirmationRequired, Operation, RiskClass};

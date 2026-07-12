@@ -104,7 +104,7 @@ pub fn encode_channel(channel: u8, payload: &[u8]) -> Result<Vec<u8>> {
     Ok(wire)
 }
 
-fn append_escaped(out: &mut Vec<u8>, payload: &[u8]) {
+pub(crate) fn append_escaped(out: &mut Vec<u8>, payload: &[u8]) {
     for &byte in payload {
         out.push(byte);
         if byte == ESCAPE {

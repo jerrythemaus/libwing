@@ -61,6 +61,9 @@ as link/checksum only.
   pending. When captured, each fixture's model/firmware/date/sanitizer run is
   recorded here per `REDACTION.md` rule 4.
 
+This means no capability may be distributed or documented as `hardware-captured` yet. Offline
+replay success is synthetic evidence and does not satisfy the U12 hardware-only release gate.
+
 ## Synthetic capture contracts
 
 - **`tests/fixtures/complete_session_v2.wingcap`** — version-2 format contract
