@@ -619,33 +619,94 @@ pub enum NativeResponse {
 
 /// Encode an indivisible response batch on the Audio Engine channel.
 pub fn encode_responses(responses: &[NativeResponse]) -> Result<Vec<u8>> {
-    let mut payload = Vec::new();
+    encode_responses_bounded(responses.iter().cloned(), usize::MAX)
+}
+
+/// Encode an indivisible response batch while enforcing its final wire-size ceiling.
+///
+/// Responses are consumed incrementally so a server can stream a large state iterator into a
+/// bounded batch without first materializing the complete response list. If the batch would
+/// exceed `max_wire_bytes`, encoding stops and returns [`Error::InvalidInput`].
+pub fn encode_responses_bounded(
+    responses: impl IntoIterator<Item = NativeResponse>,
+    max_wire_bytes: usize,
+) -> Result<Vec<u8>> {
+    let mut encoder = BoundedResponseEncoder::new(max_wire_bytes);
     for response in responses {
+        encoder.push(&response)?;
+    }
+    encoder.finish()
+}
+
+/// Incremental form of [`encode_responses_bounded`] for state visitors and generators.
+pub struct BoundedResponseEncoder {
+    payload: Vec<u8>,
+    max_wire_bytes: usize,
+}
+
+impl BoundedResponseEncoder {
+    pub fn new(max_wire_bytes: usize) -> Self {
+        Self {
+            payload: Vec::new(),
+            max_wire_bytes,
+        }
+    }
+
+    pub fn push(&mut self, response: &NativeResponse) -> Result<()> {
+        let mut encoded = Vec::new();
         match response {
-            NativeResponse::RequestEnd => payload.push(0xde),
+            NativeResponse::RequestEnd => encoded.push(0xde),
             NativeResponse::NodeData { id, value }
             | NativeResponse::AuthoritativeEvent { id, value } => {
-                payload.push(0xd7);
-                payload.extend_from_slice(&id.to_be_bytes());
-                encode_value(&mut payload, value)?;
+                encoded.push(0xd7);
+                encoded.extend_from_slice(&id.to_be_bytes());
+                encode_value(&mut encoded, value)?;
             }
             NativeResponse::NodeDef(def) => {
                 let body = def.to_wire_bytes()?;
                 if body.len() > NativeLimits::default().max_definition_bytes {
                     return Err(Error::InvalidInput);
                 }
-                payload.push(0xdf);
+                encoded.push(0xdf);
                 if let Ok(len) = u16::try_from(body.len()) {
-                    payload.extend_from_slice(&len.to_be_bytes());
+                    encoded.extend_from_slice(&len.to_be_bytes());
                 } else {
-                    payload.extend_from_slice(&0u16.to_be_bytes());
-                    payload.extend_from_slice(&(body.len() as u32).to_be_bytes());
+                    encoded.extend_from_slice(&0u16.to_be_bytes());
+                    encoded.extend_from_slice(&(body.len() as u32).to_be_bytes());
                 }
-                payload.extend_from_slice(&body);
+                encoded.extend_from_slice(&body);
             }
         }
+        let next_wire_len =
+            encoded_channel_len(&self.payload).saturating_add(escaped_len(&encoded));
+        if next_wire_len > self.max_wire_bytes {
+            return Err(Error::InvalidInput);
+        }
+        self.payload.extend_from_slice(&encoded);
+        Ok(())
     }
-    encode_channel(1, &payload)
+
+    pub fn finish(self) -> Result<Vec<u8>> {
+        let wire_len = encoded_channel_len(&self.payload);
+        if wire_len > self.max_wire_bytes {
+            return Err(Error::InvalidInput);
+        }
+        let mut wire = Vec::with_capacity(wire_len);
+        wire.extend_from_slice(&[ESCAPE, CHANNEL_BASE + 1]);
+        append_escaped(&mut wire, &self.payload);
+        Ok(wire)
+    }
+}
+
+fn encoded_channel_len(payload: &[u8]) -> usize {
+    2usize.saturating_add(escaped_len(payload))
+}
+
+fn escaped_len(payload: &[u8]) -> usize {
+    payload
+        .iter()
+        .map(|byte| if *byte == ESCAPE { 2 } else { 1 })
+        .sum()
 }
 
 fn encode_value(payload: &mut Vec<u8>, value: &NativeValue) -> Result<()> {

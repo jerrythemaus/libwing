@@ -1,6 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -214,6 +215,7 @@ pub struct WingConsole {
     wsock: Arc<Mutex<Box<dyn Transport>>>,
     main: Arc<Mutex<_WingConsoleMain>>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
+    has_meter_socket: Arc<AtomicBool>,
     peer_ip: IpAddr,
     /// The peer's TCP port, so [`reconnect`](Self::reconnect) can target the same endpoint
     /// without re-resolving a hostname (`connect` always used 2222; `connect_addr` may not
@@ -431,6 +433,7 @@ impl WingConsole {
                 meters: None,
                 next_meter_id: 0,
             })),
+            has_meter_socket: Arc::new(AtomicBool::new(false)),
             peer_ip,
             peer_port,
             reconnectable,
@@ -478,7 +481,7 @@ impl WingConsole {
                         main.keep_alive_timer =
                             Instant::now() + Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
                     }
-                    let meters_invalidated = self.mtrs.lock_recover().meters.is_some();
+                    let meters_invalidated = self.has_meter_socket.load(Ordering::Acquire);
                     return Ok(ReconnectOutcome {
                         attempts: attempt,
                         gap: SessionGap {
@@ -1050,6 +1053,7 @@ impl WingConsole {
             let port = socket.local_addr()?.port();
             socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
             mtrs.meters = Some(Meters { socket, port });
+            self.has_meter_socket.store(true, Ordering::Release);
         } else {
             self._keep_alive_meters(&mut mtrs)?;
         }

@@ -1,4 +1,4 @@
-use libwing::native::{encode_responses, NativeResponse, NativeValue};
+use libwing::native::{encode_responses, BoundedResponseEncoder, NativeResponse, NativeValue};
 use libwing::{FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingNodeDef};
 
 fn deframe(wire: &[u8]) -> Vec<u8> {
@@ -66,6 +66,20 @@ fn encodes_literal_node_values_and_completion() {
     ];
     assert_eq!(deframe(&wire), expected);
     expected.clear();
+}
+
+#[test]
+fn bounded_encoder_rejects_the_response_that_crosses_the_wire_limit() {
+    let first = NativeResponse::NodeData {
+        id: 0xdf,
+        value: NativeValue::Integer(1),
+    };
+    let first_wire = encode_responses(std::slice::from_ref(&first)).unwrap();
+    let mut encoder = BoundedResponseEncoder::new(first_wire.len());
+
+    encoder.push(&first).unwrap();
+    assert!(encoder.push(&NativeResponse::RequestEnd).is_err());
+    assert_eq!(encoder.finish().unwrap(), first_wire);
 }
 
 #[test]
