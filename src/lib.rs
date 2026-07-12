@@ -84,6 +84,7 @@ mod helpers;
 /// WING icon index ↔ name map (decoded from the protocol-spec "WING Icons" appendix).
 pub mod icons;
 mod meters;
+pub mod native;
 mod node;
 /// OSC-over-UDP transport (U10: R3), a sibling to the Native transport above.
 /// Namespaced rather than flattened into the root re-exports below: several of its
@@ -110,9 +111,9 @@ pub use helpers::{
 };
 pub use icons::{icon_category, icon_index, icon_name};
 pub use meters::{
-    decode_frame, fx_band_gr_db, level_db, ChannelMeter, ChannelMeterV2, DcaMeter, FxMeter,
-    MeterFrameEntry, MonitorMeter, CHANNEL_V2_WORDS, CHANNEL_WORDS, DCA_WORDS, FX_WORDS,
-    MONITOR_WORDS, OUTPUT_WORDS, RTA_WORDS, SOURCE_WORDS,
+    decode_frame, fx_band_gr_db, level_db, meter_word_count, ChannelMeter, ChannelMeterV2,
+    DcaMeter, FxMeter, MeterFrameEntry, MonitorMeter, CHANNEL_V2_WORDS, CHANNEL_WORDS, DCA_WORDS,
+    FX_WORDS, MONITOR_WORDS, OUTPUT_WORDS, RTA_WORDS, SOURCE_WORDS,
 };
 pub use node::{FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingNodeData, WingNodeDef};
 pub use safety::{risk_class, ConfirmationGuard, ConfirmationRequired, Operation, RiskClass};

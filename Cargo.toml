@@ -51,3 +51,6 @@ path = "tools/wingprop.rs"
 [[example]]
 name = "wingcapture"
 path = "tools/wingcapture.rs"
+
+# Keep the submodule independently testable when its parent checkout is itself a worktree.
+[workspace]

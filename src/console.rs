@@ -1,9 +1,11 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::native::{ChannelDecoder, ChannelEvent};
 use crate::node::{NodeType, WingNodeData, WingNodeDef};
 use crate::propmap::NAME_TO_DEF;
 use crate::{Error, Result, WingResponse};
@@ -170,9 +172,12 @@ struct _WingConsoleMain {
     rx_buf: [u8; RX_BUFFER_SIZE],
     rx_buf_tail: usize,
     rx_buf_size: usize,
-    rx_esc: bool,
-    rx_current_channel: i8,
-    rx_has_in_pipe: Option<u8>,
+    rx_channels: ChannelDecoder,
+    rx_events: VecDeque<ChannelEvent>,
+    /// Decoded bytes replayed after a bounded read timed out mid-response. `read_timeout` is
+    /// cancellation-safe: bytes already removed from the transport are never discarded.
+    replay: VecDeque<(i8, u8)>,
+    read_capture: Vec<(i8, u8)>,
     current_node_id: i32,
     /// Overall deadline for an in-flight attended-get operation (R16/R17), consulted by
     /// `decode_next` so a stuck socket read can't run past it. `None` outside of
@@ -218,7 +223,9 @@ pub struct WingConsole {
     rsock: Arc<Mutex<Box<dyn Transport>>>,
     wsock: Arc<Mutex<Box<dyn Transport>>>,
     main: Arc<Mutex<_WingConsoleMain>>,
+    read_gate: Arc<Mutex<()>>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
+    has_meter_socket: Arc<AtomicBool>,
     peer_ip: IpAddr,
     /// The peer's TCP port, so [`reconnect`](Self::reconnect) can target the same endpoint
     /// without re-resolving a hostname (`connect` always used 2222; `connect_addr` may not
@@ -421,19 +428,26 @@ impl WingConsole {
                 rx_buf: [0; RX_BUFFER_SIZE],
                 rx_buf_tail: 0,
                 rx_buf_size: 0,
-                rx_esc: false,
-                rx_current_channel: -1,
-                rx_has_in_pipe: None,
+                // Captured/test transports historically pass an already-selected
+                // Audio Engine payload. Starting on channel 1 preserves that API;
+                // a real stream's handshake selection simply selects it again.
+                rx_channels: ChannelDecoder::with_channel(1)
+                    .expect("Audio Engine is a valid Native channel"),
+                rx_events: VecDeque::new(),
+                replay: VecDeque::new(),
+                read_capture: Vec::new(),
                 current_node_id: 0,
                 op_deadline: None,
                 capture: None,
             })),
+            read_gate: Arc::new(Mutex::new(())),
             mtrs: Arc::new(Mutex::new(_WingConsoleMeters {
                 keep_alive_meters_timer: std::time::Instant::now()
                     + std::time::Duration::from_secs(METERS_KEEP_ALIVE_SECONDS),
                 meters: None,
                 next_meter_id: 0,
             })),
+            has_meter_socket: Arc::new(AtomicBool::new(false)),
             peer_ip,
             peer_port,
             reconnectable,
@@ -473,15 +487,18 @@ impl WingConsole {
                         let mut main = self.main.lock_recover();
                         main.rx_buf_tail = 0;
                         main.rx_buf_size = 0;
-                        main.rx_esc = false;
-                        main.rx_current_channel = -1;
-                        main.rx_has_in_pipe = None;
+                        main.rx_channels = ChannelDecoder::with_channel(1)
+                            .expect("Audio Engine is a valid Native channel");
+                        main.rx_events.clear();
+                        main.replay.clear();
+                        main.read_capture.clear();
+                        main.capture = None;
                         main.current_node_id = 0;
                         main.op_deadline = None;
                         main.keep_alive_timer =
                             Instant::now() + Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
                     }
-                    let meters_invalidated = self.mtrs.lock_recover().meters.is_some();
+                    let meters_invalidated = self.has_meter_socket.load(Ordering::Acquire);
                     return Ok(ReconnectOutcome {
                         attempts: attempt,
                         gap: SessionGap {
@@ -504,6 +521,31 @@ impl WingConsole {
     }
 
     pub fn read(&mut self) -> Result<WingResponse> {
+        // Parsing one logical response spans multiple `main` lock acquisitions. Serialize that
+        // whole transaction across cheap `WingConsole` clones so timeout rollback from one
+        // reader cannot replay bytes already committed by another reader.
+        let read_gate = self.read_gate.clone();
+        let _read_guard = read_gate.lock_recover();
+        let previous_node_id = {
+            let mut main = self.main.lock_recover();
+            main.read_capture.clear();
+            main.current_node_id
+        };
+        let result = self.read_inner();
+        let mut main = self.main.lock_recover();
+        if matches!(result, Err(Error::Timeout)) {
+            let captured = std::mem::take(&mut main.read_capture);
+            for decoded in captured.into_iter().rev() {
+                main.replay.push_front(decoded);
+            }
+            main.current_node_id = previous_node_id;
+        } else {
+            main.read_capture.clear();
+        }
+        result
+    }
+
+    fn read_inner(&mut self) -> Result<WingResponse> {
         loop {
             let mainptr = self.main.clone();
             let mut main = mainptr.lock_recover();
@@ -746,14 +788,21 @@ impl WingConsole {
         r: &mut _WingConsoleMain,
         raw: &mut Vec<u8>,
     ) -> Result<(i8, u8)> {
-        if let Some(value) = r.rx_has_in_pipe {
-            // println!("has in pipe");
-            r.rx_has_in_pipe = None;
-            raw.push(value);
-            return Ok((r.rx_current_channel, value));
-        }
-
         loop {
+            if let Some((channel, value)) = r.replay.pop_front() {
+                raw.push(value);
+                r.read_capture.push((channel, value));
+                return Ok((channel, value));
+            }
+            while let Some(event) = r.rx_events.pop_front() {
+                if let ChannelEvent::Data(channel, value) = event {
+                    raw.push(value);
+                    let decoded = (channel as i8, value);
+                    r.read_capture.push(decoded);
+                    return Ok(decoded);
+                }
+            }
+
             self._keep_alive(r)?;
             if r.rx_buf_size == 0 {
                 // Check before arming the socket timeout, not just after: this is what
@@ -817,32 +866,7 @@ impl WingConsole {
             r.rx_buf_tail += 1;
             r.rx_buf_size -= 1;
 
-            if !r.rx_esc {
-                if byte == 0xdf {
-                    r.rx_esc = true;
-                } else {
-                    raw.push(byte);
-                    break Ok((r.rx_current_channel, byte));
-                }
-            } else if byte == 0xdf {
-                break Ok((r.rx_current_channel, byte));
-            } else {
-                r.rx_esc = false;
-                if byte == 0xde {
-                    raw.push(0xdf);
-                    break Ok((r.rx_current_channel, 0xdf));
-                } else if (0xd0..0xde).contains(&byte) {
-                    r.rx_current_channel = (byte - 0xd0) as i8;
-                    continue;
-                } else if r.rx_current_channel >= 0 {
-                    r.rx_has_in_pipe = Some(byte);
-                    raw.push(0xdf);
-                    break Ok((r.rx_current_channel, 0xdf));
-                } else {
-                    raw.push(byte);
-                    break Ok((r.rx_current_channel, byte));
-                }
-            }
+            r.rx_events.extend(r.rx_channels.push(&[byte])?);
         }
     }
 
@@ -926,16 +950,11 @@ impl WingConsole {
     }
 
     fn push_escaped(buf: &mut Vec<u8>, byte: u8) {
-        buf.push(byte);
-        if byte == 0xdf {
-            buf.push(0xde);
-        }
+        crate::native::append_escaped(buf, &[byte]);
     }
 
     fn extend_escaped(buf: &mut Vec<u8>, bytes: &[u8]) {
-        for byte in bytes {
-            Self::push_escaped(buf, *byte);
-        }
+        crate::native::append_escaped(buf, bytes);
     }
 
     fn format_id(id: i32, buf: &mut Vec<u8>, prefix: u8, suffix: Option<u8>) {
@@ -1094,6 +1113,7 @@ impl WingConsole {
             let port = socket.local_addr()?.port();
             socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
             mtrs.meters = Some(Meters { socket, port });
+            self.has_meter_socket.store(true, Ordering::Release);
         } else {
             self._keep_alive_meters(&mut mtrs)?;
         }
@@ -2054,7 +2074,7 @@ mod tests {
         data.push(0x05);
         data.push(0xd1);
         data.push(64);
-        data.extend_from_slice(&vec![b'a'; 65]);
+        data.extend_from_slice(&[b'a'; 65]);
         data.push(0xde);
 
         assert_eq!(
@@ -2141,6 +2161,82 @@ mod tests {
             panic!("expected node data");
         };
         assert_eq!(data.get_string(), "A\0B");
+    }
+
+    #[test]
+    fn read_timeout_replays_a_response_fragment_instead_of_corrupting_the_stream() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, peer_addr) = listener.accept().unwrap();
+        let writer = std::thread::spawn(move || {
+            server.write_all(&[0xd7, 0, 0, 0, 7, 0xd5, 0x41]).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            server.write_all(&[0x20, 0, 0]).unwrap();
+        });
+        let mut console = WingConsole::from_streams(
+            client.try_clone().unwrap(),
+            client,
+            peer_addr.ip(),
+            peer_addr.port(),
+        );
+
+        assert!(matches!(
+            console.read_timeout(Duration::from_millis(20)),
+            Err(Error::Timeout)
+        ));
+        let WingResponse::NodeData(id, value) = console
+            .read_timeout(Duration::from_millis(200))
+            .expect("the replayed prefix and remaining suffix form one response")
+        else {
+            panic!("expected node data");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(value.get_float(), 10.0);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn cloned_readers_serialize_timeout_replay_transactions() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, peer_addr) = listener.accept().unwrap();
+        let writer = std::thread::spawn(move || {
+            server.write_all(&[0xd7, 0, 0, 0, 7, 0xd5, 0x41]).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            server
+                .write_all(&[0x20, 0, 0, 0xd7, 0, 0, 0, 8, 0xd4, 0, 0, 0, 9])
+                .unwrap();
+        });
+        let mut console = WingConsole::from_streams(
+            client.try_clone().unwrap(),
+            client,
+            peer_addr.ip(),
+            peer_addr.port(),
+        );
+        let mut first = console.clone();
+        let timed_out = std::thread::spawn(move || first.read_timeout(Duration::from_millis(20)));
+        std::thread::sleep(Duration::from_millis(5));
+        let mut second = console.clone();
+        let replayed =
+            std::thread::spawn(move || second.read_timeout(Duration::from_millis(200)).unwrap());
+
+        assert!(matches!(timed_out.join().unwrap(), Err(Error::Timeout)));
+        let WingResponse::NodeData(id, value) = replayed.join().unwrap() else {
+            panic!("expected replayed node data");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(value.get_float(), 10.0);
+        let WingResponse::NodeData(id, value) = console
+            .read_timeout(Duration::from_millis(200))
+            .expect("the second response remains exactly once")
+        else {
+            panic!("expected second node data");
+        };
+        assert_eq!(id, 8);
+        assert_eq!(value.get_int(), 9);
+        writer.join().unwrap();
     }
 
     #[test]

@@ -26,9 +26,137 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use libwing::native::{ChannelDecoder, NativeRequest, NativeRequestDecoder};
 use libwing::{decode_frame, osc, Meter, MeterFrameEntry, Transport, WingConsole, WingResponse};
 
 use fixtures_common::{Fixture, Line};
+
+#[test]
+fn legacy_v1_fixtures_remain_implicit_and_unchanged() {
+    for name in [
+        "discovery.wingcap",
+        "meters_channel_rta.wingcap",
+        "native_connect_get_set.wingcap",
+        "osc_subscription.wingcap",
+    ] {
+        let fx = load_fixture(name);
+        assert_eq!(fx.header("wingcap_version"), None, "{name}");
+        assert!(fx.events.is_empty(), "{name}");
+    }
+}
+
+#[test]
+fn complete_v2_session_preserves_order_directions_and_raw_meter_header() {
+    let fx = load_fixture("complete_session_v2.wingcap");
+    assert_eq!(fx.header("wingcap_version"), Some("2"));
+    for key in [
+        "scenario",
+        "source",
+        "console_model",
+        "firmware",
+        "capture_date",
+        "sanitizer",
+        "manual_redaction_attested",
+        "expected_behavior",
+    ] {
+        assert!(fx.header(key).is_some(), "missing {key}");
+    }
+    assert_eq!(fx.events.len(), 16);
+    for (index, event) in fx.events.iter().enumerate() {
+        assert_eq!(event.ordinal, index as u64 + 1);
+        if index > 0 {
+            assert!(event.offset_us >= fx.events[index - 1].offset_us);
+        }
+    }
+    assert!(fx
+        .events
+        .iter()
+        .any(|event| matches!(event.line, Line::DiscoveryOut(_))));
+    assert!(fx
+        .events
+        .iter()
+        .any(|event| matches!(event.line, Line::DiscoveryIn(_))));
+    assert!(fx
+        .events
+        .iter()
+        .any(|event| matches!(event.line, Line::NativeOut(_))));
+    assert!(fx
+        .events
+        .iter()
+        .any(|event| matches!(event.line, Line::NativeIn(_))));
+    assert!(fx
+        .events
+        .iter()
+        .any(|event| matches!(event.line, Line::MeterOut(_))));
+    let meter = fx
+        .events
+        .iter()
+        .find_map(|event| match &event.line {
+            Line::MeterRawIn(bytes) => Some(bytes),
+            _ => None,
+        })
+        .expect("raw meter datagram");
+    assert_eq!(&meter[..4], &[0, 1, 0, 0]);
+
+    let discovery = fx.events.iter().find_map(|event| match &event.line {
+        Line::DiscoveryIn(bytes) => Some(bytes),
+        _ => None,
+    });
+    let discovery =
+        std::str::from_utf8(discovery.expect("discovery reply")).expect("UTF-8 discovery reply");
+    let fields = discovery.split(',').collect::<Vec<_>>();
+    assert_eq!(fields.first(), Some(&"WING"));
+    assert_eq!(fields.get(3), Some(&"RACK"));
+    assert_eq!(fields.get(5), Some(&"3.1"));
+
+    let mut requests = NativeRequestDecoder::default();
+    let mut decoded = Vec::new();
+    for event in &fx.events {
+        if let Line::NativeOut(bytes) | Line::MeterOut(bytes) = &event.line {
+            decoded.extend(requests.push(bytes).expect("semantic Native request"));
+        }
+    }
+    requests.finish().expect("complete Native request stream");
+    assert!(decoded
+        .iter()
+        .any(|request| matches!(request, NativeRequest::Get { id: 1234 })));
+    assert!(decoded
+        .iter()
+        .any(|request| matches!(request, NativeRequest::Definition { id: 1234 })));
+    assert!(decoded
+        .iter()
+        .any(|request| matches!(request, NativeRequest::Set { id: 1234, .. })));
+    assert!(decoded.iter().any(|request| matches!(
+        request,
+        NativeRequest::MeterSubscribe {
+            report_id: 0x0001_1234,
+            ..
+        }
+    )));
+    assert!(decoded.iter().any(|request| matches!(
+        request,
+        NativeRequest::MeterRenew {
+            report_id: 0x0001_1234
+        }
+    )));
+
+    let mut responses = ChannelDecoder::default();
+    for event in &fx.events {
+        if let Line::NativeIn(bytes) = &event.line {
+            responses.push(bytes).expect("framed Native response");
+        }
+    }
+    responses.finish().expect("complete Native response stream");
+
+    assert_eq!(&meter[..4], &[0x00, 0x01, 0x00, 0x00]);
+    let words = meter[4..]
+        .chunks_exact(2)
+        .map(|bytes| i16::from_be_bytes([bytes[0], bytes[1]]))
+        .collect::<Vec<_>>();
+    assert_eq!(words.len() * 2, meter.len() - 4, "odd meter payload");
+    let entries = decode_frame(&[Meter::Channel(1)], &words).expect("semantic meter frame");
+    assert!(matches!(entries.as_slice(), [MeterFrameEntry::Channel(_)]));
+}
 
 // ---------------------------------------------------------------------------
 // Scripted transports (same shapes as tests/attended_get.rs; duplicated rather than
@@ -464,9 +592,12 @@ fn every_checked_in_fixture_passes_redaction() {
                 Line::NativeOut(b)
                 | Line::NativeIn(b)
                 | Line::MeterIn(b)
+                | Line::MeterRawIn(b)
+                | Line::MeterOut(b)
                 | Line::OscIn(b)
                 | Line::OscOut(b)
-                | Line::DiscoveryIn(b) => Some(b),
+                | Line::DiscoveryIn(b)
+                | Line::DiscoveryOut(b) => Some(b),
                 Line::Expect(_) => None,
             };
             if let Some(bytes) = bytes {

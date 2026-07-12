@@ -217,7 +217,7 @@ pub enum MeterFrameEntry {
 }
 
 /// Word count of the family a given [`Meter`] request element decodes to.
-fn family_words(meter: &Meter) -> usize {
+pub fn meter_word_count(meter: &Meter) -> usize {
     match meter {
         Meter::Channel(_) | Meter::Aux(_) | Meter::Bus(_) | Meter::Main(_) | Meter::Matrix(_) => {
             CHANNEL_WORDS
@@ -252,7 +252,7 @@ fn family_words(meter: &Meter) -> usize {
 /// actual word count (feeds R28 — a caller can surface this as a clear "insufficient capacity"
 /// signal rather than a panic or silently-misaligned decode).
 pub fn decode_frame(request: &[Meter], raw: &[i16]) -> Result<Vec<MeterFrameEntry>> {
-    let expected: usize = request.iter().map(family_words).sum();
+    let expected: usize = request.iter().map(meter_word_count).sum();
     if raw.len() != expected {
         return Err(Error::MeterFrameLength {
             expected,
@@ -263,7 +263,7 @@ pub fn decode_frame(request: &[Meter], raw: &[i16]) -> Result<Vec<MeterFrameEntr
     let mut out = Vec::with_capacity(request.len());
     let mut offset = 0;
     for meter in request {
-        let n = family_words(meter);
+        let n = meter_word_count(meter);
         let words = &raw[offset..offset + n];
         out.push(match meter {
             Meter::Channel(_) => MeterFrameEntry::Channel(ChannelMeter::from_slice(words)),

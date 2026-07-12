@@ -60,3 +60,24 @@ as link/checksum only.
   scaling, OSC live exercise, redacted verification run per R70/R56) is
   pending. When captured, each fixture's model/firmware/date/sanitizer run is
   recorded here per `REDACTION.md` rule 4.
+
+This means no capability may be distributed or documented as `hardware-captured` yet. Offline
+replay success is synthetic evidence and does not satisfy the U12 hardware-only release gate.
+
+## Synthetic capture contracts
+
+- **`complete_session_v2.wingcap`**
+  - Evidence class: synthetic
+  - Source: synthetic
+  - Review status: reviewed
+  - Console model: RACK
+  - Firmware: 3.1
+  - Capture date: 2026-07-12
+  - Sanitizer: n/a
+  - Origin: independently hand-authored from the public protocol description and
+    repository-owned codecs. It is not hardware evidence.
+  - Covers the ordered bidirectional discovery, Native, and meter channel grammar,
+    including the raw four-byte meter report token.
+  - Expected behavior: format parsing, ordering, direction preservation, raw-meter
+    framing, and legacy-v1 coexistence only.
+  - No vendor emulator, firmware payload, `wapi` material, or user data was used.

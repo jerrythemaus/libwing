@@ -22,6 +22,10 @@ pub enum Line {
     /// the 4-byte meter-id header a real UDP datagram carries -- see
     /// [`crate::WingConsole::read_meters`]'s docs -- has already been stripped).
     MeterIn(Vec<u8>),
+    /// V2 `M<`: the complete UDP datagram, including the four-byte report token.
+    MeterRawIn(Vec<u8>),
+    /// V2 `M>`: client -> console meter subscription or renewal bytes.
+    MeterOut(Vec<u8>),
     /// `O<`: console -> client OSC datagram.
     OscIn(Vec<u8>),
     /// `O>`: client -> console OSC datagram (round-trip checked, not replayed
@@ -29,8 +33,17 @@ pub enum Line {
     OscOut(Vec<u8>),
     /// `D<`: a WING discovery-reply UDP payload (ASCII, comma-separated).
     DiscoveryIn(Vec<u8>),
+    /// V2 `D>`: client -> console discovery request.
+    DiscoveryOut(Vec<u8>),
     /// `# expect: ...`: an assertion annotation, raw text after the prefix.
     Expect(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub ordinal: u64,
+    pub offset_us: u64,
+    pub line: Line,
 }
 
 pub struct Fixture {
@@ -39,6 +52,8 @@ pub struct Fixture {
     /// `request`) keep every occurrence -- see [`headers_all`](Self::headers_all).
     pub headers: Vec<(String, String)>,
     pub lines: Vec<Line>,
+    /// Ordered/timed V2 events. Empty for legacy V1 fixtures.
+    pub events: Vec<Event>,
     /// Every raw non-blank line, verbatim, exactly as it appears in the file --
     /// used by the redaction guard, which scans independently of how this loader
     /// interprets each line.
@@ -104,9 +119,40 @@ impl Fixture {
 /// something a replay test should have to handle gracefully.
 pub fn load(path: &Path) -> Fixture {
     let text = fs::read_to_string(path).unwrap_or_else(|e| panic!("reading {path:?}: {e}"));
+    parse(path, &text)
+}
+
+fn parse(path: &Path, text: &str) -> Fixture {
+    let mut declared_version = None;
+    let mut saw_data = false;
+    for raw in text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+    {
+        let Some(rest) = raw.strip_prefix('#') else {
+            saw_data = true;
+            continue;
+        };
+        let Some((key, value)) = rest.trim().split_once(':') else {
+            continue;
+        };
+        if key.trim() != "wingcap_version" {
+            continue;
+        }
+        assert!(!saw_data, "{path:?}: wingcap_version must precede data");
+        assert!(
+            declared_version.is_none(),
+            "{path:?}: duplicate wingcap_version headers"
+        );
+        assert_eq!(value.trim(), "2", "{path:?}: unsupported wingcap_version");
+        declared_version = Some(2);
+    }
+    let version = declared_version.unwrap_or(1);
     let mut headers = Vec::new();
     let mut lines = Vec::new();
     let mut raw_lines = Vec::new();
+    let mut events: Vec<Event> = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim_end();
@@ -122,6 +168,23 @@ pub fn load(path: &Path) -> Fixture {
                 headers.push((key.trim().to_string(), value.trim().to_string()));
             }
             // A bare `#` comment with no `key: value` shape is decorative only.
+        } else if version == 2 && line.starts_with('@') {
+            let event = parse_v2_event(path, line);
+            let expected_ordinal = events.len() as u64 + 1;
+            assert_eq!(
+                event.ordinal, expected_ordinal,
+                "{path:?}: V2 event ordinal must be contiguous from one"
+            );
+            if let Some(previous) = events.last() {
+                assert!(
+                    event.offset_us >= previous.offset_us,
+                    "{path:?}: V2 event offsets must be monotonic"
+                );
+            }
+            lines.push(event.line.clone());
+            events.push(event);
+        } else if version == 2 {
+            panic!("{path:?}: V2 data lines must use timed @ events: {line:?}");
         } else if let Some(rest) = line.strip_prefix("N>") {
             lines.push(Line::NativeOut(decode_hex(rest.trim())));
         } else if let Some(rest) = line.strip_prefix("N<") {
@@ -143,7 +206,43 @@ pub fn load(path: &Path) -> Fixture {
         path: path.to_path_buf(),
         headers,
         lines,
+        events,
         raw_lines,
+    }
+}
+
+fn parse_v2_event(path: &Path, line: &str) -> Event {
+    let mut fields = line.split_whitespace();
+    let ordinal = fields
+        .next()
+        .and_then(|value| value.strip_prefix('@'))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{path:?}: invalid V2 ordinal in {line:?}"));
+    let offset_us = fields
+        .next()
+        .and_then(|value| value.strip_prefix('+'))
+        .and_then(|value| value.strip_suffix("us"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{path:?}: invalid V2 offset in {line:?}"));
+    let channel = fields
+        .next()
+        .unwrap_or_else(|| panic!("{path:?}: missing V2 channel in {line:?}"));
+    let bytes = decode_hex(&fields.collect::<Vec<_>>().join(""));
+    let line = match channel {
+        "N>" => Line::NativeOut(bytes),
+        "N<" => Line::NativeIn(bytes),
+        "M>" => Line::MeterOut(bytes),
+        "M<" => Line::MeterRawIn(bytes),
+        "D>" => Line::DiscoveryOut(bytes),
+        "D<" => Line::DiscoveryIn(bytes),
+        "O>" => Line::OscOut(bytes),
+        "O<" => Line::OscIn(bytes),
+        _ => panic!("{path:?}: unknown V2 channel {channel:?}"),
+    };
+    Event {
+        ordinal,
+        offset_us,
+        line,
     }
 }
 
@@ -177,4 +276,34 @@ pub fn all_fixture_paths() -> Vec<PathBuf> {
         .collect();
     paths.sort();
     paths
+}
+
+#[cfg(test)]
+mod grammar_tests {
+    use super::*;
+
+    fn rejects(text: &str) -> bool {
+        std::panic::catch_unwind(|| parse(Path::new("grammar.wingcap"), text)).is_err()
+    }
+
+    #[test]
+    fn version_selects_one_strict_grammar() {
+        assert!(!rejects("N> df0100df\n"));
+        assert!(rejects("@1 +0us N> df0100df\n"));
+        assert!(!rejects("# wingcap_version: 2\n@1 +0us N> df0100df\n"));
+        assert!(rejects("# wingcap_version: 2\nN> df0100df\n"));
+        assert!(rejects("# wingcap_version: 1\nN> df0100df\n"));
+        assert!(rejects("@1 +0us N> 01\n# wingcap_version: 2\n"));
+    }
+
+    #[test]
+    fn v2_rejects_duplicate_gap_and_decreasing_offset() {
+        for text in [
+            "# wingcap_version: 2\n@1 +0us N> 01\n@1 +1us N< 02\n",
+            "# wingcap_version: 2\n@1 +0us N> 01\n@3 +1us N< 02\n",
+            "# wingcap_version: 2\n@1 +2us N> 01\n@2 +1us N< 02\n",
+        ] {
+            assert!(rejects(text), "accepted malformed V2 fixture: {text}");
+        }
+    }
 }
