@@ -22,6 +22,10 @@ pub enum Line {
     /// the 4-byte meter-id header a real UDP datagram carries -- see
     /// [`crate::WingConsole::read_meters`]'s docs -- has already been stripped).
     MeterIn(Vec<u8>),
+    /// V2 `M<`: the complete UDP datagram, including the four-byte report token.
+    MeterRawIn(Vec<u8>),
+    /// V2 `M>`: client -> console meter subscription or renewal bytes.
+    MeterOut(Vec<u8>),
     /// `O<`: console -> client OSC datagram.
     OscIn(Vec<u8>),
     /// `O>`: client -> console OSC datagram (round-trip checked, not replayed
@@ -29,8 +33,17 @@ pub enum Line {
     OscOut(Vec<u8>),
     /// `D<`: a WING discovery-reply UDP payload (ASCII, comma-separated).
     DiscoveryIn(Vec<u8>),
+    /// V2 `D>`: client -> console discovery request.
+    DiscoveryOut(Vec<u8>),
     /// `# expect: ...`: an assertion annotation, raw text after the prefix.
     Expect(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Event {
+    pub ordinal: u64,
+    pub offset_us: u64,
+    pub line: Line,
 }
 
 pub struct Fixture {
@@ -39,6 +52,8 @@ pub struct Fixture {
     /// `request`) keep every occurrence -- see [`headers_all`](Self::headers_all).
     pub headers: Vec<(String, String)>,
     pub lines: Vec<Line>,
+    /// Ordered/timed V2 events. Empty for legacy V1 fixtures.
+    pub events: Vec<Event>,
     /// Every raw non-blank line, verbatim, exactly as it appears in the file --
     /// used by the redaction guard, which scans independently of how this loader
     /// interprets each line.
@@ -107,6 +122,7 @@ pub fn load(path: &Path) -> Fixture {
     let mut headers = Vec::new();
     let mut lines = Vec::new();
     let mut raw_lines = Vec::new();
+    let mut events = Vec::new();
 
     for raw in text.lines() {
         let line = raw.trim_end();
@@ -122,6 +138,10 @@ pub fn load(path: &Path) -> Fixture {
                 headers.push((key.trim().to_string(), value.trim().to_string()));
             }
             // A bare `#` comment with no `key: value` shape is decorative only.
+        } else if line.starts_with('@') {
+            let event = parse_v2_event(path, line);
+            lines.push(event.line.clone());
+            events.push(event);
         } else if let Some(rest) = line.strip_prefix("N>") {
             lines.push(Line::NativeOut(decode_hex(rest.trim())));
         } else if let Some(rest) = line.strip_prefix("N<") {
@@ -143,7 +163,43 @@ pub fn load(path: &Path) -> Fixture {
         path: path.to_path_buf(),
         headers,
         lines,
+        events,
         raw_lines,
+    }
+}
+
+fn parse_v2_event(path: &Path, line: &str) -> Event {
+    let mut fields = line.split_whitespace();
+    let ordinal = fields
+        .next()
+        .and_then(|value| value.strip_prefix('@'))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{path:?}: invalid V2 ordinal in {line:?}"));
+    let offset_us = fields
+        .next()
+        .and_then(|value| value.strip_prefix('+'))
+        .and_then(|value| value.strip_suffix("us"))
+        .and_then(|value| value.parse().ok())
+        .unwrap_or_else(|| panic!("{path:?}: invalid V2 offset in {line:?}"));
+    let channel = fields
+        .next()
+        .unwrap_or_else(|| panic!("{path:?}: missing V2 channel in {line:?}"));
+    let bytes = decode_hex(&fields.collect::<Vec<_>>().join(""));
+    let line = match channel {
+        "N>" => Line::NativeOut(bytes),
+        "N<" => Line::NativeIn(bytes),
+        "M>" => Line::MeterOut(bytes),
+        "M<" => Line::MeterRawIn(bytes),
+        "D>" => Line::DiscoveryOut(bytes),
+        "D<" => Line::DiscoveryIn(bytes),
+        "O>" => Line::OscOut(bytes),
+        "O<" => Line::OscIn(bytes),
+        _ => panic!("{path:?}: unknown V2 channel {channel:?}"),
+    };
+    Event {
+        ordinal,
+        offset_us,
+        line,
     }
 }
 

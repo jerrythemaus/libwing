@@ -17,6 +17,20 @@ A `.wingcap` file is plain text, one scenario per file: `# key: value` header li
 followed by data lines and `# expect:` assertion annotations. Blank lines are ignored.
 Loader: `tests/fixtures_common/mod.rs`.
 
+Legacy files have no `wingcap_version` header and retain the V1 grammar below
+byte-for-byte. V2 starts with `# wingcap_version: 2` and records each wire event as:
+
+```text
+@<ordinal> +<monotonic-microseconds> <channel><direction> <raw-hex-bytes>
+```
+
+V2 requires `scenario`, `source`, `console_model`, `firmware`, `capture_date`,
+`sanitizer`, `manual_redaction_attested`, and `expected_behavior`. Ordinals are
+contiguous from one and offsets never decrease. `D>`, `D<`, `N>`, `N<`, `M>`, and
+`M<` preserve both directions; OSC may use `O>`/`O<`. Unlike V1, V2 `M<` stores the
+complete UDP datagram, including its four-byte report token. V1 `M<` remains the
+post-header meter body consumed by `decode_frame`.
+
 ### Headers
 
 | Key | Meaning |
@@ -66,12 +80,47 @@ Free-text identifiers -- console/channel/show/scribble names -- have no reliable
 mechanical pattern and are **not** caught by this scanner. Redact those by hand per
 `REDACTION.md`'s replacement table before a capture is sanitized.
 
-## Recording and checking in a real hardware capture
+## Private quarantine and promotion preflight
 
-No WING Rack is reachable from this development environment, so this is written for
-whoever runs it first, on real hardware:
+Raw captures are sensitive and must live in a dedicated off-tree, non-synchronized
+quarantine. The tool rejects repository destinations, common synchronized-directory
+names, traversal, and symlink escapes. On Unix it enforces mode `0700` for the root
+and `0600` for raw files.
 
-1. **Capture the raw traffic.** For unsolicited/keepalive Native traffic:
+```sh
+cargo run --example wingcapture -- --init-quarantine /private/local/wing-quarantine
+cargo run --example wingcapture -- --record-script script-v2.wingcap \
+  /private/local/wing-quarantine session.raw.wingcap
+cargo run --example wingcapture -- --sanitize-v2 \
+  /private/local/wing-quarantine session.raw.wingcap candidate.wingcap
+cargo run --example wingcapture -- --preflight candidate.wingcap PROVENANCE.md
+```
+
+`--record-script` is the offline U8 import path for a complete ordered transcript;
+U12 owns acquiring a real transcript. The older `--record` mode remains for legacy
+one-way diagnostic capture only and cannot produce a promotion-ready V2 contract.
+Before sanitizing, manually replace console/channel/show/preset/scribble free text
+and set `manual_redaction_attested: true`. Preflight then requires complete metadata,
+contiguous events, all core directions, a raw meter header, a clean mechanical scan,
+and a matching canonical `PROVENANCE.md` entry.
+
+No candidate is promoted by this tool. Review it, place it under `tests/fixtures/`,
+run `cargo test --test replay`, and then immediately dispose of the raw capture:
+
+```sh
+cargo run --example wingcapture -- --dispose session.raw.wingcap \
+  /private/local/wing-quarantine
+```
+
+Delete rejected raw captures immediately as well. Abandoned captures have a maximum
+24-hour retention and can be removed with `--purge-expired <quarantine> 24`. Cleanup
+errors are fatal and must be resolved visibly; do not treat a candidate as promoted
+or rejected while its raw source remains.
+
+No WING Rack was accessed while building this tooling. For the later hardware run:
+
+1. **Capture the raw traffic in the private quarantine.** For legacy
+   unsolicited/keepalive Native diagnostics only:
    ```sh
    cargo run --example wingcapture -- --record <console-ip> capture.raw.wingcap --seconds 10
    ```
@@ -92,7 +141,7 @@ whoever runs it first, on real hardware:
    ```sh
    cargo run --example wingcapture -- capture.raw.wingcap capture.wingcap
    ```
-5. **Verify and check in.**
+5. **Run preflight, verify, and check in.**
    ```sh
    cargo test --test replay
    ```
