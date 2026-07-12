@@ -218,6 +218,7 @@ pub struct WingConsole {
     rsock: Arc<Mutex<Box<dyn Transport>>>,
     wsock: Arc<Mutex<Box<dyn Transport>>>,
     main: Arc<Mutex<_WingConsoleMain>>,
+    read_gate: Arc<Mutex<()>>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
     has_meter_socket: Arc<AtomicBool>,
     peer_ip: IpAddr,
@@ -433,6 +434,7 @@ impl WingConsole {
                 current_node_id: 0,
                 op_deadline: None,
             })),
+            read_gate: Arc::new(Mutex::new(())),
             mtrs: Arc::new(Mutex::new(_WingConsoleMeters {
                 keep_alive_meters_timer: std::time::Instant::now()
                     + std::time::Duration::from_secs(METERS_KEEP_ALIVE_SECONDS),
@@ -482,6 +484,8 @@ impl WingConsole {
                         main.rx_channels = ChannelDecoder::with_channel(1)
                             .expect("Audio Engine is a valid Native channel");
                         main.rx_events.clear();
+                        main.replay.clear();
+                        main.read_capture.clear();
                         main.current_node_id = 0;
                         main.op_deadline = None;
                         main.keep_alive_timer =
@@ -510,6 +514,11 @@ impl WingConsole {
     }
 
     pub fn read(&mut self) -> Result<WingResponse> {
+        // Parsing one logical response spans multiple `main` lock acquisitions. Serialize that
+        // whole transaction across cheap `WingConsole` clones so timeout rollback from one
+        // reader cannot replay bytes already committed by another reader.
+        let read_gate = self.read_gate.clone();
+        let _read_guard = read_gate.lock_recover();
         let previous_node_id = {
             let mut main = self.main.lock_recover();
             main.read_capture.clear();
@@ -1707,6 +1716,49 @@ mod tests {
         };
         assert_eq!(id, 7);
         assert_eq!(value.get_float(), 10.0);
+        writer.join().unwrap();
+    }
+
+    #[test]
+    fn cloned_readers_serialize_timeout_replay_transactions() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = TcpStream::connect(addr).unwrap();
+        let (mut server, peer_addr) = listener.accept().unwrap();
+        let writer = std::thread::spawn(move || {
+            server.write_all(&[0xd7, 0, 0, 0, 7, 0xd5, 0x41]).unwrap();
+            std::thread::sleep(Duration::from_millis(50));
+            server
+                .write_all(&[0x20, 0, 0, 0xd7, 0, 0, 0, 8, 0xd4, 0, 0, 0, 9])
+                .unwrap();
+        });
+        let mut console = WingConsole::from_streams(
+            client.try_clone().unwrap(),
+            client,
+            peer_addr.ip(),
+            peer_addr.port(),
+        );
+        let mut first = console.clone();
+        let timed_out = std::thread::spawn(move || first.read_timeout(Duration::from_millis(20)));
+        std::thread::sleep(Duration::from_millis(5));
+        let mut second = console.clone();
+        let replayed =
+            std::thread::spawn(move || second.read_timeout(Duration::from_millis(200)).unwrap());
+
+        assert!(matches!(timed_out.join().unwrap(), Err(Error::Timeout)));
+        let WingResponse::NodeData(id, value) = replayed.join().unwrap() else {
+            panic!("expected replayed node data");
+        };
+        assert_eq!(id, 7);
+        assert_eq!(value.get_float(), 10.0);
+        let WingResponse::NodeData(id, value) = console
+            .read_timeout(Duration::from_millis(200))
+            .expect("the second response remains exactly once")
+        else {
+            panic!("expected second node data");
+        };
+        assert_eq!(id, 8);
+        assert_eq!(value.get_int(), 9);
         writer.join().unwrap();
     }
 
