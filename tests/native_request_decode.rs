@@ -150,3 +150,47 @@ fn rejects_limits_truncation_and_recovers_after_reset() {
         Err(Error::InvalidData)
     ));
 }
+
+#[test]
+fn rejects_index_path_flood_and_recovers_after_automatic_reset() {
+    let limits = NativeLimits {
+        max_path_elements: 2,
+        ..NativeLimits::default()
+    };
+    let mut decoder = NativeRequestDecoder::new(limits);
+
+    assert!(matches!(
+        decoder.push(&framed(1, &[0xda, 0x40, 0x41, 0x42])),
+        Err(Error::InvalidData)
+    ));
+
+    let requests = decoder.push(&framed(1, &[0xda, 0x40, 0xdc])).unwrap();
+    assert_eq!(
+        requests.last(),
+        Some(&NativeRequest::BulkData {
+            path: vec![PathElement::Index(1)],
+        })
+    );
+}
+
+#[test]
+fn rejects_named_path_byte_flood_and_recovers_after_automatic_reset() {
+    let limits = NativeLimits {
+        max_path_bytes: 2,
+        ..NativeLimits::default()
+    };
+    let mut decoder = NativeRequestDecoder::new(limits);
+
+    assert!(matches!(
+        decoder.push(&framed(1, &[0xda, 0xc1, b'a', b'b', 0xc0, b'c'])),
+        Err(Error::InvalidData)
+    ));
+
+    let requests = decoder.push(&framed(1, &[0xda, 0xc0, b'x', 0xdc])).unwrap();
+    assert_eq!(
+        requests.last(),
+        Some(&NativeRequest::BulkData {
+            path: vec![PathElement::Name("x".to_owned())],
+        })
+    );
+}

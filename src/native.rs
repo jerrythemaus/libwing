@@ -118,6 +118,8 @@ fn append_escaped(out: &mut Vec<u8>, payload: &[u8]) {
 pub struct NativeLimits {
     pub max_buffered_bytes: usize,
     pub max_string_bytes: usize,
+    pub max_path_elements: usize,
+    pub max_path_bytes: usize,
     pub max_definition_bytes: usize,
     pub max_batch_requests: usize,
     pub max_meter_entries: usize,
@@ -128,6 +130,8 @@ impl Default for NativeLimits {
         Self {
             max_buffered_bytes: 64 * 1024,
             max_string_bytes: 256,
+            max_path_elements: 256,
+            max_path_bytes: 4096,
             max_definition_bytes: 1024 * 1024,
             max_batch_requests: 4096,
             max_meter_entries: 512,
@@ -209,6 +213,7 @@ pub struct NativeRequestDecoder {
     meter: Vec<u8>,
     selected_id: Option<i32>,
     path: Vec<PathElement>,
+    path_bytes: usize,
     meter_port: Option<u16>,
 }
 
@@ -227,6 +232,7 @@ impl NativeRequestDecoder {
             meter: Vec::new(),
             selected_id: None,
             path: Vec::new(),
+            path_bytes: 0,
             meter_port: None,
         }
     }
@@ -319,7 +325,7 @@ impl NativeRequestDecoder {
         let request = match opcode {
             0x00..=0x3f => self.set_value(1, NativeValue::Integer(opcode as i32))?,
             0x40..=0x7f => {
-                self.path.push(PathElement::Index((opcode - 0x3f) as u32));
+                self.push_path_index((opcode - 0x3f) as u32)?;
                 self.audio.drain(..1);
                 return self.parse_audio();
             }
@@ -335,8 +341,10 @@ impl NativeRequestDecoder {
                 if self.audio.len() < len + 1 {
                     return Ok(None);
                 }
+                self.check_path_room(len)?;
                 let value = String::from_utf8(self.audio[1..=len].to_vec())
                     .map_err(|_| Error::InvalidData)?;
+                self.path_bytes += len;
                 self.path.push(PathElement::Name(value));
                 self.audio.drain(..=len);
                 return self.parse_audio();
@@ -356,9 +364,9 @@ impl NativeRequestDecoder {
                 let Some(bytes) = self.audio.get(1..3) else {
                     return Ok(None);
                 };
-                self.path.push(PathElement::Index(
+                self.push_path_index(
                     u16::from_be_bytes(bytes.try_into().expect("two bytes")) as u32 + 1,
-                ));
+                )?;
                 self.audio.drain(..3);
                 return self.parse_audio();
             }
@@ -415,12 +423,15 @@ impl NativeRequestDecoder {
             0xda => {
                 self.selected_id = None;
                 self.path.clear();
+                self.path_bytes = 0;
                 self.audio.drain(..1);
                 return self.parse_audio();
             }
             0xdb => {
                 self.selected_id = None;
-                self.path.pop();
+                if let Some(PathElement::Name(name)) = self.path.pop() {
+                    self.path_bytes -= name.len();
+                }
                 self.audio.drain(..1);
                 return self.parse_audio();
             }
@@ -451,6 +462,26 @@ impl NativeRequestDecoder {
             }
         };
         Ok(Some(request))
+    }
+
+    fn push_path_index(&mut self, index: u32) -> Result<()> {
+        self.check_path_room(0)?;
+        self.path.push(PathElement::Index(index));
+        Ok(())
+    }
+
+    fn check_path_room(&mut self, name_bytes: usize) -> Result<()> {
+        let within_elements = self.path.len() < self.limits.max_path_elements;
+        let within_bytes = self
+            .path_bytes
+            .checked_add(name_bytes)
+            .is_some_and(|bytes| bytes <= self.limits.max_path_bytes);
+        if within_elements && within_bytes {
+            Ok(())
+        } else {
+            self.reset();
+            Err(Error::InvalidData)
+        }
     }
 
     fn parse_string_token(&mut self, len: usize, header: usize) -> Result<NativeRequest> {
