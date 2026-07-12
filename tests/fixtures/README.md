@@ -56,9 +56,9 @@ must be present.
 | `source` | `synthetic` or `hardware` (required). |
 | `console_model`, `firmware`, `capture_date` | Provenance; required when `source: hardware`, meaningless (omit or `n/a`) for synthetic fixtures. |
 | `sanitizer` | The sanitizer version/run that produced this file (`tools/wingcapture.rs`'s `SANITIZER_VERSION`), or `n/a` for a synthetic fixture that never went through it. |
-| `note` | Free text, repeatable, documentation only. |
+| `note` | Free-text documentation. V2 metadata keys are unique; combine multiple notes into one value. |
 | `meters` | Meter scenario only: comma-separated meter requests in `Meter`-enum shorthand, e.g. `channel:1,rta`, `monitor`, `dca:2`. Order matters -- it's the same order `decode_frame` expects. |
-| `request` | Native scenario only, repeatable, in order: one of `get_node_data id=<i32>`, `get_node_definition id=<i32>`, `set_int id=<i32> value=<i32>`, `set_float id=<i32> value=<f32>`, `set_string id=<i32> value=<string>` (no spaces in the value -- keep test strings single-token). Each drives one call against the replayed `WingConsole`. |
+| `request` | Native scenario only. Legacy fixtures may repeat it; promotion-ready V2 captures use timed events and unique metadata keys. |
 
 ### Data lines
 
@@ -132,7 +132,10 @@ cannot produce a promotion-ready V2 contract.
 Before sanitizing, manually replace console/channel/show/preset/scribble free text
 and set `manual_redaction_attested: true`. Preflight then requires complete metadata,
 contiguous events, all core directions, a raw meter header, a clean mechanical scan,
-and a matching canonical `PROVENANCE.md` entry.
+and exactly one canonical `PROVENANCE.md` entry. The entry heading must be
+`- **\`<fixture-name>\`**` and must record matching `Evidence class`, `Source`,
+`Review status: reviewed`, `Console model`, `Firmware`, `Capture date`, and `Sanitizer`
+fields. A filename mentioned in prose or in a rejected entry does not satisfy preflight.
 
 No candidate is promoted by this tool. Review it, place it under `tests/fixtures/`,
 run `cargo test --test replay`, and then immediately dispose of the raw capture:

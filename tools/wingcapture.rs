@@ -274,6 +274,7 @@ fn encode_hex(bytes: &[u8]) -> String {
 struct CaptureSummary {
     version: u8,
     event_count: usize,
+    headers: BTreeMap<String, String>,
 }
 
 const HARDWARE_MATRIX: &str = "wing-rack-3.1-v1";
@@ -437,20 +438,21 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
                 return Err(format!("sensitive identifier in metadata: {line:?}"));
             }
             if let Some((key, value)) = rest.trim().split_once(':') {
-                if key.trim() == "wingcap_version" {
+                let key = key.trim().to_ascii_lowercase();
+                let value = value.trim();
+                if headers.contains_key(&key) {
+                    return Err(format!("duplicate capture metadata key: {key}"));
+                }
+                if key == "wingcap_version" {
                     if saw_data {
                         return Err("wingcap_version must precede data".to_string());
                     }
-                    if declared_version.replace(value.trim()).is_some() {
-                        return Err("duplicate wingcap_version headers".to_string());
-                    }
-                    if value.trim() != "2" {
+                    declared_version = Some(value);
+                    if value != "2" {
                         return Err("unsupported wingcap_version".to_string());
                     }
                 }
-                headers
-                    .entry(key.trim().to_string())
-                    .or_insert_with(|| value.trim().to_string());
+                headers.insert(key, value.to_string());
             }
             continue;
         }
@@ -570,6 +572,7 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
     Ok(CaptureSummary {
         version,
         event_count,
+        headers,
     })
 }
 
@@ -584,18 +587,115 @@ fn preflight_text(text: &str) -> Result<CaptureSummary, String> {
 fn preflight(candidate: &Path, provenance: &Path) -> Result<(), String> {
     let text = fs::read_to_string(candidate)
         .map_err(|error| format!("reading candidate {}: {error}", candidate.display()))?;
-    preflight_text(&text)?;
+    let capture = preflight_text(&text)?;
     let provenance_text = fs::read_to_string(provenance)
         .map_err(|error| format!("reading provenance {}: {error}", provenance.display()))?;
     let name = candidate
         .file_name()
         .and_then(|name| name.to_str())
         .ok_or_else(|| "candidate has no UTF-8 file name".to_string())?;
-    if !provenance_text.contains(name) {
+    validate_provenance_entry(&provenance_text, name, &capture.headers)
+}
+
+fn validate_provenance_entry(
+    text: &str,
+    name: &str,
+    capture: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    let heading = format!("- **`{name}`**");
+    let mut entries = 0usize;
+    let mut in_entry = false;
+    let mut fields = BTreeMap::new();
+    for line in text.lines() {
+        if line.starts_with("- **`") {
+            in_entry = line.trim_end() == heading;
+            if in_entry {
+                entries += 1;
+            }
+            continue;
+        }
+        if !in_entry {
+            continue;
+        }
+        let Some(field) = line.strip_prefix("  - ") else {
+            if !line.trim().is_empty() && !line.starts_with("    ") {
+                in_entry = false;
+            }
+            continue;
+        };
+        let Some((key, value)) = field.split_once(':') else {
+            continue;
+        };
+        let key = key.trim().to_ascii_lowercase();
+        if fields
+            .insert(key.clone(), value.trim().to_string())
+            .is_some()
+        {
+            return Err(format!("duplicate provenance field {key:?} for {name}"));
+        }
+    }
+    if entries != 1 {
         return Err(format!(
-            "provenance record {} does not name {name}",
-            provenance.display()
+            "provenance must contain exactly one canonical entry for {name}"
         ));
+    }
+
+    let required = |key: &str| {
+        fields
+            .get(key)
+            .filter(|value| !value.is_empty())
+            .map(String::as_str)
+            .ok_or_else(|| format!("provenance entry for {name} is missing {key}"))
+    };
+    let source = capture
+        .get("source")
+        .map(String::as_str)
+        .ok_or_else(|| "capture is missing source metadata".to_string())?;
+    let expected_evidence = match source {
+        "synthetic" => "synthetic",
+        "hardware" => "hardware-captured",
+        _ => return Err("capture source is not promotion-eligible".to_string()),
+    };
+    let expected = [
+        ("evidence class", expected_evidence),
+        ("source", source),
+        ("review status", "reviewed"),
+        (
+            "console model",
+            capture
+                .get("console_model")
+                .map(String::as_str)
+                .ok_or_else(|| "capture is missing console_model metadata".to_string())?,
+        ),
+        (
+            "firmware",
+            capture
+                .get("firmware")
+                .map(String::as_str)
+                .ok_or_else(|| "capture is missing firmware metadata".to_string())?,
+        ),
+        (
+            "capture date",
+            capture
+                .get("capture_date")
+                .map(String::as_str)
+                .ok_or_else(|| "capture is missing capture_date metadata".to_string())?,
+        ),
+        (
+            "sanitizer",
+            capture
+                .get("sanitizer")
+                .map(String::as_str)
+                .ok_or_else(|| "capture is missing sanitizer metadata".to_string())?,
+        ),
+    ];
+    for (key, expected) in expected {
+        let actual = required(key)?;
+        if actual != expected {
+            return Err(format!(
+                "provenance {key} for {name} is {actual:?}, expected {expected:?}"
+            ));
+        }
     }
     Ok(())
 }
@@ -1717,9 +1817,64 @@ mod tests {
         assert!(preflight(&capture, &provenance)
             .unwrap_err()
             .contains("provenance"));
-        fs::write(&provenance, "- `candidate.wingcap`: synthetic test\n").unwrap();
+        let reviewed = "- **`candidate.wingcap`**\n\
+                        \x20 - Evidence class: synthetic\n\
+                        \x20 - Source: synthetic\n\
+                        \x20 - Review status: reviewed\n\
+                        \x20 - Console model: RACK\n\
+                        \x20 - Firmware: 3.1\n\
+                        \x20 - Capture date: 2026-07-12\n\
+                        \x20 - Sanitizer: wingcapture/2\n";
+        fs::write(&provenance, reviewed).unwrap();
         preflight(&capture, &provenance).unwrap();
+
+        for (expected, mismatch) in [
+            ("Evidence class: synthetic", "Evidence class: inferred"),
+            ("Source: synthetic", "Source: hardware"),
+            ("Console model: RACK", "Console model: OTHER"),
+            ("Firmware: 3.1", "Firmware: 3.0"),
+            ("Capture date: 2026-07-12", "Capture date: 2026-07-11"),
+            ("Sanitizer: wingcapture/2", "Sanitizer: n/a"),
+        ] {
+            fs::write(&provenance, reviewed.replace(expected, mismatch)).unwrap();
+            assert!(
+                preflight(&capture, &provenance).is_err(),
+                "accepted {mismatch}"
+            );
+        }
+
+        fs::write(
+            &provenance,
+            "# candidate.wingcap appears incidentally, without a reviewed entry\n",
+        )
+        .unwrap();
+        assert!(preflight(&capture, &provenance).is_err());
+
+        fs::write(
+            &provenance,
+            "- **`candidate.wingcap`**\n\
+             \x20 - Evidence class: synthetic\n\
+             \x20 - Source: synthetic\n\
+             \x20 - Review status: rejected\n\
+             \x20 - Console model: RACK\n\
+             \x20 - Firmware: 3.1\n\
+             \x20 - Capture date: 2026-07-12\n\
+             \x20 - Sanitizer: wingcapture/2\n",
+        )
+        .unwrap();
+        assert!(preflight(&capture, &provenance)
+            .unwrap_err()
+            .contains("review status"));
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn checked_in_v2_fixture_has_a_matching_reviewed_provenance_entry() {
+        preflight(
+            Path::new("tests/fixtures/complete_session_v2.wingcap"),
+            Path::new("PROVENANCE.md"),
+        )
+        .unwrap();
     }
 
     #[test]
@@ -1731,6 +1886,44 @@ mod tests {
         ] {
             assert!(parse_capture_structure(text).is_err(), "accepted {text:?}");
         }
+    }
+
+    #[test]
+    fn v2_structure_rejects_every_duplicate_metadata_key() {
+        for key in [
+            "scenario",
+            "source",
+            "console_model",
+            "firmware",
+            "capture_date",
+            "sanitizer",
+            "manual_redaction_attested",
+            "expected_behavior",
+        ] {
+            let original = complete_v2(true);
+            let marker = original.find("@1 ").unwrap();
+            let duplicate = format!(
+                "{}# {key}: duplicate\n{}",
+                &original[..marker],
+                &original[marker..]
+            );
+            let error = parse_capture_structure(&duplicate).unwrap_err();
+            assert!(
+                error.contains("duplicate capture metadata key"),
+                "{key}: {error}"
+            );
+        }
+
+        let original = complete_v2(true);
+        let marker = original.find("@1 ").unwrap();
+        let duplicate_note = format!(
+            "{}# note: first\n# note: second\n{}",
+            &original[..marker],
+            &original[marker..]
+        );
+        assert!(parse_capture_structure(&duplicate_note)
+            .unwrap_err()
+            .contains("duplicate capture metadata key"));
     }
 
     #[test]

@@ -66,12 +66,18 @@ replay success is synthetic evidence and does not satisfy the U12 hardware-only 
 
 ## Synthetic capture contracts
 
-- **`tests/fixtures/complete_session_v2.wingcap`** — version-2 format contract
-  - Source/evidence class: synthetic; independently hand-authored from the public
-    protocol description and repository-owned codecs. It is not hardware evidence.
+- **`complete_session_v2.wingcap`**
+  - Evidence class: synthetic
+  - Source: synthetic
+  - Review status: reviewed
+  - Console model: RACK
+  - Firmware: 3.1
+  - Capture date: 2026-07-12
+  - Sanitizer: n/a
+  - Origin: independently hand-authored from the public protocol description and
+    repository-owned codecs. It is not hardware evidence.
   - Covers the ordered bidirectional discovery, Native, and meter channel grammar,
     including the raw four-byte meter report token.
-  - Created: 2026-07-12. Sanitizer: `n/a` because it contains no captured data.
   - Expected behavior: format parsing, ordering, direction preservation, raw-meter
     framing, and legacy-v1 coexistence only.
   - No vendor emulator, firmware payload, `wapi` material, or user data was used.
