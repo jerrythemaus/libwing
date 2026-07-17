@@ -21,6 +21,8 @@
 //! Free-text identifiers (console/channel/show names) have no reliable pattern to
 //! scan for; redact those by hand before running this tool.
 
+#[path = "compare.rs"]
+mod compare;
 #[path = "redact.rs"]
 mod redact;
 mod utils;
@@ -61,6 +63,7 @@ Usage: wingcapture <input.raw.wingcap> <output.wingcap>
        wingcapture --sanitize-v2 <quarantine> <relative-raw> <candidate>
        wingcapture --preflight <candidate> <PROVENANCE.md>
        wingcapture --compare-v2 <hardware-candidate> <emulator-reference> <report>
+       wingcapture --compare-fidelity <hardware-candidate> <emulator-reference> <report>
        wingcapture --proxy-native <loopback-listen> <console-address> <quarantine> <relative-output> [--seconds N]
        wingcapture --capture-discovery <target> <quarantine> <relative-output> [--seconds N]
        wingcapture --capture-meters <native-proxy> <console-ip> <quarantine> <relative-output> --allow-state-changing [--seconds N]
@@ -115,6 +118,13 @@ Usage: wingcapture <input.raw.wingcap> <output.wingcap>
             let report = PathBuf::from(args.next());
             compare_v2(&hardware, &emulator, &report)
                 .map(|count| format!("wrote comparison report with {count} deviation(s)"))
+        }
+        "--compare-fidelity" => {
+            let hardware = PathBuf::from(args.next());
+            let emulator = PathBuf::from(args.next());
+            let report = PathBuf::from(args.next());
+            compare_fidelity_files(&hardware, &emulator, &report)
+                .map(|count| format!("wrote fidelity report with {count} deviation(s)"))
         }
         "--proxy-native" => {
             proxy_native(&mut args);
@@ -777,6 +787,24 @@ fn compare_v2(hardware: &Path, emulator: &Path, report: &Path) -> Result<usize, 
     fs::write(report, output)
         .map_err(|error| format!("writing comparison report {}: {error}", report.display()))?;
     Ok(deviation_count)
+}
+
+fn compare_fidelity_files(
+    hardware: &Path,
+    emulator: &Path,
+    report: &Path,
+) -> Result<usize, String> {
+    let read_events = |path: &Path, label: &str| {
+        let text = fs::read_to_string(path)
+            .map_err(|error| format!("reading {label} capture {}: {error}", path.display()))?;
+        contract_events(&text)
+    };
+    let hardware_events = read_events(hardware, "hardware")?;
+    let emulator_events = read_events(emulator, "emulator")?;
+    let comparison = compare::compare_fidelity(&hardware_events, &emulator_events);
+    fs::write(report, comparison.text)
+        .map_err(|error| format!("writing fidelity report {}: {error}", report.display()))?;
+    Ok(comparison.deviations)
 }
 
 fn describe_event(event: Option<&(String, Vec<u8>)>) -> String {
