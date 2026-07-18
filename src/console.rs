@@ -1007,14 +1007,14 @@ impl WingConsole {
     fn attended_read_until<T>(
         &mut self,
         deadline: Instant,
-        matcher: impl Fn(WingResponse) -> std::result::Result<T, WingResponse>,
+        matcher: impl Fn(WingResponse) -> std::result::Result<T, Box<WingResponse>>,
     ) -> Result<(T, Vec<WingResponse>)> {
         let mut buffered = Vec::new();
         loop {
             let resp = self.read()?;
             match matcher(resp) {
                 Ok(matched) => return Ok((matched, buffered)),
-                Err(unrelated) => buffered.push(unrelated),
+                Err(unrelated) => buffered.push(*unrelated),
             }
             if Instant::now() >= deadline {
                 return Err(Error::Timeout);
@@ -1048,7 +1048,7 @@ impl WingConsole {
         self.set_op_deadline(Some(deadline));
         let result = self.attended_read_until(deadline, |resp| match resp {
             WingResponse::NodeData(rid, data) if rid == id => Ok(data),
-            other => Err(other),
+            other => Err(Box::new(other)),
         });
         self.set_op_deadline(None);
         result
@@ -1078,7 +1078,7 @@ impl WingConsole {
         self.set_op_deadline(Some(deadline));
         let result = self.attended_read_until(deadline, |resp| match resp {
             WingResponse::NodeDef(def) if def.id == id => Ok(def),
-            other => Err(other),
+            other => Err(Box::new(other)),
         });
         self.set_op_deadline(None);
         result
