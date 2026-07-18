@@ -17,7 +17,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use libwing::{NodeValue, Transport, WingConsole};
+#[cfg(feature = "propmap")]
+use libwing::NodeValue;
+use libwing::{Transport, WingConsole};
 
 struct ScriptReader {
     bytes: VecDeque<u8>,
@@ -194,6 +196,7 @@ fn toggle_emits_click_token() {
 }
 
 /// A `d7 <id> d5 <f32>` value pair (float, as a fader carries).
+#[cfg(feature = "propmap")]
 fn value_f32(id: i32, v: f32) -> Vec<u8> {
     let mut buf = vec![0xd7];
     buf.extend_from_slice(&id.to_be_bytes());
@@ -203,6 +206,7 @@ fn value_f32(id: i32, v: f32) -> Vec<u8> {
 }
 
 /// A read-back reply frame (value pair + end token) for `get_node_data` to consume.
+#[cfg(feature = "propmap")]
 fn reply_f32(id: i32, v: f32) -> Vec<u8> {
     let mut buf = value_f32(id, v);
     buf.push(0xde);
@@ -210,6 +214,7 @@ fn reply_f32(id: i32, v: f32) -> Vec<u8> {
 }
 
 #[test]
+#[cfg(feature = "propmap")]
 fn verify_passes_when_readback_matches() {
     let fdr = WingConsole::name_to_id("/ch/1/fdr").expect("/ch/1/fdr in propmap");
     // Buffer says fdr = -6.0; the console reads back -6.0 -> no mismatch, no second pass.
@@ -231,6 +236,7 @@ fn verify_passes_when_readback_matches() {
 }
 
 #[test]
+#[cfg(feature = "propmap")]
 fn verify_flags_dropped_write() {
     let fdr = WingConsole::name_to_id("/ch/1/fdr").expect("/ch/1/fdr in propmap");
     // Buffer says fdr = -6.0, but the console still reports -3.0 (write didn't stick).
@@ -249,6 +255,7 @@ fn verify_flags_dropped_write() {
 }
 
 #[test]
+#[cfg(feature = "propmap")]
 fn verify_reports_absent_node_as_mismatch() {
     let fdr = WingConsole::name_to_id("/ch/1/fdr").expect("/ch/1/fdr in propmap");
     let other = WingConsole::name_to_id("/ch/2/fdr").expect("/ch/2/fdr in propmap");
@@ -266,6 +273,7 @@ fn verify_reports_absent_node_as_mismatch() {
 }
 
 #[test]
+#[cfg(feature = "propmap")]
 fn verify_second_pass_filters_transient_mismatch() {
     let fdr = WingConsole::name_to_id("/ch/1/fdr").expect("/ch/1/fdr in propmap");
     // First capture: fdr still -3.0 (not settled). Second capture after settle: -6.0 (reconciled).
@@ -287,6 +295,7 @@ fn verify_second_pass_filters_transient_mismatch() {
 }
 
 #[test]
+#[cfg(feature = "propmap")]
 fn verify_second_pass_keeps_persistent_mismatch() {
     let fdr = WingConsole::name_to_id("/ch/1/fdr").expect("/ch/1/fdr in propmap");
     // Both captures report -3.0 -> a genuinely dropped write survives the second pass.
