@@ -432,7 +432,8 @@ fn probe_inputs(def: &WingNodeDef) -> Vec<SetVal> {
         NodeType::LinearFloat | NodeType::LogarithmicFloat | NodeType::FaderLevel => {
             let min = def.min_float.unwrap_or(-144.0);
             let max = def.max_float.unwrap_or(10.0);
-            if !(max > min) {
+            // Also rejects NaN bounds, which are incomparable and would yield useless probes.
+            if !matches!(max.partial_cmp(&min), Some(std::cmp::Ordering::Greater)) {
                 return Vec::new();
             }
             let span = max - min;

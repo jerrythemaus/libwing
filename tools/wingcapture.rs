@@ -1228,7 +1228,7 @@ fn proxy_direction(
                     error.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) => {}
-            Err(error) if stop.load(Ordering::Acquire) => return Ok(()),
+            Err(_) if stop.load(Ordering::Acquire) => return Ok(()),
             Err(error) => {
                 stop.store(true, Ordering::Release);
                 let _ = destination.shutdown(Shutdown::Both);

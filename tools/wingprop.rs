@@ -206,10 +206,11 @@ Usage: wingprop [-h host] [-j] property[=value|?]
                         | NodeType::LogarithmicFloat
                         | NodeType::FaderLevel
                         | NodeType::String => {
+                            let value = data.get_string();
                             if jsonoutput {
-                                println!("{}", data.get_string());
+                                println!("{}", value);
                             } else {
-                                println!("{} = {}", propname, data.get_string());
+                                println!("{} = {}", propname, value);
                             }
                         }
                         // NodeType is non_exhaustive (R21): print the raw value for a
