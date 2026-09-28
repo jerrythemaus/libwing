@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::native::{ChannelDecoder, ChannelEvent, NativeValue};
-use crate::node::{NodeType, WingNodeData, WingNodeDef};
+use crate::node::{NodeType, PropMap, WingNodeData, WingNodeDef};
 use crate::propmap::NAME_TO_DEF;
 use crate::{Error, Result, WingResponse};
 
@@ -132,10 +132,10 @@ impl Meter {
 }
 
 lazy_static::lazy_static! {
-    static ref ID_TO_NAME: HashMap<i32, Vec<&'static str>> = {
-        let mut id2name = HashMap::<i32, Vec<&'static str>>::new();
-        for (fullname, def) in NAME_TO_DEF.iter() {
-            id2name.entry(def.id).or_default().push(fullname.as_str());
+    static ref ID_TO_NAME: PropMap<i32, Vec<&'static str>> = {
+        let mut id2name = PropMap::<i32, Vec<&'static str>>::default();
+        for (&fullname, def) in NAME_TO_DEF.iter() {
+            id2name.entry(def.id).or_default().push(fullname);
         }
         id2name
     };
@@ -158,10 +158,14 @@ const METER_FRAME_BYTES: usize = 8192;
 /// Most samples one meter datagram can carry.
 pub(crate) const MAX_METER_SAMPLES: usize = (METER_FRAME_BYTES - 4) / 2;
 
+/// Big-endian samples of a meter frame body. `as_chunks` gives LLVM fixed-size pairs, which it
+/// vectorizes (about 2x `chunks_exact` on a full frame).
 fn meter_samples(bytes: &[u8]) -> impl Iterator<Item = i16> + '_ {
     bytes
-        .chunks_exact(2)
-        .map(|chunk| i16::from_be_bytes([chunk[0], chunk[1]]))
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|&pair| i16::from_be_bytes(pair))
 }
 /// UDP port a WING answers `WING?` discovery and firmware probes on.
 const DISCOVERY_PORT: u16 = 2222;
@@ -765,10 +769,11 @@ impl WingConsole {
     }
 
     fn read_inner(&mut self) -> Result<WingResponse> {
+        let mainptr = self.main.clone();
+        let mut main = mainptr.lock_recover();
+        let mut raw = Vec::new();
         loop {
-            let mainptr = self.main.clone();
-            let mut main = mainptr.lock_recover();
-            let mut raw = Vec::new();
+            raw.clear();
             let (ch, cmd) = self.decode_next(&mut main, &mut raw)?;
             //println!("Channel: {}, Command: {:X}", ch, cmd);
             if cmd <= 0x3f {
@@ -1030,8 +1035,8 @@ impl WingConsole {
                 }
             }
 
-            self._keep_alive(r)?;
             if r.rx_buf_size == 0 {
+                self._keep_alive(r)?;
                 // Check before arming the socket timeout, not just after: this is what
                 // caps a stuck read to at most one capped-timeout interval past the
                 // deadline rather than one keep-alive interval (up to 7s) past it.
@@ -1093,8 +1098,19 @@ impl WingConsole {
             r.rx_buf_tail += 1;
             r.rx_buf_size -= 1;
 
-            r.rx_events
-                .extend(r.rx_channels.push_byte(byte)?.into_iter().flatten());
+            // `rx_events` is empty here: queue only a second event, and hand the first
+            // straight to the caller without a round trip through the deque.
+            let [first, second] = r.rx_channels.push_byte(byte)?;
+            if let Some(second) = second {
+                r.rx_events.push_back(second);
+            }
+            if let Some(ChannelEvent::Data(AUDIO_ENGINE_CHANNEL, value)) = first {
+                ensure_native_response_capacity(r.read_capture.len())?;
+                raw.push(value);
+                let decoded = (AUDIO_ENGINE_CHANNEL as i8, value);
+                r.read_capture.push(decoded);
+                return Ok(decoded);
+            }
         }
     }
 
@@ -1646,7 +1662,15 @@ impl WingConsole {
     /// (`wing-core::tools::search`, U1) which must rank over the whole tree. Empty when the
     /// `propmap` feature is off.
     pub fn propmap_iter() -> impl Iterator<Item = (&'static str, &'static WingNodeDef)> {
-        NAME_TO_DEF.iter().map(|(k, v)| (k.as_str(), v))
+        NAME_TO_DEF.iter().map(|(&k, v)| (k, v))
+    }
+
+    /// Builds the embedded property map and its reverse id index now instead of on first use.
+    /// Together they take about 20 ms, so an application should call this on a background
+    /// thread at startup; otherwise the first lookup pays for it, possibly on a UI thread.
+    pub fn preload_property_map() {
+        lazy_static::initialize(&NAME_TO_DEF);
+        lazy_static::initialize(&ID_TO_NAME);
     }
 
     /// Total number of entries in the embedded property map. Exposed for the
@@ -1804,20 +1828,19 @@ impl WingConsole {
     pub fn dump_subtree(&mut self, root_fullname: &str, timeout: Duration) -> Result<NodeDump> {
         let reconnect_gate = self.reconnect_gate.clone();
         let _reconnect_guard = reconnect_gate.lock_recover();
-        let leaves = dumpable_leaves(NAME_TO_DEF.iter(), root_fullname);
+        let leaves = dumpable_leaves(Self::propmap_iter(), root_fullname);
 
         // A model sweep contains mutually exclusive definitions with reused ids.
         // Read selectors first, from outermost to innermost, so only the active
         // branch contributes values to the snapshot.
         let root_prefix = format!("{root_fullname}/");
-        let mut selectors: Vec<_> = NAME_TO_DEF
-            .iter()
+        let mut selectors: Vec<_> = Self::propmap_iter()
             .filter(|(name, def)| {
                 let Some(parent) = name.strip_suffix("/mdl") else {
                     return false;
                 };
                 def.node_type == NodeType::StringEnum
-                    && (name.as_str() == root_fullname
+                    && (*name == root_fullname
                         || parent == root_fullname
                         || parent.starts_with(&root_prefix)
                         || root_fullname.starts_with(&format!("{parent}/")))
@@ -1840,14 +1863,14 @@ impl WingConsole {
             let data = self.dump_get(def.id, timeout)?;
             let value = dump_value(&data, def)?;
             if data.string_enum_item(def).is_none() {
-                unknown_models.push(fullname.clone());
+                unknown_models.push(fullname.to_owned());
             }
             active_models.push(ActiveModel {
                 parent: fullname.strip_suffix("/mdl").unwrap(),
                 definition: def,
                 selected: value.clone(),
             });
-            selector_values.insert(fullname.as_str(), value);
+            selector_values.insert(fullname, value);
         }
 
         let mut entries = Vec::with_capacity(leaves.len());
@@ -1859,7 +1882,7 @@ impl WingConsole {
                 value
             } else {
                 let data = self.dump_get(id, timeout)?;
-                dump_value(&data, NAME_TO_DEF.get(&fullname).unwrap())?
+                dump_value(&data, NAME_TO_DEF.get(fullname.as_str()).unwrap())?
             };
             entries.push(DumpEntry {
                 fullname,
@@ -1916,7 +1939,7 @@ impl WingConsole {
             .into_iter()
             .map(|entry| {
                 let blocked = NAME_TO_DEF
-                    .get(&entry.fullname)
+                    .get(entry.fullname.as_str())
                     .map(|def| def.read_only)
                     .unwrap_or(false);
                 let result = if blocked {
@@ -2225,7 +2248,7 @@ pub struct NodeDump {
 /// read-only entry in the embedded map (as of this map's current sweep, it has
 /// none -- see `console::tests::dumpable_leaves_excludes_read_only_and_containers`).
 fn dumpable_leaves<'a>(
-    entries: impl Iterator<Item = (&'a String, &'a WingNodeDef)>,
+    entries: impl Iterator<Item = (&'a str, &'a WingNodeDef)>,
     root_fullname: &str,
 ) -> Vec<(String, i32)> {
     let prefix = format!("{root_fullname}/");
@@ -2233,9 +2256,9 @@ fn dumpable_leaves<'a>(
         .filter(|(name, def)| {
             def.node_type != NodeType::Node
                 && !def.read_only
-                && (name.as_str() == root_fullname || name.starts_with(&prefix))
+                && (*name == root_fullname || name.starts_with(&prefix))
         })
-        .map(|(name, def)| (name.clone(), def.id))
+        .map(|(name, def)| (name.to_owned(), def.id))
         .collect();
     leaves.sort_by(|a, b| a.0.cmp(&b.0));
     leaves
@@ -2891,7 +2914,7 @@ mod tests {
             ),
         ];
 
-        let leaves = dumpable_leaves(fixture.iter().map(|(n, d)| (n, d)), "/root");
+        let leaves = dumpable_leaves(fixture.iter().map(|(n, d)| (n.as_str(), d)), "/root");
 
         assert_eq!(
             leaves,

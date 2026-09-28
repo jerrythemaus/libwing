@@ -191,17 +191,16 @@ fn count_entries(raw: &[u8]) -> usize {
 fn write_propmap_rs(rust_file: &mut impl Write, raw: &[u8]) -> std::io::Result<()> {
     // rustfmt import order (crate before std), so a fmt pass over the
     // generated file is a no-op and regeneration produces no diff noise.
-    writeln!(rust_file, "use crate::node::WingNodeDef;")?;
-    writeln!(rust_file, "use std::collections::HashMap;")?;
+    writeln!(rust_file, "use crate::node::{{PropMap, WingNodeDef}};")?;
     writeln!(rust_file, "lazy_static::lazy_static! {{")?;
     writeln!(
         rust_file,
-        "    pub static ref NAME_TO_DEF: HashMap<String, WingNodeDef> = {{"
+        "    pub(crate) static ref NAME_TO_DEF: PropMap<&'static str, WingNodeDef> = {{"
     )?;
     // Size the map up front: ~70k entries would otherwise rehash repeatedly at startup.
     writeln!(
         rust_file,
-        "        let mut m = HashMap::with_capacity({});",
+        "        let mut m = PropMap::with_capacity_and_hasher({}, Default::default());",
         count_entries(raw)
     )?;
     write!(rust_file, "        let d = b\"")?;
@@ -220,7 +219,7 @@ fn write_propmap_rs(rust_file: &mut impl Write, raw: &[u8]) -> std::io::Result<(
     writeln!(rust_file, "            i += 2;")?;
     writeln!(
         rust_file,
-        "            let name = String::from_utf8(d[i..i + namelen].to_vec()).unwrap();"
+        "            let name = std::str::from_utf8(&d[i..i + namelen]).unwrap();"
     )?;
     writeln!(rust_file, "            i += namelen;")?;
     writeln!(

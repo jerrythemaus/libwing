@@ -45,6 +45,8 @@
 - C: `wing_console_read_timeout`; last-error code -2 for a Rust panic caught at the FFI
   boundary; `libwing.h` states the threading contract (never destroy a handle while
   another thread is inside a call on it).
+- `WingConsole::preload_property_map`: builds the embedded map and its id index up front
+  (about 20 ms), so an application can take that cost on a background thread.
 
 ### Fixed
 
@@ -88,6 +90,12 @@
 - Every C entry point catches Rust panics instead of aborting the host process.
 - `WingConsole`'s drop shuts its sockets down even when a lock was poisoned.
 - The embedded property map is allocated at its final size (no rehashing at startup).
+- `read()` costs about 80 ns per value instead of 260 ns: it checked the keepalive clock on
+  every byte (two thirds of its time went to `Instant::now`), and it re-locked state,
+  re-allocated a buffer, and round-tripped every byte through a queue per token.
+- Property-map lookups use FNV-1a instead of SipHash and borrow the embedded path strings
+  instead of allocating one `String` per entry (`name_to_id` 10 -> 7 ns, id lookups
+  14 -> 8 ns, map build about 20% faster). Meter frames decode about 2x faster.
 
 ## [2.0.0] - 2026-07-05
 

@@ -1,6 +1,5 @@
-use crate::node::WingNodeDef;
-use std::collections::HashMap;
+use crate::node::{PropMap, WingNodeDef};
 
 lazy_static::lazy_static! {
-    pub static ref NAME_TO_DEF: HashMap<String, WingNodeDef> = HashMap::new();
+    pub(crate) static ref NAME_TO_DEF: PropMap<&'static str, WingNodeDef> = PropMap::default();
 }
