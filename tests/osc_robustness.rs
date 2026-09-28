@@ -11,6 +11,7 @@ use std::time::{Duration, Instant};
 use libwing::osc::{
     self, decode, encode, node_set_local, OscArg, OscError, OscEvent, OscMessage, OscNodeError,
     ParamFacets, RequestPolicy, SubscriptionFormat, WingOscClient, MAX_PACKET_BYTES,
+    UNSOLICITED_CAP,
 };
 use libwing::{transport_availability, Operation, TransportAvailability};
 
@@ -205,6 +206,189 @@ fn every_attempt_lost_returns_typed_retries_exhausted_error() {
 
     // console_sock is dropped here without ever responding.
     drop(console_sock);
+}
+
+fn fdr_reply(addr: &str, value: f32) -> OscMessage {
+    OscMessage::new(
+        addr,
+        vec![
+            OscArg::Str(format!("{value}")),
+            OscArg::Float(0.5),
+            OscArg::Float(value),
+        ],
+    )
+}
+
+#[test]
+fn garbage_datagram_before_the_reply_is_skipped() {
+    // Fake console: answers each request with an undecodable datagram, then the real
+    // reply. Neither `request` nor `request_with_policy` may give up on the garbage.
+    let console_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let console_addr = console_sock.local_addr().unwrap();
+    let client = WingOscClient::connect_addr(console_addr).unwrap();
+
+    let responder = std::thread::spawn(move || {
+        for _ in 0..2 {
+            let mut buf = [0u8; 1024];
+            let (_n, from) = console_sock.recv_from(&mut buf).unwrap();
+            console_sock.send_to(b"garbage!", from).unwrap();
+            let reply = encode(&fdr_reply("/ch/1/fdr", -5.0)).unwrap();
+            console_sock.send_to(&reply, from).unwrap();
+        }
+    });
+
+    let get_fdr = osc::get_param("/ch/1/fdr").unwrap();
+    let reply = client.request(&get_fdr, Duration::from_secs(2)).unwrap();
+    assert_eq!(reply, fdr_reply("/ch/1/fdr", -5.0));
+    let policy = RequestPolicy {
+        attempts: 1,
+        timeout_per_attempt: Duration::from_secs(2),
+    };
+    let reply = client.request_with_policy(&get_fdr, policy).unwrap();
+    assert_eq!(reply, fdr_reply("/ch/1/fdr", -5.0));
+    // Skipped, not buffered as unsolicited traffic.
+    assert!(client.take_unsolicited().is_empty());
+
+    responder.join().unwrap();
+}
+
+#[test]
+fn toggle_with_a_lost_reply_is_sent_once_and_not_retried() {
+    // Fake console: applies (counts) every toggle it receives but never replies, as if
+    // each reply were lost. A retry would flip the parameter back.
+    let console_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let console_addr = console_sock.local_addr().unwrap();
+    console_sock
+        .set_read_timeout(Some(Duration::from_millis(500)))
+        .unwrap();
+    let client = WingOscClient::connect_addr(console_addr).unwrap();
+
+    let counter = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let mut toggles = 0;
+        while let Ok((n, _from)) = console_sock.recv_from(&mut buf) {
+            assert_eq!(
+                decode(&buf[..n]).unwrap(),
+                osc::toggle("/ch/1/mute").unwrap()
+            );
+            toggles += 1;
+        }
+        toggles
+    });
+
+    let policy = RequestPolicy {
+        attempts: 3,
+        timeout_per_attempt: Duration::from_millis(100),
+    };
+    let err = client
+        .request_with_policy(&osc::toggle("/ch/1/mute").unwrap(), policy)
+        .unwrap_err();
+    assert!(matches!(err, OscError::Timeout), "got {err:?}");
+    assert_eq!(counter.join().unwrap(), 1);
+}
+
+#[test]
+fn unsolicited_buffer_is_capped_and_counts_drops() {
+    // Fake console: floods more unrelated messages than the cap, then the reply.
+    let flood = UNSOLICITED_CAP + 76;
+    let console_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let console_addr = console_sock.local_addr().unwrap();
+    let client = WingOscClient::connect_addr(console_addr).unwrap();
+
+    let responder = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let (_n, from) = console_sock.recv_from(&mut buf).unwrap();
+        for i in 0..flood {
+            let event = OscMessage::new("/ch/2/mute", vec![OscArg::Int(i as i32)]);
+            console_sock
+                .send_to(&encode(&event).unwrap(), from)
+                .unwrap();
+            // Pace the flood so loopback socket buffers never overflow.
+            if i % 64 == 63 {
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        let reply = encode(&fdr_reply("/ch/1/fdr", -6.0)).unwrap();
+        console_sock.send_to(&reply, from).unwrap();
+    });
+
+    let reply = client
+        .request(
+            &osc::get_param("/ch/1/fdr").unwrap(),
+            Duration::from_secs(5),
+        )
+        .unwrap();
+    assert_eq!(reply, fdr_reply("/ch/1/fdr", -6.0));
+    responder.join().unwrap();
+
+    let unsolicited = client.take_unsolicited();
+    assert_eq!(unsolicited.len(), UNSOLICITED_CAP);
+    // The oldest were dropped; the newest survive in arrival order.
+    assert_eq!(unsolicited[0].args, vec![OscArg::Int(76)]);
+    assert_eq!(
+        unsolicited.last().unwrap().args,
+        vec![OscArg::Int(flood as i32 - 1)]
+    );
+    assert_eq!(client.take_unsolicited_dropped(), 76);
+    assert_eq!(client.take_unsolicited_dropped(), 0);
+}
+
+#[test]
+fn reply_port_request_matches_the_plain_path_reply() {
+    // Page 21: `/%<port>/ch/1/fdr` gets the plain `/ch/1/fdr` reply, on `<port>`.
+    let console_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let console_addr = console_sock.local_addr().unwrap();
+    let reply_port = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let client = WingOscClient::connect_addr(console_addr)
+        .unwrap()
+        .bind_reply_port(reply_port)
+        .unwrap();
+
+    let responder = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let (n, _from) = console_sock.recv_from(&mut buf).unwrap();
+        let request = decode(&buf[..n]).unwrap();
+        assert_eq!(request.addr, format!("/%{reply_port}/ch/1/fdr"));
+        let reply = encode(&fdr_reply("/ch/1/fdr", -7.0)).unwrap();
+        console_sock
+            .send_to(&reply, ("127.0.0.1", reply_port))
+            .unwrap();
+    });
+
+    let request = osc::with_reply_port(reply_port, osc::get_param("/ch/1/fdr").unwrap());
+    let reply = client.request(&request, Duration::from_secs(2)).unwrap();
+    assert_eq!(reply, fdr_reply("/ch/1/fdr", -7.0));
+    assert!(client.take_unsolicited().is_empty());
+
+    responder.join().unwrap();
+}
+
+#[cfg(feature = "propmap")]
+#[test]
+fn hash_request_matches_the_plain_path_reply() {
+    // Page 21: `/#<hash>` "would return the same data" as the path form.
+    let console_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let console_addr = console_sock.local_addr().unwrap();
+    let client = WingOscClient::connect_addr(console_addr).unwrap();
+
+    let responder = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let (_n, from) = console_sock.recv_from(&mut buf).unwrap();
+        let reply = encode(&fdr_reply("/ch/1/fdr", -8.0)).unwrap();
+        console_sock.send_to(&reply, from).unwrap();
+    });
+
+    let id = libwing::WingConsole::name_to_id("/ch/1/fdr").unwrap();
+    let reply = client
+        .request(&osc::get_param_by_id(id), Duration::from_secs(2))
+        .unwrap();
+    assert_eq!(reply, fdr_reply("/ch/1/fdr", -8.0));
+
+    responder.join().unwrap();
 }
 
 // ---------------------------------------------------------------------------

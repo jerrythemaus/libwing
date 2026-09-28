@@ -72,6 +72,17 @@ typedef enum {
 // index and must pass 0. Any other id makes wing_console_request_meter() return 0 without
 // subscribing anything (see wing_last_error_message()).
 
+// Threading: every function may be called from any thread, and one WingConsole* may be used
+// by several threads at once (calls share one session; wing_console_read() on one thread does
+// not block setters on another). The one exception is wing_console_destroy(): call it only
+// after every other call on that handle has returned and none can start. Destroying a handle
+// while another thread is still inside a call on it is a use-after-free.
+//
+// A Rust panic never unwinds into the caller: the function returns its failure value (NULL,
+// -1, 0 or NaN) and wing_last_error_code() reports -2.
+//
+// Discovery lists each console once; its ip is the address the reply came from, not the
+// address the reply claims.
 WingDiscoveryInfo* wing_discover_scan                             (int stop_on_first); // Return value must be freed by wing_discover_destroy()
 int                wing_discover_count                            (const WingDiscoveryInfo* handle);
 char*              wing_discover_get_ip                           (const WingDiscoveryInfo* handle, int index); // Return value must be freed by wing_string_destroy()
@@ -83,6 +94,10 @@ void               wing_discover_destroy                          (WingDiscovery
 
 WingConsole*       wing_console_connect                           (const char* ip); // Return value must be freed by wing_console_destroy()
 Response*          wing_console_read                              (WingConsole* handle); // Return value must be freed by wing_response_destroy()
+// wing_console_read() bounded by timeout_ms: NULL with wing_last_error_code() == 7 when
+// nothing arrived in time. Use it for a reader loop that must also service its own work;
+// plain wing_console_read() blocks until the console sends something.
+Response*          wing_console_read_timeout                      (WingConsole* handle, uint32_t timeout_ms); // Return value must be freed by wing_response_destroy()
 int                wing_console_set_string                        (WingConsole* handle, int32_t id, const char* value);
 int                wing_console_set_float                         (WingConsole* handle, int32_t id, float value);
 int                wing_console_set_int                           (WingConsole* handle, int32_t id, int value);
@@ -94,7 +109,12 @@ int                wing_console_get_binary_node                   (WingConsole* 
 int                wing_console_set_binary_node                   (WingConsole* handle, const uint8_t* data, size_t len);
 int                wing_console_request_node_definition           (WingConsole* handle, int32_t id);
 int                wing_console_request_node_data                 (WingConsole* handle, int32_t id);
+// Each call replaces the previous subscription: only the most recent one is kept alive, and
+// earlier report ids stop within a few seconds.
 uint16_t           wing_console_request_meter                     (WingConsole* handle, uint16_t *meter_ids, size_t len); // see above about meter ids
+// Meter reads return the sample count, -2 if out_data_capacity is too small (nothing copied),
+// or -1 on error. With no frame for 3 seconds they return -1 with wing_last_error_code() == 7
+// (timeout); keep calling them, they keep the subscription alive while waiting.
 int                wing_console_read_meter                        (WingConsole* handle, uint16_t *out_id, int16_t *out_data, size_t out_data_capacity);
 int                wing_console_read_meter_bounded                (WingConsole* handle, uint16_t *out_id, int16_t *out_data, size_t out_data_capacity);
 // read()/read_meters() already send keepalives as needed; call these yourself only if
@@ -167,7 +187,8 @@ Response*          wing_id_to_defs_get_def                        (int32_t id, s
 // owned by the library and valid until the next failing call on the same thread --
 // do not free it, and do not pass it to wing_string_destroy(). wing_last_error_code()
 // returns 0 if nothing has failed yet, -1 for an FFI-usage error (bad argument
-// detected at the FFI boundary, e.g. a null pointer), 1-9 for a specific underlying
+// detected at the FFI boundary, e.g. a null pointer), -2 for an internal panic caught at
+// the boundary, 1-9 for a specific underlying
 // error (9: interrupted by a reconnect on another handle -- retry, do not reconnect
 // again), or 99 for a future/unrecognized error variant.
 const char*        wing_last_error_message                        (void);

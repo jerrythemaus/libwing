@@ -9,6 +9,82 @@ use std::ptr;
 /// the console/protocol layer). Returned by [`wing_last_error_code`].
 const WING_ERROR_FFI_USAGE: c_int = -1;
 
+/// Last-error code for a Rust panic caught at the FFI boundary.
+const WING_ERROR_PANIC: c_int = -2;
+
+/// The value an FFI entry point returns when [`ffi_guard`] catches a panic inside it.
+trait PanicFallback {
+    fn panic_fallback() -> Self;
+}
+
+impl<T> PanicFallback for *mut T {
+    fn panic_fallback() -> Self {
+        ptr::null_mut()
+    }
+}
+
+impl<T> PanicFallback for *const T {
+    fn panic_fallback() -> Self {
+        ptr::null()
+    }
+}
+
+impl PanicFallback for () {
+    fn panic_fallback() -> Self {}
+}
+
+impl PanicFallback for c_int {
+    fn panic_fallback() -> Self {
+        -1
+    }
+}
+
+impl PanicFallback for u16 {
+    fn panic_fallback() -> Self {
+        0
+    }
+}
+
+impl PanicFallback for usize {
+    fn panic_fallback() -> Self {
+        0
+    }
+}
+
+impl PanicFallback for c_float {
+    fn panic_fallback() -> Self {
+        c_float::NAN
+    }
+}
+
+impl PanicFallback for ResponseType {
+    fn panic_fallback() -> Self {
+        ResponseType::End
+    }
+}
+
+impl PanicFallback for FfiNodeType {
+    fn panic_fallback() -> Self {
+        FfiNodeType::Unknown
+    }
+}
+
+impl PanicFallback for FfiNodeUnit {
+    fn panic_fallback() -> Self {
+        FfiNodeUnit::Unknown
+    }
+}
+
+/// Runs an FFI entry point's body. A panic must not unwind into the C caller (Rust aborts
+/// the whole host process when one leaves an `extern "C"` frame), so a caught panic becomes
+/// the function's failure value plus a [`WING_ERROR_PANIC`] last error instead.
+fn ffi_guard<T: PanicFallback>(body: impl FnOnce() -> T) -> T {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)).unwrap_or_else(|_| {
+        set_last_error("internal panic in libwing", WING_ERROR_PANIC);
+        T::panic_fallback()
+    })
+}
+
 thread_local! {
     // Structured last-error slot (R25): one message + one code per thread. Overwritten
     // on every failing FFI call; untouched on success, so a prior failure's message
@@ -71,7 +147,8 @@ pub extern "C" fn wing_last_error_message() -> *const c_char {
 
 /// Returns the code for the most recent failing call made from the current thread, or
 /// `0` if none has failed yet. `-1` means the failure was an FFI-usage error (bad
-/// argument) rather than a [`crate::Error`]; `1..=8` mirror specific `Error` variants;
+/// argument) rather than a [`crate::Error`]; `-2` is a panic caught at the boundary
+/// (see `ffi_guard`); `1..=9` mirror specific `Error` variants;
 /// `99` is a future/unrecognized `Error` variant. See [`wing_last_error_message`] for
 /// the paired human-readable message.
 #[no_mangle]
@@ -136,38 +213,40 @@ unsafe fn response_ref<'a>(handle: *const ResponseHandle) -> Option<&'a Response
 
 #[no_mangle]
 pub extern "C" fn wing_string_destroy(handle: *mut c_char) {
-    unsafe {
+    ffi_guard(|| unsafe {
         if handle.is_null() {
             return;
         }
         drop(CString::from_raw(handle));
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_discover_scan(stop_on_first: c_int) -> *mut WingDiscoveryInfoHandle {
-    match WingConsole::scan(stop_on_first != 0) {
+    ffi_guard(|| match WingConsole::scan(stop_on_first != 0) {
         Ok(results) => Box::into_raw(Box::new(WingDiscoveryInfoHandle { info: results })),
         Err(err) => {
             record_error(&err);
             ptr::null_mut()
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_discover_destroy(handle: *mut WingDiscoveryInfoHandle) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard(|| {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_discover_count(handle: *const WingDiscoveryInfoHandle) -> c_int {
-    unsafe { discovery_ref(handle).map_or(-1, |handle| handle.info.len() as c_int) }
+    ffi_guard(|| unsafe { discovery_ref(handle).map_or(-1, |handle| handle.info.len() as c_int) })
 }
 
 #[no_mangle]
@@ -175,13 +254,15 @@ pub extern "C" fn wing_discover_get_ip(
     handle: *const WingDiscoveryInfoHandle,
     index: c_int,
 ) -> *mut c_char {
-    unsafe { discovery_ref(handle) }
-        .and_then(|handle| {
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| handle.info.get(index))
-        })
-        .map_or(ptr::null_mut(), |info| string_to_c(&info.ip))
+    ffi_guard(|| {
+        unsafe { discovery_ref(handle) }
+            .and_then(|handle| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| handle.info.get(index))
+            })
+            .map_or(ptr::null_mut(), |info| string_to_c(&info.ip))
+    })
 }
 
 #[no_mangle]
@@ -189,13 +270,15 @@ pub extern "C" fn wing_discover_get_name(
     handle: *const WingDiscoveryInfoHandle,
     index: c_int,
 ) -> *mut c_char {
-    unsafe { discovery_ref(handle) }
-        .and_then(|handle| {
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| handle.info.get(index))
-        })
-        .map_or(ptr::null_mut(), |info| string_to_c(&info.name))
+    ffi_guard(|| {
+        unsafe { discovery_ref(handle) }
+            .and_then(|handle| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| handle.info.get(index))
+            })
+            .map_or(ptr::null_mut(), |info| string_to_c(&info.name))
+    })
 }
 
 #[no_mangle]
@@ -203,13 +286,15 @@ pub extern "C" fn wing_discover_get_model(
     handle: *const WingDiscoveryInfoHandle,
     index: c_int,
 ) -> *mut c_char {
-    unsafe { discovery_ref(handle) }
-        .and_then(|handle| {
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| handle.info.get(index))
-        })
-        .map_or(ptr::null_mut(), |info| string_to_c(&info.model))
+    ffi_guard(|| {
+        unsafe { discovery_ref(handle) }
+            .and_then(|handle| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| handle.info.get(index))
+            })
+            .map_or(ptr::null_mut(), |info| string_to_c(&info.model))
+    })
 }
 
 #[no_mangle]
@@ -217,13 +302,15 @@ pub extern "C" fn wing_discover_get_serial(
     handle: *const WingDiscoveryInfoHandle,
     index: c_int,
 ) -> *mut c_char {
-    unsafe { discovery_ref(handle) }
-        .and_then(|handle| {
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| handle.info.get(index))
-        })
-        .map_or(ptr::null_mut(), |info| string_to_c(&info.serial))
+    ffi_guard(|| {
+        unsafe { discovery_ref(handle) }
+            .and_then(|handle| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| handle.info.get(index))
+            })
+            .map_or(ptr::null_mut(), |info| string_to_c(&info.serial))
+    })
 }
 
 #[no_mangle]
@@ -231,73 +318,106 @@ pub extern "C" fn wing_discover_get_firmware(
     handle: *const WingDiscoveryInfoHandle,
     index: c_int,
 ) -> *mut c_char {
-    unsafe { discovery_ref(handle) }
-        .and_then(|handle| {
-            usize::try_from(index)
-                .ok()
-                .and_then(|index| handle.info.get(index))
-        })
-        .map_or(ptr::null_mut(), |info| string_to_c(&info.firmware))
+    ffi_guard(|| {
+        unsafe { discovery_ref(handle) }
+            .and_then(|handle| {
+                usize::try_from(index)
+                    .ok()
+                    .and_then(|index| handle.info.get(index))
+            })
+            .map_or(ptr::null_mut(), |info| string_to_c(&info.firmware))
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_console_connect(ip: *const c_char) -> *mut WingConsoleHandle {
-    if ip.is_null() {
-        match WingConsole::connect(None) {
-            Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console })),
-            Err(err) => {
-                record_error(&err);
-                ptr::null_mut()
+    ffi_guard(|| {
+        if ip.is_null() {
+            match WingConsole::connect(None) {
+                Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console })),
+                Err(err) => {
+                    record_error(&err);
+                    ptr::null_mut()
+                }
             }
-        }
-    } else if let Some(ip) = unsafe { cstr_to_str(ip) } {
-        match WingConsole::connect(Some(ip)) {
-            Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console })),
-            Err(err) => {
-                record_error(&err);
-                ptr::null_mut()
+        } else if let Some(ip) = unsafe { cstr_to_str(ip) } {
+            match WingConsole::connect(Some(ip)) {
+                Ok(console) => Box::into_raw(Box::new(WingConsoleHandle { console })),
+                Err(err) => {
+                    record_error(&err);
+                    ptr::null_mut()
+                }
             }
+        } else {
+            record_ffi_usage_error("wing_console_connect: invalid or non-UTF-8 ip");
+            ptr::null_mut()
         }
-    } else {
-        record_ffi_usage_error("wing_console_connect: invalid or non-UTF-8 ip");
-        ptr::null_mut()
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_console_destroy(handle: *mut WingConsoleHandle) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard(|| {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_console_read(handle: *mut WingConsoleHandle) -> *mut ResponseHandle {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_read: null console handle");
-        return ptr::null_mut();
-    };
-    let mut console = handle.console.clone();
-    match console.read() {
-        Ok(response) => Box::into_raw(Box::new(ResponseHandle { response })),
-        Err(err) => {
-            record_error(&err);
-            ptr::null_mut()
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_read: null console handle");
+            return ptr::null_mut();
+        };
+        let mut console = handle.console.clone();
+        match console.read() {
+            Ok(response) => Box::into_raw(Box::new(ResponseHandle { response })),
+            Err(err) => {
+                record_error(&err);
+                ptr::null_mut()
+            }
         }
-    }
+    })
+}
+
+/// [`wing_console_read`] bounded by `timeout_ms`: NULL with last-error code 7 (timeout) when
+/// nothing arrives in time, so a C reader loop can service its own work between reads.
+#[no_mangle]
+pub extern "C" fn wing_console_read_timeout(
+    handle: *mut WingConsoleHandle,
+    timeout_ms: u32,
+) -> *mut ResponseHandle {
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_read_timeout: null console handle");
+            return ptr::null_mut();
+        };
+        let mut console = handle.console.clone();
+        match console.read_timeout(std::time::Duration::from_millis(timeout_ms.into())) {
+            Ok(response) => Box::into_raw(Box::new(ResponseHandle { response })),
+            Err(err) => {
+                record_error(&err);
+                ptr::null_mut()
+            }
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_response_destroy(handle: *mut ResponseHandle) {
-    if handle.is_null() {
-        return;
-    }
-    unsafe {
-        drop(Box::from_raw(handle));
-    }
+    ffi_guard(|| {
+        if handle.is_null() {
+            return;
+        }
+        unsafe {
+            drop(Box::from_raw(handle));
+        }
+    })
 }
 
 #[no_mangle]
@@ -306,22 +426,24 @@ pub extern "C" fn wing_console_set_string(
     id: i32,
     value: *const c_char,
 ) -> c_int {
-    let Some(value) = (unsafe { cstr_to_str(value) }) else {
-        record_ffi_usage_error("wing_console_set_string: invalid or non-UTF-8 value");
-        return -1;
-    };
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_set_string: null console handle");
-        return -1;
-    };
-    let mut console = handle.console.clone();
-    match console.set_string(id, value) {
-        Ok(()) => 0,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(value) = (unsafe { cstr_to_str(value) }) else {
+            record_ffi_usage_error("wing_console_set_string: invalid or non-UTF-8 value");
+            return -1;
+        };
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_set_string: null console handle");
+            return -1;
+        };
+        let mut console = handle.console.clone();
+        match console.set_string(id, value) {
+            Ok(()) => 0,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
@@ -330,18 +452,20 @@ pub extern "C" fn wing_console_set_float(
     id: i32,
     value: c_float,
 ) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_set_float: null console handle");
-        return -1;
-    };
-    let mut console = handle.console.clone();
-    match console.set_float(id, value) {
-        Ok(()) => 0,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_set_float: null console handle");
+            return -1;
+        };
+        let mut console = handle.console.clone();
+        match console.set_float(id, value) {
+            Ok(()) => 0,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
@@ -350,36 +474,40 @@ pub extern "C" fn wing_console_set_int(
     id: i32,
     value: c_int,
 ) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_set_int: null console handle");
-        return -1;
-    };
-    let mut console = handle.console.clone();
-    match console.set_int(id, value) {
-        Ok(()) => 0,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_set_int: null console handle");
+            return -1;
+        };
+        let mut console = handle.console.clone();
+        match console.set_int(id, value) {
+            Ok(()) => 0,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Toggles a 0/1 parameter in one write (`wToggleTokenInt`). Returns 0 on success, -1 on
 /// error.
 #[no_mangle]
 pub extern "C" fn wing_console_toggle(handle: *mut WingConsoleHandle, id: i32) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_toggle: null console handle");
-        return -1;
-    };
-    let mut console = handle.console.clone();
-    match console.toggle(id) {
-        Ok(()) => 0,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_toggle: null console handle");
+            return -1;
+        };
+        let mut console = handle.console.clone();
+        match console.toggle(id) {
+            Ok(()) => 0,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Captures the raw, hash-addressed native byte stream for the subtree rooted at `id`
@@ -395,35 +523,37 @@ pub extern "C" fn wing_console_get_binary_node(
     out_buf: *mut u8,
     out_capacity: usize,
 ) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_get_binary_node: null console handle");
-        return -1;
-    };
-    if out_capacity > 0 && out_buf.is_null() {
-        record_ffi_usage_error(
-            "wing_console_get_binary_node: null out buffer for requested capacity",
-        );
-        return -1;
-    }
-    let timeout = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
-    let mut console = handle.console.clone();
-    match console.get_binary_node(id, timeout) {
-        Ok(bytes) => {
-            if bytes.len() > out_capacity {
-                return -2;
-            }
-            if !bytes.is_empty() {
-                unsafe {
-                    ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_get_binary_node: null console handle");
+            return -1;
+        };
+        if out_capacity > 0 && out_buf.is_null() {
+            record_ffi_usage_error(
+                "wing_console_get_binary_node: null out buffer for requested capacity",
+            );
+            return -1;
+        }
+        let timeout = std::time::Duration::from_millis(timeout_ms.max(0) as u64);
+        let mut console = handle.console.clone();
+        match console.get_binary_node(id, timeout) {
+            Ok(bytes) => {
+                if bytes.len() > out_capacity {
+                    return -2;
                 }
+                if !bytes.is_empty() {
+                    unsafe {
+                        ptr::copy_nonoverlapping(bytes.as_ptr(), out_buf, bytes.len());
+                    }
+                }
+                bytes.len() as c_int
             }
-            bytes.len() as c_int
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-        Err(err) => {
-            record_error(&err);
-            -1
-        }
-    }
+    })
 }
 
 /// Replays a buffer captured by `wing_console_get_binary_node` (`wSetBinaryNode`). Returns
@@ -435,27 +565,31 @@ pub extern "C" fn wing_console_set_binary_node(
     data: *const u8,
     len: usize,
 ) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_set_binary_node: null console handle");
-        return -1;
-    };
-    if len > 0 && data.is_null() {
-        record_ffi_usage_error("wing_console_set_binary_node: null data buffer for nonzero len");
-        return -1;
-    }
-    let slice = if len == 0 {
-        &[][..]
-    } else {
-        unsafe { std::slice::from_raw_parts(data, len) }
-    };
-    let mut console = handle.console.clone();
-    match console.set_binary_node(slice) {
-        Ok(written) => written as c_int,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_set_binary_node: null console handle");
+            return -1;
+        };
+        if len > 0 && data.is_null() {
+            record_ffi_usage_error(
+                "wing_console_set_binary_node: null data buffer for nonzero len",
+            );
+            return -1;
         }
-    }
+        let slice = if len == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(data, len) }
+        };
+        let mut console = handle.console.clone();
+        match console.set_binary_node(slice) {
+            Ok(written) => written as c_int,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
+        }
+    })
 }
 
 #[no_mangle]
@@ -463,157 +597,179 @@ pub extern "C" fn wing_console_request_node_definition(
     handle: *mut WingConsoleHandle,
     id: i32,
 ) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_request_node_definition: null console handle");
-        return -1;
-    };
-    let mut console = handle.console.clone();
-    match console.request_node_definition(id) {
-        Ok(()) => 0,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_request_node_definition: null console handle");
+            return -1;
+        };
+        let mut console = handle.console.clone();
+        match console.request_node_definition(id) {
+            Ok(()) => 0,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_console_request_node_data(handle: *mut WingConsoleHandle, id: i32) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_request_node_data: null console handle");
-        return -1;
-    };
-    let mut console = handle.console.clone();
-    match console.request_node_data(id) {
-        Ok(()) => 0,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_request_node_data: null console handle");
+            return -1;
+        };
+        let mut console = handle.console.clone();
+        match console.request_node_data(id) {
+            Ok(()) => 0,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_response_get_type(handle: *const ResponseHandle) -> ResponseType {
-    match unsafe { response_ref(handle).map(|handle| &handle.response) } {
-        Some(WingResponse::RequestEnd) => ResponseType::End,
-        Some(WingResponse::NodeDef(_)) => ResponseType::NodeDefinition,
-        Some(WingResponse::NodeData(_, _)) => ResponseType::NodeData,
-        None => {
-            record_ffi_usage_error("wing_response_get_type: null response handle");
-            ResponseType::End
-        }
-    }
+    ffi_guard(
+        || match unsafe { response_ref(handle).map(|handle| &handle.response) } {
+            Some(WingResponse::RequestEnd) => ResponseType::End,
+            Some(WingResponse::NodeDef(_)) => ResponseType::NodeDefinition,
+            Some(WingResponse::NodeData(_, _)) => ResponseType::NodeData,
+            None => {
+                record_ffi_usage_error("wing_response_get_type: null response handle");
+                ResponseType::End
+            }
+        },
+    )
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_id(handle: *const ResponseHandle) -> i32 {
-    if let Some(WingResponse::NodeData(id, _)) =
-        unsafe { response_ref(handle).map(|handle| &handle.response) }
-    {
-        *id
-    } else {
-        0
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeData(id, _)) =
+            unsafe { response_ref(handle).map(|handle| &handle.response) }
+        {
+            *id
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_string(handle: *const ResponseHandle) -> *mut c_char {
-    if let Some(WingResponse::NodeData(_, data)) =
-        unsafe { response_ref(handle).map(|handle| &handle.response) }
-    {
-        string_to_c(&data.get_string())
-    } else {
-        ptr::null_mut()
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeData(_, data)) =
+            unsafe { response_ref(handle).map(|handle| &handle.response) }
+        {
+            string_to_c(&data.get_string())
+        } else {
+            ptr::null_mut()
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_float(handle: *const ResponseHandle) -> c_float {
-    if let Some(WingResponse::NodeData(_, data)) =
-        unsafe { response_ref(handle).map(|handle| &handle.response) }
-    {
-        data.get_float()
-    } else {
-        0.0
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeData(_, data)) =
+            unsafe { response_ref(handle).map(|handle| &handle.response) }
+        {
+            data.get_float()
+        } else {
+            0.0
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_int(handle: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeData(_, data)) =
-        unsafe { response_ref(handle).map(|handle| &handle.response) }
-    {
-        data.get_int()
-    } else {
-        0
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeData(_, data)) =
+            unsafe { response_ref(handle).map(|handle| &handle.response) }
+        {
+            data.get_int()
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_string(handle: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeData(_, data)) =
-        unsafe { response_ref(handle).map(|handle| &handle.response) }
-    {
-        if data.has_string() && is_c_string_compatible(&data.get_string()) {
-            1
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeData(_, data)) =
+            unsafe { response_ref(handle).map(|handle| &handle.response) }
+        {
+            if data.has_string() && is_c_string_compatible(&data.get_string()) {
+                1
+            } else {
+                0
+            }
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_float(handle: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeData(_, data)) =
-        unsafe { response_ref(handle).map(|handle| &handle.response) }
-    {
-        if data.has_float() {
-            1
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeData(_, data)) =
+            unsafe { response_ref(handle).map(|handle| &handle.response) }
+        {
+            if data.has_float() {
+                1
+            } else {
+                0
+            }
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_int(handle: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeData(_, data)) =
-        unsafe { response_ref(handle).map(|handle| &handle.response) }
-    {
-        if data.has_int() {
-            1
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeData(_, data)) =
+            unsafe { response_ref(handle).map(|handle| &handle.response) }
+        {
+            if data.has_int() {
+                1
+            } else {
+                0
+            }
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_name_to_id(name: *const c_char, out_id: *mut i32) -> c_int {
-    if out_id.is_null() {
-        record_ffi_usage_error("wing_name_to_id: null out_id");
-        return 0;
-    }
-    let Some(name_str) = (unsafe { cstr_to_str(name) }) else {
-        record_ffi_usage_error("wing_name_to_id: invalid or non-UTF-8 name");
-        return 0;
-    };
-    if let Some(id) = WingConsole::name_to_id(name_str) {
-        unsafe {
-            *out_id = id;
+    ffi_guard(|| {
+        if out_id.is_null() {
+            record_ffi_usage_error("wing_name_to_id: null out_id");
+            return 0;
         }
-        1
-    } else {
-        record_ffi_usage_error("wing_name_to_id: name not found in property map");
-        0
-    }
+        let Some(name_str) = (unsafe { cstr_to_str(name) }) else {
+            record_ffi_usage_error("wing_name_to_id: invalid or non-UTF-8 name");
+            return 0;
+        };
+        if let Some(id) = WingConsole::name_to_id(name_str) {
+            unsafe {
+                *out_id = id;
+            }
+            1
+        } else {
+            record_ffi_usage_error("wing_name_to_id: name not found in property map");
+            0
+        }
+    })
 }
 
 /// Reverse lookup: the node definition for a full property-map name (e.g.
@@ -625,19 +781,21 @@ pub extern "C" fn wing_name_to_id(name: *const c_char, out_id: *mut i32) -> c_in
 /// Return value must be freed with [`wing_response_destroy`].
 #[no_mangle]
 pub extern "C" fn wing_name_to_def(name: *const c_char) -> *mut ResponseHandle {
-    let Some(name_str) = (unsafe { cstr_to_str(name) }) else {
-        record_ffi_usage_error("wing_name_to_def: null or non-UTF-8 name");
-        return ptr::null_mut();
-    };
-    match WingConsole::name_to_def(name_str) {
-        Some(def) => Box::into_raw(Box::new(ResponseHandle {
-            response: WingResponse::NodeDef(def.clone()),
-        })),
-        None => {
-            record_ffi_usage_error("wing_name_to_def: name not found in property map");
-            ptr::null_mut()
+    ffi_guard(|| {
+        let Some(name_str) = (unsafe { cstr_to_str(name) }) else {
+            record_ffi_usage_error("wing_name_to_def: null or non-UTF-8 name");
+            return ptr::null_mut();
+        };
+        match WingConsole::name_to_def(name_str) {
+            Some(def) => Box::into_raw(Box::new(ResponseHandle {
+                response: WingResponse::NodeDef(def.clone()),
+            })),
+            None => {
+                record_ffi_usage_error("wing_name_to_def: name not found in property map");
+                ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 /// Number of candidate node definitions sharing wire `id` (an id can map to more than
@@ -647,7 +805,7 @@ pub extern "C" fn wing_name_to_def(name: *const c_char) -> *mut ResponseHandle {
 /// query result (no last-error is recorded).
 #[no_mangle]
 pub extern "C" fn wing_id_to_defs_count(id: i32) -> usize {
-    WingConsole::id_to_defs(id).map_or(0, |defs| defs.len())
+    ffi_guard(|| WingConsole::id_to_defs(id).map_or(0, |defs| defs.len()))
 }
 
 /// Full name of the `index`-th candidate for `id` (see [`wing_id_to_defs_count`]),
@@ -673,27 +831,29 @@ pub extern "C" fn wing_id_to_defs_get_name(
     name_out: *mut c_char,
     name_cap: usize,
 ) -> c_int {
-    let Some(defs) = WingConsole::id_to_defs(id) else {
-        record_ffi_usage_error("wing_id_to_defs_get_name: unknown id");
-        return -1;
-    };
-    let Some((name, _)) = defs.get(index) else {
-        record_ffi_usage_error("wing_id_to_defs_get_name: index out of range");
-        return -1;
-    };
-    if !is_c_string_compatible(name) {
-        record_ffi_usage_error("wing_id_to_defs_get_name: name contains embedded NUL");
-        return -1;
-    }
-    let needed = name.len() + 1;
-    if name_out.is_null() || name_cap < needed {
-        return needed as c_int;
-    }
-    unsafe {
-        ptr::copy_nonoverlapping(name.as_ptr().cast::<c_char>(), name_out, name.len());
-        *name_out.add(name.len()) = 0;
-    }
-    needed as c_int
+    ffi_guard(|| {
+        let Some(defs) = WingConsole::id_to_defs(id) else {
+            record_ffi_usage_error("wing_id_to_defs_get_name: unknown id");
+            return -1;
+        };
+        let Some((name, _)) = defs.get(index) else {
+            record_ffi_usage_error("wing_id_to_defs_get_name: index out of range");
+            return -1;
+        };
+        if !is_c_string_compatible(name) {
+            record_ffi_usage_error("wing_id_to_defs_get_name: name contains embedded NUL");
+            return -1;
+        }
+        let needed = name.len() + 1;
+        if name_out.is_null() || name_cap < needed {
+            return needed as c_int;
+        }
+        unsafe {
+            ptr::copy_nonoverlapping(name.as_ptr().cast::<c_char>(), name_out, name.len());
+            *name_out.add(name.len()) = 0;
+        }
+        needed as c_int
+    })
 }
 
 /// Node definition of the `index`-th candidate for `id` (see
@@ -704,19 +864,21 @@ pub extern "C" fn wing_id_to_defs_get_name(
 /// Return value must be freed with [`wing_response_destroy`].
 #[no_mangle]
 pub extern "C" fn wing_id_to_defs_get_def(id: i32, index: usize) -> *mut ResponseHandle {
-    let Some(defs) = WingConsole::id_to_defs(id) else {
-        record_ffi_usage_error("wing_id_to_defs_get_def: unknown id");
-        return ptr::null_mut();
-    };
-    match defs.get(index) {
-        Some((_, def)) => Box::into_raw(Box::new(ResponseHandle {
-            response: WingResponse::NodeDef(def.clone()),
-        })),
-        None => {
-            record_ffi_usage_error("wing_id_to_defs_get_def: index out of range");
-            ptr::null_mut()
+    ffi_guard(|| {
+        let Some(defs) = WingConsole::id_to_defs(id) else {
+            record_ffi_usage_error("wing_id_to_defs_get_def: unknown id");
+            return ptr::null_mut();
+        };
+        match defs.get(index) {
+            Some((_, def)) => Box::into_raw(Box::new(ResponseHandle {
+                response: WingResponse::NodeDef(def.clone()),
+            })),
+            None => {
+                record_ffi_usage_error("wing_id_to_defs_get_def: index out of range");
+                ptr::null_mut()
+            }
         }
-    }
+    })
 }
 
 /// Sends a keepalive for the main (get/set) connection if the console's internal
@@ -726,18 +888,20 @@ pub extern "C" fn wing_id_to_defs_get_def(id: i32, index: usize) -> *mut Respons
 /// success, -1 on failure (null handle, or see [`wing_last_error_message`]).
 #[no_mangle]
 pub extern "C" fn wing_console_keep_alive(handle: *mut WingConsoleHandle) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_keep_alive: null console handle");
-        return -1;
-    };
-    let mut console = handle.console.clone();
-    match console.keep_alive() {
-        Ok(()) => 0,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_keep_alive: null console handle");
+            return -1;
+        };
+        let mut console = handle.console.clone();
+        match console.keep_alive() {
+            Ok(()) => 0,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-    }
+    })
 }
 
 /// Sends a keepalive for the metering connection if its internal keepalive timer has
@@ -747,51 +911,59 @@ pub extern "C" fn wing_console_keep_alive(handle: *mut WingConsoleHandle) -> c_i
 /// not initialized, or see [`wing_last_error_message`]).
 #[no_mangle]
 pub extern "C" fn wing_console_keep_alive_meters(handle: *mut WingConsoleHandle) -> c_int {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_keep_alive_meters: null console handle");
-        return -1;
-    };
-    let mut console = handle.console.clone();
-    match console.keep_alive_meters() {
-        Ok(()) => 0,
-        Err(err) => {
-            record_error(&err);
-            -1
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_keep_alive_meters: null console handle");
+            return -1;
+        };
+        let mut console = handle.console.clone();
+        match console.keep_alive_meters() {
+            Ok(()) => 0,
+            Err(err) => {
+                record_error(&err);
+                -1
+            }
         }
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_id(def: *const ResponseHandle) -> i32 {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        def.id
-    } else {
-        0
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            def.id
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_parent_id(def: *const ResponseHandle) -> i32 {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        def.parent_id
-    } else {
-        0
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            def.parent_id
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_index(def: *const ResponseHandle) -> u16 {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        def.index
-    } else {
-        0
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            def.index
+        } else {
+            0
+        }
+    })
 }
 
 /// C ABI mirror of [`NodeType`]. `NodeType` itself is not `#[repr(C)]` (it carries a
@@ -863,61 +1035,71 @@ impl From<NodeUnit> for FfiNodeUnit {
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_type(def: *const ResponseHandle) -> FfiNodeType {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        def.node_type.into()
-    } else {
-        FfiNodeType::Node
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            def.node_type.into()
+        } else {
+            FfiNodeType::Node
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_unit(def: *const ResponseHandle) -> FfiNodeUnit {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        def.unit.into()
-    } else {
-        FfiNodeUnit::None
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            def.unit.into()
+        } else {
+            FfiNodeUnit::None
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_name(def: *const ResponseHandle) -> *mut c_char {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        string_to_c(&def.name)
-    } else {
-        ptr::null_mut()
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            string_to_c(&def.name)
+        } else {
+            ptr::null_mut()
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_long_name(def: *const ResponseHandle) -> *mut c_char {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        string_to_c(&def.long_name)
-    } else {
-        ptr::null_mut()
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            string_to_c(&def.long_name)
+        } else {
+            ptr::null_mut()
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_is_read_only(def: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if def.read_only {
-            1
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if def.read_only {
+                1
+            } else {
+                0
+            }
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -925,23 +1107,25 @@ pub extern "C" fn wing_node_definition_get_min_float(
     def: *const ResponseHandle,
     ret: *mut c_float,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(min_float) = def.min_float {
-            unsafe {
-                *ret = min_float;
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(min_float) = def.min_float {
+                unsafe {
+                    *ret = min_float;
+                }
+                1
+            } else {
+                0
             }
-            1
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -949,23 +1133,25 @@ pub extern "C" fn wing_node_definition_get_max_float(
     def: *const ResponseHandle,
     ret: *mut c_float,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(max_float) = def.max_float {
-            unsafe {
-                *ret = max_float;
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(max_float) = def.max_float {
+                unsafe {
+                    *ret = max_float;
+                }
+                1
+            } else {
+                0
             }
-            1
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -973,23 +1159,25 @@ pub extern "C" fn wing_node_definition_get_steps(
     def: *const ResponseHandle,
     ret: *mut c_int,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(steps) = def.steps {
-            unsafe {
-                *ret = steps;
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(steps) = def.steps {
+                unsafe {
+                    *ret = steps;
+                }
+                1
+            } else {
+                0
             }
-            1
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -997,23 +1185,25 @@ pub extern "C" fn wing_node_definition_get_min_int(
     def: *const ResponseHandle,
     ret: *mut c_int,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(min_int) = def.min_int {
-            unsafe {
-                *ret = min_int;
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(min_int) = def.min_int {
+                unsafe {
+                    *ret = min_int;
+                }
+                1
+            } else {
+                0
             }
-            1
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -1021,23 +1211,25 @@ pub extern "C" fn wing_node_definition_get_max_int(
     def: *const ResponseHandle,
     ret: *mut c_int,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(max_int) = def.max_int {
-            unsafe {
-                *ret = max_int;
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(max_int) = def.max_int {
+                unsafe {
+                    *ret = max_int;
+                }
+                1
+            } else {
+                0
             }
-            1
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -1045,49 +1237,55 @@ pub extern "C" fn wing_node_definition_get_max_string_len(
     def: *const ResponseHandle,
     ret: *mut c_int,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(max_string_len) = def.max_string_len {
-            unsafe {
-                *ret = max_string_len as i32;
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(max_string_len) = def.max_string_len {
+                unsafe {
+                    *ret = max_string_len as i32;
+                }
+                1
+            } else {
+                0
             }
-            1
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_string_enum_count(def: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        def.string_enum
-            .as_ref()
-            .map_or(0, |string_enum| string_enum.len() as c_int)
-    } else {
-        0
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            def.string_enum
+                .as_ref()
+                .map_or(0, |string_enum| string_enum.len() as c_int)
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_float_enum_count(def: *const ResponseHandle) -> c_int {
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        def.float_enum
-            .as_ref()
-            .map_or(0, |float_enum| float_enum.len() as c_int)
-    } else {
-        0
-    }
+    ffi_guard(|| {
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            def.float_enum
+                .as_ref()
+                .map_or(0, |float_enum| float_enum.len() as c_int)
+        } else {
+            0
+        }
+    })
 }
 
 #[no_mangle]
@@ -1096,26 +1294,28 @@ pub extern "C" fn wing_node_definition_get_float_enum_item(
     index: c_int,
     ret: *mut c_float,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    let Some(index) = usize::try_from(index).ok() else {
-        return 0;
-    };
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(item) = def.float_enum.as_ref().and_then(|items| items.get(index)) {
-            unsafe {
-                *ret = item.item;
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        let Some(index) = usize::try_from(index).ok() else {
+            return 0;
+        };
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(item) = def.float_enum.as_ref().and_then(|items| items.get(index)) {
+                unsafe {
+                    *ret = item.item;
+                }
+                1
+            } else {
+                0
             }
-            1
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -1124,30 +1324,33 @@ pub extern "C" fn wing_node_definition_get_float_enum_long_item(
     index: c_int,
     ret: *mut *mut c_char,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    let Some(index) = usize::try_from(index).ok() else {
-        return 0;
-    };
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(item) = def.float_enum.as_ref().and_then(|items| items.get(index)) {
-            unsafe {
-                *ret = string_to_c(&item.long_item);
-            }
-            if unsafe { (*ret).is_null() } {
-                0
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        let Some(index) = usize::try_from(index).ok() else {
+            return 0;
+        };
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(item) = def.float_enum.as_ref().and_then(|items| items.get(index)) {
+                let value = string_to_c(&item.long_item);
+                if value.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        *ret = value;
+                    }
+                    1
+                }
             } else {
-                1
+                0
             }
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -1156,30 +1359,33 @@ pub extern "C" fn wing_node_definition_get_string_enum_item(
     index: c_int,
     ret: *mut *mut c_char,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    let Some(index) = usize::try_from(index).ok() else {
-        return 0;
-    };
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(item) = def.string_enum.as_ref().and_then(|items| items.get(index)) {
-            unsafe {
-                *ret = string_to_c(&item.item);
-            }
-            if unsafe { (*ret).is_null() } {
-                0
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        let Some(index) = usize::try_from(index).ok() else {
+            return 0;
+        };
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(item) = def.string_enum.as_ref().and_then(|items| items.get(index)) {
+                let value = string_to_c(&item.item);
+                if value.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        *ret = value;
+                    }
+                    1
+                }
             } else {
-                1
+                0
             }
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_string_enum_long_item(
@@ -1187,30 +1393,33 @@ pub extern "C" fn wing_node_definition_get_string_enum_long_item(
     index: c_int,
     ret: *mut *mut c_char,
 ) -> c_int {
-    if ret.is_null() {
-        return 0;
-    }
-    let Some(index) = usize::try_from(index).ok() else {
-        return 0;
-    };
-    if let Some(WingResponse::NodeDef(def)) =
-        unsafe { response_ref(def).map(|handle| &handle.response) }
-    {
-        if let Some(item) = def.string_enum.as_ref().and_then(|items| items.get(index)) {
-            unsafe {
-                *ret = string_to_c(&item.long_item);
-            }
-            if unsafe { (*ret).is_null() } {
-                0
+    ffi_guard(|| {
+        if ret.is_null() {
+            return 0;
+        }
+        let Some(index) = usize::try_from(index).ok() else {
+            return 0;
+        };
+        if let Some(WingResponse::NodeDef(def)) =
+            unsafe { response_ref(def).map(|handle| &handle.response) }
+        {
+            if let Some(item) = def.string_enum.as_ref().and_then(|items| items.get(index)) {
+                let value = string_to_c(&item.long_item);
+                if value.is_null() {
+                    0
+                } else {
+                    unsafe {
+                        *ret = value;
+                    }
+                    1
+                }
             } else {
-                1
+                0
             }
         } else {
             0
         }
-    } else {
-        0
-    }
+    })
 }
 
 #[no_mangle]
@@ -1219,56 +1428,40 @@ pub extern "C" fn wing_console_request_meter(
     meters: *const u16,
     meters_count: usize,
 ) -> u16 {
-    let Some(handle) = (unsafe { handle.as_ref() }) else {
-        record_ffi_usage_error("wing_console_request_meter: null console handle");
-        return 0;
-    };
-    if meters_count > 0 && meters.is_null() {
-        record_ffi_usage_error("wing_console_request_meter: null meter array for nonzero len");
-        return 0;
-    }
-
-    let meter_ids = if meters_count == 0 {
-        &[][..]
-    } else {
-        unsafe { std::slice::from_raw_parts(meters, meters_count) }
-    };
-
-    let Some(meters) = meter_ids
-        .iter()
-        .map(|m| match m & 0xff00 {
-            0xa000 => Some(Meter::Channel((m & 0xff) as u8)),
-            0xa100 => Some(Meter::Aux((m & 0xff) as u8)),
-            0xa200 => Some(Meter::Bus((m & 0xff) as u8)),
-            0xa300 => Some(Meter::Main((m & 0xff) as u8)),
-            0xa400 => Some(Meter::Matrix((m & 0xff) as u8)),
-            0xa500 => Some(Meter::Dca((m & 0xff) as u8)),
-            0xa600 => Some(Meter::Fx((m & 0xff) as u8)),
-            0xa700 => Some(Meter::Source((m & 0xff) as u8)),
-            0xa800 => Some(Meter::Output((m & 0xff) as u8)),
-            0xa900 if *m == 0xa900 => Some(Meter::Monitor),
-            0xaa00 if *m == 0xaa00 => Some(Meter::Rta),
-            0xab00 => Some(Meter::Channel2((m & 0xff) as u8)),
-            0xac00 => Some(Meter::Aux2((m & 0xff) as u8)),
-            0xad00 => Some(Meter::Bus2((m & 0xff) as u8)),
-            0xae00 => Some(Meter::Main2((m & 0xff) as u8)),
-            0xaf00 => Some(Meter::Matrix2((m & 0xff) as u8)),
-            _ => None,
-        })
-        .collect::<Option<Vec<_>>>()
-    else {
-        record_ffi_usage_error("wing_console_request_meter: invalid meter id");
-        return 0;
-    };
-
-    let mut console = handle.console.clone();
-    match console.request_meter(&meters) {
-        Ok(id) => id,
-        Err(err) => {
-            record_error(&err);
-            0
+    ffi_guard(|| {
+        let Some(handle) = (unsafe { handle.as_ref() }) else {
+            record_ffi_usage_error("wing_console_request_meter: null console handle");
+            return 0;
+        };
+        if meters_count > 0 && meters.is_null() {
+            record_ffi_usage_error("wing_console_request_meter: null meter array for nonzero len");
+            return 0;
         }
-    }
+
+        let meter_ids = if meters_count == 0 {
+            &[][..]
+        } else {
+            unsafe { std::slice::from_raw_parts(meters, meters_count) }
+        };
+
+        let Some(meters) = meter_ids
+            .iter()
+            .map(|&m| Meter::from_wire((m >> 8) as u8, (m & 0xff) as u8))
+            .collect::<Option<Vec<_>>>()
+        else {
+            record_ffi_usage_error("wing_console_request_meter: invalid meter id");
+            return 0;
+        };
+
+        let mut console = handle.console.clone();
+        match console.request_meter(&meters) {
+            Ok(id) => id,
+            Err(err) => {
+                record_error(&err);
+                0
+            }
+        }
+    })
 }
 
 #[no_mangle]
@@ -1278,7 +1471,7 @@ pub extern "C" fn wing_console_read_meter(
     ret_data: *mut i16,
     ret_data_capacity: usize,
 ) -> c_int {
-    wing_console_read_meter_into(handle, ret_id, ret_data, ret_data_capacity, true)
+    ffi_guard(|| wing_console_read_meter_into(handle, ret_id, ret_data, ret_data_capacity, true))
 }
 
 #[no_mangle]
@@ -1288,7 +1481,7 @@ pub extern "C" fn wing_console_read_meter_bounded(
     ret_data: *mut i16,
     ret_data_capacity: usize,
 ) -> c_int {
-    wing_console_read_meter_into(handle, ret_id, ret_data, ret_data_capacity, false)
+    ffi_guard(|| wing_console_read_meter_into(handle, ret_id, ret_data, ret_data_capacity, false))
 }
 
 fn wing_console_read_meter_into(
@@ -1307,9 +1500,10 @@ fn wing_console_read_meter_into(
         return -1;
     }
     let mut console = handle.console.clone();
-    match console.read_meters() {
-        Ok((id, data)) => {
-            if data.len() > ret_data_capacity {
+    let mut samples = [0i16; crate::console::MAX_METER_SAMPLES];
+    match console.read_meters_into(&mut samples) {
+        Ok((id, len)) => {
+            if len > ret_data_capacity {
                 if write_id_on_capacity_failure {
                     unsafe {
                         *ret_id = id;
@@ -1320,12 +1514,12 @@ fn wing_console_read_meter_into(
             unsafe {
                 *ret_id = id;
             }
-            if !data.is_empty() {
+            if len > 0 {
                 unsafe {
-                    ptr::copy_nonoverlapping(data.as_ptr(), ret_data, data.len());
+                    ptr::copy_nonoverlapping(samples.as_ptr(), ret_data, len);
                 }
             }
-            data.len() as c_int
+            len as c_int
         }
         Err(err) => {
             record_error(&err);
@@ -1729,5 +1923,50 @@ mod tests {
         assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
         assert_eq!(wing_console_keep_alive_meters(ptr::null_mut()), -1);
         assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+    }
+
+    #[test]
+    fn a_panic_inside_an_entry_point_becomes_a_failure_value_and_error_code() {
+        let result: c_int = ffi_guard(|| panic!("boom"));
+        assert_eq!(result, -1);
+        assert_eq!(wing_last_error_code(), WING_ERROR_PANIC);
+
+        let result: *mut ResponseHandle = ffi_guard(|| panic!("boom"));
+        assert!(result.is_null());
+        let result: ResponseType = ffi_guard(|| panic!("boom"));
+        assert!(result == ResponseType::End);
+    }
+
+    #[test]
+    fn read_timeout_returns_null_with_the_timeout_code_on_a_quiet_console() {
+        assert!(wing_console_read_timeout(ptr::null_mut(), 10).is_null());
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let console = WingConsole::connect_addr(listener.local_addr().unwrap()).unwrap();
+        let _server = listener.accept().unwrap();
+        let mut handle = WingConsoleHandle { console };
+
+        let start = std::time::Instant::now();
+        assert!(wing_console_read_timeout(&mut handle, 100).is_null());
+        assert_eq!(wing_last_error_code(), 7);
+        assert!(start.elapsed() < std::time::Duration::from_secs(2));
+    }
+
+    #[test]
+    fn enum_item_getters_leave_ret_untouched_on_a_bad_index() {
+        let Some((_, def)) = WingConsole::propmap_iter().find(|(_, def)| def.string_enum.is_some())
+        else {
+            return; // no embedded map without the `propmap` feature
+        };
+        let handle = ResponseHandle {
+            response: WingResponse::NodeDef(def.clone()),
+        };
+        let mut ret: *mut c_char = ptr::null_mut();
+        assert_eq!(
+            wing_node_definition_get_string_enum_item(&handle, 10_000, &mut ret),
+            0
+        );
+        assert!(ret.is_null());
     }
 }

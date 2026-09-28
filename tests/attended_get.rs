@@ -12,7 +12,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use libwing::{Error, Transport, WingConsole, WingResponse};
+use libwing::{Error, LiveSchema, Transport, WingConsole, WingResponse};
 
 /// Feeds pre-scripted wire bytes to the console's reader. An empty script reports
 /// `TimedOut` (matching what a real timed-out socket read looks like to `decode_next`)
@@ -405,6 +405,65 @@ fn concurrent_attended_gets_do_not_consume_each_others_responses() {
     assert_eq!(first_data.get_int(), 500);
     assert_eq!(second_data.get_int(), 510);
     assert_eq!(state.0.lock().unwrap().requests, vec![50, 51]);
+}
+
+#[test]
+fn a_timed_out_get_hands_its_buffered_responses_to_the_next_read() {
+    let mut script = node_data_i32(51, 99);
+    script.extend(request_end());
+    let mut console = console_with_script(script, 4096);
+
+    assert!(matches!(
+        console.get_node_data(50, Duration::from_millis(100)),
+        Err(Error::Timeout)
+    ));
+    match console.read_timeout(Duration::from_millis(100)) {
+        Ok(WingResponse::NodeData(51, data)) => assert_eq!(data.get_int(), 99),
+        other => panic!(
+            "expected the buffered NodeData(51), got {:?}",
+            other.is_ok()
+        ),
+    }
+    assert!(matches!(
+        console.read_timeout(Duration::from_millis(100)),
+        Ok(WingResponse::RequestEnd)
+    ));
+}
+
+#[test]
+fn a_flood_of_unrelated_responses_fails_the_get_instead_of_growing_memory() {
+    // One node selector, then 70k one-byte values for it: each is an unrelated NodeData.
+    let mut script = vec![0xd7];
+    script.extend_from_slice(&51_i32.to_be_bytes());
+    script.extend(std::iter::repeat_n(0x00, 70_000));
+    let mut console = console_with_script(script, 4096);
+
+    let start = Instant::now();
+    assert!(matches!(
+        console.get_node_data(50, Duration::from_secs(30)),
+        Err(Error::InvalidData)
+    ));
+    assert!(start.elapsed() < Duration::from_secs(10));
+}
+
+#[test]
+fn refresh_subtree_times_out_on_a_silent_console_and_keeps_interleaved_data() {
+    let mut console = console_with_script(node_data_i32(51, 99), 4096);
+    let mut schema = LiveSchema::new();
+
+    let start = Instant::now();
+    assert!(matches!(
+        schema.refresh_subtree(&mut console, 7, Duration::from_millis(150)),
+        Err(Error::Timeout)
+    ));
+    assert!(start.elapsed() < Duration::from_secs(2));
+    match console.read_timeout(Duration::from_millis(100)) {
+        Ok(WingResponse::NodeData(51, data)) => assert_eq!(data.get_int(), 99),
+        other => panic!(
+            "expected the interleaved NodeData(51), got {:?}",
+            other.is_ok()
+        ),
+    }
 }
 
 fn variant_name(resp: &WingResponse) -> &'static str {

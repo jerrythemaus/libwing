@@ -245,14 +245,18 @@ impl NativeRequestDecoder {
         }
     }
 
+    /// Decode a fragment. Any error resets the decoder: the rest of the fragment
+    /// is dropped, so the buffered state no longer describes the stream.
     pub fn push(&mut self, input: &[u8]) -> Result<Vec<NativeRequest>> {
-        let events = match self.channels.push(input) {
-            Ok(events) => events,
-            Err(err) => {
-                self.reset();
-                return Err(err);
-            }
-        };
+        let result = self.push_events(input);
+        if result.is_err() {
+            self.reset();
+        }
+        result
+    }
+
+    fn push_events(&mut self, input: &[u8]) -> Result<Vec<NativeRequest>> {
+        let events = self.channels.push(input)?;
         let mut requests = Vec::new();
         for event in events {
             match event {
@@ -261,6 +265,8 @@ impl NativeRequestDecoder {
                     requests.push(NativeRequest::KeepAlive { channel });
                 }
                 ChannelEvent::Data(1, byte) => {
+                    // Bytes are parsed one at a time, so `audio` holds at most one
+                    // incomplete token and each `parse_audio` drain empties it.
                     self.audio.push(byte);
                     self.check_buffer_limit()?;
                     while let Some(request) = self.parse_audio()? {
@@ -279,7 +285,6 @@ impl NativeRequestDecoder {
                 }
             }
             if requests.len() > self.limits.max_batch_requests {
-                self.reset();
                 return Err(Error::InvalidData);
             }
         }
@@ -307,9 +312,8 @@ impl NativeRequestDecoder {
         *self = Self::new(limits);
     }
 
-    fn check_buffer_limit(&mut self) -> Result<()> {
+    fn check_buffer_limit(&self) -> Result<()> {
         if self.audio.len().saturating_add(self.meter.len()) > self.limits.max_buffered_bytes {
-            self.reset();
             Err(Error::InvalidData)
         } else {
             Ok(())
@@ -478,7 +482,7 @@ impl NativeRequestDecoder {
         Ok(())
     }
 
-    fn check_path_room(&mut self, name_bytes: usize) -> Result<()> {
+    fn check_path_room(&self, name_bytes: usize) -> Result<()> {
         let within_elements = self.path.len() < self.limits.max_path_elements;
         let within_bytes = self
             .path_bytes
@@ -487,14 +491,12 @@ impl NativeRequestDecoder {
         if within_elements && within_bytes {
             Ok(())
         } else {
-            self.reset();
             Err(Error::InvalidData)
         }
     }
 
     fn parse_string_token(&mut self, len: usize, header: usize) -> Result<NativeRequest> {
         if len > self.limits.max_string_bytes {
-            self.reset();
             return Err(Error::InvalidData);
         }
         let value = String::from_utf8(self.audio[header..header + len].to_vec())
@@ -534,10 +536,12 @@ impl NativeRequestDecoder {
                     self.meter.drain(..5);
                     return Ok(Some(NativeRequest::MeterRenew { report_id }));
                 }
-                let Some(end) = self.meter[6..].iter().position(|&byte| byte == 0xde) else {
+                // Only the newest byte can close the collection; rescanning the
+                // whole buffer per byte would be quadratic.
+                let end = self.meter.len() - 1;
+                if end < 6 || self.meter[end] != 0xde {
                     return Ok(None);
-                };
-                let end = end + 6;
+                }
                 let meters =
                     decode_meter_entries(&self.meter[6..end], self.limits.max_meter_entries)?;
                 let port = self.meter_port.ok_or(Error::InvalidData)?;
@@ -578,32 +582,13 @@ fn decode_meter_entries(raw: &[u8], limit: usize) -> Result<Vec<Meter>> {
     for &byte in raw {
         if (0xa0..=0xaf).contains(&byte) {
             family = Some(byte);
-            if matches!(byte, 0xa9 | 0xaa) {
-                meters.push(if byte == 0xa9 {
-                    Meter::Monitor
-                } else {
-                    Meter::Rta
-                });
+            // Monitor and Rta take no index byte: the opcode is the whole entry.
+            if let Some(meter) = Meter::from_wire(byte, 0).filter(|m| m.wire().2 == 0) {
+                meters.push(meter);
             }
         } else if byte <= 0x7f {
-            let n = byte.checked_add(1).ok_or(Error::InvalidData)?;
-            meters.push(match family.ok_or(Error::InvalidData)? {
-                0xa0 => Meter::Channel(n),
-                0xa1 => Meter::Aux(n),
-                0xa2 => Meter::Bus(n),
-                0xa3 => Meter::Main(n),
-                0xa4 => Meter::Matrix(n),
-                0xa5 => Meter::Dca(n),
-                0xa6 => Meter::Fx(n),
-                0xa7 => Meter::Source(n),
-                0xa8 => Meter::Output(n),
-                0xab => Meter::Channel2(n),
-                0xac => Meter::Aux2(n),
-                0xad => Meter::Bus2(n),
-                0xae => Meter::Main2(n),
-                0xaf => Meter::Matrix2(n),
-                _ => return Err(Error::InvalidData),
-            });
+            let family = family.ok_or(Error::InvalidData)?;
+            meters.push(Meter::from_wire(family, byte + 1).ok_or(Error::InvalidData)?);
         } else {
             return Err(Error::InvalidData);
         }
@@ -649,6 +634,7 @@ pub fn encode_responses_bounded(
 /// Incremental form of [`encode_responses_bounded`] for state visitors and generators.
 pub struct BoundedResponseEncoder {
     payload: Vec<u8>,
+    wire_len: usize,
     max_wire_bytes: usize,
 }
 
@@ -656,8 +642,15 @@ impl BoundedResponseEncoder {
     pub fn new(max_wire_bytes: usize) -> Self {
         Self {
             payload: Vec::new(),
+            // The channel-select prefix.
+            wire_len: 2,
             max_wire_bytes,
         }
+    }
+
+    /// Length of the frame [`Self::finish`] would return now.
+    pub fn wire_len(&self) -> usize {
+        self.wire_len
     }
 
     pub fn push(&mut self, response: &NativeResponse) -> Result<()> {
@@ -685,29 +678,24 @@ impl BoundedResponseEncoder {
                 encoded.extend_from_slice(&body);
             }
         }
-        let next_wire_len =
-            encoded_channel_len(&self.payload).saturating_add(escaped_len(&encoded));
+        let next_wire_len = self.wire_len.saturating_add(escaped_len(&encoded));
         if next_wire_len > self.max_wire_bytes {
             return Err(Error::InvalidInput);
         }
         self.payload.extend_from_slice(&encoded);
+        self.wire_len = next_wire_len;
         Ok(())
     }
 
     pub fn finish(self) -> Result<Vec<u8>> {
-        let wire_len = encoded_channel_len(&self.payload);
-        if wire_len > self.max_wire_bytes {
+        if self.wire_len > self.max_wire_bytes {
             return Err(Error::InvalidInput);
         }
-        let mut wire = Vec::with_capacity(wire_len);
+        let mut wire = Vec::with_capacity(self.wire_len);
         wire.extend_from_slice(&[ESCAPE, CHANNEL_BASE + 1]);
         append_escaped(&mut wire, &self.payload);
         Ok(wire)
     }
-}
-
-fn encoded_channel_len(payload: &[u8]) -> usize {
-    2usize.saturating_add(escaped_len(payload))
 }
 
 fn escaped_len(payload: &[u8]) -> usize {
@@ -717,7 +705,9 @@ fn escaped_len(payload: &[u8]) -> usize {
         .sum()
 }
 
-fn encode_value(payload: &mut Vec<u8>, value: &NativeValue) -> Result<()> {
+/// Append `value`'s unescaped wire token to `payload`. Shared by the server-side response
+/// encoder and the client's `set_*` messages so the two can't drift apart.
+pub(crate) fn encode_value(payload: &mut Vec<u8>, value: &NativeValue) -> Result<()> {
     match value {
         NativeValue::Integer(value) if (0..=0x3f).contains(value) => payload.push(*value as u8),
         NativeValue::Integer(value) if i16::try_from(*value).is_ok() => {

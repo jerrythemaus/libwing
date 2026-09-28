@@ -40,12 +40,13 @@
 //! root-level exports or read confusingly next to them. Call sites use `osc::get_param(..)`,
 //! `osc::WingOscClient`, etc.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
+use std::collections::VecDeque;
 use std::io;
 use std::net::{SocketAddr, ToSocketAddrs, UdpSocket};
 use std::time::{Duration, Instant};
 
-use crate::DiscoveryInfo;
+use crate::{DiscoveryInfo, WingConsole};
 
 /// WING's OSC server always listens here (R3); see the "OSC Remote Protocol" section,
 /// page 19.
@@ -63,6 +64,12 @@ pub const SUBSCRIPTION_EXPIRY: Duration = Duration::from_secs(10);
 /// [`SUBSCRIPTION_EXPIRY`] so a caller polling at a normal rate never brushes the real
 /// 10-second deadline.
 pub const SUBSCRIPTION_RENEW_MARGIN: Duration = Duration::from_secs(5);
+
+/// How many unrelated messages [`WingOscClient`] buffers for
+/// [`take_unsolicited`](WingOscClient::take_unsolicited) before dropping the oldest, so a
+/// caller that never drains it can't grow memory without bound. Drops are counted by
+/// [`take_unsolicited_dropped`](WingOscClient::take_unsolicited_dropped).
+pub const UNSOLICITED_CAP: usize = 1024;
 
 /// `#[non_exhaustive]` (R21) for the same reason as [`crate::Error`]: new failure modes
 /// may be added without that being a breaking change for callers matching with a
@@ -362,6 +369,9 @@ pub fn set_int(path: &str, value: i32) -> Result<OscMessage> {
 
 /// Toggles a 0/1 int parameter (page 22): sending `-1` to an int-typed 0/1 parameter
 /// flips it, saving a read-before-write round-trip.
+///
+/// This is a relative write: applying it twice restores the old value, so
+/// [`WingOscClient::request_with_policy`] never retries it (see [`RequestPolicy`]).
 pub fn toggle(path: &str) -> Result<OscMessage> {
     set_int(path, -1)
 }
@@ -699,17 +709,7 @@ pub fn parse_console_info(msg: &OscMessage) -> Result<DiscoveryInfo> {
             ))
         }
     };
-    let parts: Vec<&str> = payload.split(',').collect();
-    if parts.len() < 6 || parts[0] != "WING" {
-        return Err(OscError::Malformed("unexpected console info payload"));
-    }
-    Ok(DiscoveryInfo {
-        ip: parts[1].to_string(),
-        name: parts[2].to_string(),
-        model: parts[3].to_string(),
-        serial: parts[4].to_string(),
-        firmware: parts[5].to_string(),
-    })
+    DiscoveryInfo::parse(payload).ok_or(OscError::Malformed("unexpected console info payload"))
 }
 
 // ---------------------------------------------------------------------------
@@ -729,10 +729,15 @@ impl Default for RequestPolicy {
 }
 
 /// Retry policy for [`WingOscClient::request_with_policy`] (R75): UDP has no delivery
-/// guarantee, so a request or its reply can simply vanish. Re-sending the same request
-/// is safe for every builder in this module -- gets are idempotent, and a set landing
-/// twice (because the first send's reply was lost, not the send itself) just reapplies
-/// the same value.
+/// guarantee, so a request or its reply can simply vanish. Re-sending is safe for reads
+/// and absolute writes -- gets are idempotent, and a set landing twice (because the first
+/// send's reply was lost, not the send itself) just reapplies the same value.
+///
+/// Relative writes are the exception and are always sent once, whatever the policy says:
+/// a [`toggle`] (`,i -1`, the only relative write the reference documents, page 22)
+/// landing twice flips the parameter back. The message alone can't tell a toggle from
+/// [`set_int`]`(path, -1)` on a parameter whose range includes `-1`, so every single
+/// `,i -1` argument is treated as a toggle; that only costs such a set its retries.
 #[derive(Clone, Copy, Debug)]
 pub struct RequestPolicy {
     pub attempts: u32,
@@ -746,6 +751,44 @@ struct SubscriptionState {
     format: SubscriptionFormat,
     renew_interval: Duration,
     next_renew: Instant,
+}
+
+/// Whether `msg` is a relative write that must never be re-sent (see [`RequestPolicy`]).
+fn is_relative_write(msg: &OscMessage) -> bool {
+    matches!(msg.args.as_slice(), [OscArg::Int(-1)])
+}
+
+/// `addr` without a leading `/%<port>` reply-port prefix (see [`with_reply_port`]).
+fn strip_reply_port(addr: &str) -> &str {
+    if let Some(rest) = addr.strip_prefix("/%") {
+        let digits = rest.bytes().take_while(u8::is_ascii_digit).count();
+        if digits > 0 && rest[digits..].starts_with('/') {
+            return &rest[digits..];
+        }
+    }
+    addr
+}
+
+/// Whether `reply` (an address) answers a request sent to `request`.
+///
+/// - The reply-port prefix is not echoed: page 21 says a `/%<port>` request gets "the
+///   expected reply" on that port, i.e. the plain command's reply, so it is stripped.
+/// - `<addr>*` is a node-set ack; `/*` therefore matches only a root (`/`) request, so a
+///   stray root ack can't satisfy an unrelated get/set.
+/// - A `/#<hash>` request "would return the same data" as its path form (page 21), which
+///   reads as a reply addressed by the plain path. Any path the embedded property map
+///   gives that hash is accepted, as is an exact `/#<hash>` echo. Assumed from the
+///   reference's wording only; no hardware capture has confirmed which form the console
+///   uses. A path the map doesn't know (newer firmware) only matches the exact echo.
+fn reply_matches(request: &str, reply: &str) -> bool {
+    let request = strip_reply_port(request);
+    let reply = reply.strip_suffix('*').unwrap_or(reply);
+    reply == request
+        || request
+            .strip_prefix("/#")
+            .and_then(|hex| u32::from_str_radix(hex, 16).ok())
+            .and_then(|id| WingConsole::id_to_defs_iter(id as i32))
+            .is_some_and(|mut names| names.any(|(name, _)| name == reply))
 }
 
 /// A minimal OSC-over-UDP client (R3, R4, R75). UDP is connectionless, so `connect`
@@ -769,9 +812,12 @@ pub struct WingOscClient {
     /// of `socket`, matching a request built with [`with_reply_port`].
     reply_socket: Option<UdpSocket>,
     /// Messages received by [`request`](Self::request) that didn't match what it was
-    /// waiting for (R75: out-of-order replies), in arrival order. Drained by
-    /// [`take_unsolicited`](Self::take_unsolicited).
-    unsolicited: RefCell<Vec<OscMessage>>,
+    /// waiting for (R75: out-of-order replies), in arrival order, capped at
+    /// [`UNSOLICITED_CAP`]. Drained by [`take_unsolicited`](Self::take_unsolicited).
+    unsolicited: RefCell<VecDeque<OscMessage>>,
+    /// Oldest messages evicted from `unsolicited` since the last
+    /// [`take_unsolicited_dropped`](Self::take_unsolicited_dropped).
+    unsolicited_dropped: Cell<u64>,
     /// Set by [`subscribe`](Self::subscribe); consulted by
     /// [`poll_event`](Self::poll_event) to auto-renew on cadence.
     subscription: RefCell<Option<SubscriptionState>>,
@@ -798,7 +844,8 @@ impl WingOscClient {
             socket,
             target,
             reply_socket: None,
-            unsolicited: RefCell::new(Vec::new()),
+            unsolicited: RefCell::new(VecDeque::new()),
+            unsolicited_dropped: Cell::new(0),
             subscription: RefCell::new(None),
         })
     }
@@ -847,6 +894,16 @@ impl WingOscClient {
         decode(&buf[..n])
     }
 
+    fn buffer_unsolicited(&self, msg: OscMessage) {
+        let mut unsolicited = self.unsolicited.borrow_mut();
+        if unsolicited.len() >= UNSOLICITED_CAP {
+            unsolicited.pop_front();
+            self.unsolicited_dropped
+                .set(self.unsolicited_dropped.get() + 1);
+        }
+        unsolicited.push_back(msg);
+    }
+
     /// Drains any datagrams already sitting in the socket buffer that are exact
     /// duplicates of `matched` (R75: WING or an intervening network can deliver a UDP
     /// reply twice). Anything that isn't an exact duplicate is buffered via
@@ -858,8 +915,9 @@ impl WingOscClient {
         loop {
             match self.recv(Duration::from_millis(1)) {
                 Ok(msg) if msg == *matched => continue,
+                Err(OscError::Malformed(_)) => continue,
                 Ok(msg) => {
-                    self.unsolicited.borrow_mut().push(msg);
+                    self.buffer_unsolicited(msg);
                     break;
                 }
                 Err(_) => break,
@@ -870,34 +928,36 @@ impl WingOscClient {
     /// Sends `msg` and waits up to `timeout` for its reply: a message whose address
     /// equals `msg.addr` (the normal get/set-single-parameter case), or the node-ack
     /// address it implies (`<msg.addr>*`, covering [`node_set_local`]; `/*` covering
-    /// [`node_set_root`], but only when this request was itself a root op).
+    /// [`node_set_root`], but only when this request was itself a root op). A
+    /// [`with_reply_port`] prefix is ignored when matching, and a [`get_param_by_id`]
+    /// request also accepts a reply on the hash's plain path.
     ///
     /// Robustness (R75): anything else received while waiting -- an out-of-order
-    /// unrelated message -- is buffered (arrival order preserved) rather than dropped,
-    /// available via [`take_unsolicited`](Self::take_unsolicited); this mirrors
+    /// unrelated message -- is buffered (arrival order preserved, capped at
+    /// [`UNSOLICITED_CAP`]) rather than dropped, available via
+    /// [`take_unsolicited`](Self::take_unsolicited); this mirrors
     /// [`crate::WingConsole`]'s attended-get pattern. Once the real reply arrives, any
     /// exact duplicate of it already queued behind it is drained and discarded rather
-    /// than left to confuse a subsequent `request` to the same address.
+    /// than left to confuse a subsequent `request` to the same address. A datagram that
+    /// fails to decode is skipped; only a transport error or the deadline ends the wait.
     pub fn request(&self, msg: &OscMessage, timeout: Duration) -> Result<OscMessage> {
         let deadline = Instant::now() + timeout;
         self.send(msg)?;
-        let node_ack_addr = format!("{}*", msg.addr);
         loop {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
                 return Err(OscError::Timeout);
             }
-            let reply = self.recv(remaining)?;
-            // `/*` is the ack for a *root* node op only (msg.addr == "/"); accepting it for
-            // every request would let a stray root-ack satisfy an unrelated get/set. The
-            // per-request `<msg.addr>*` form is already request-specific, so it needs no such
-            // guard.
-            let root_ack = msg.addr == "/" && reply.addr == "/*";
-            if reply.addr == msg.addr || reply.addr == node_ack_addr || root_ack {
+            let reply = match self.recv(remaining) {
+                Ok(reply) => reply,
+                Err(OscError::Malformed(_)) => continue,
+                Err(e) => return Err(e),
+            };
+            if reply_matches(&msg.addr, &reply.addr) {
                 self.drain_duplicate_replies(&reply);
                 return Ok(reply);
             }
-            self.unsolicited.borrow_mut().push(reply);
+            self.buffer_unsolicited(reply);
         }
     }
 
@@ -907,11 +967,18 @@ impl WingOscClient {
     /// `Err(OscError::RetriesExhausted { attempts })` if every attempt times out;
     /// any non-timeout error (e.g. [`OscError::Node`]) is returned immediately without
     /// retrying, since re-sending wouldn't change a console-side rejection.
+    ///
+    /// A relative write ([`toggle`]) is sent exactly once with `policy.timeout_per_attempt`
+    /// and returns a plain [`OscError::Timeout`] if its reply is lost: the client can't
+    /// tell whether the console applied it, and a second toggle would undo it.
     pub fn request_with_policy(
         &self,
         msg: &OscMessage,
         policy: RequestPolicy,
     ) -> Result<OscMessage> {
+        if is_relative_write(msg) {
+            return self.request(msg, policy.timeout_per_attempt);
+        }
         for attempt in 1..=policy.attempts.max(1) {
             match self.request(msg, policy.timeout_per_attempt) {
                 Ok(reply) => return Ok(reply),
@@ -928,9 +995,17 @@ impl WingOscClient {
     }
 
     /// Drains and returns every message [`request`](Self::request) has buffered as
-    /// unrelated/out-of-order traffic since the last call (R75), in arrival order.
+    /// unrelated/out-of-order traffic since the last call (R75), in arrival order. At
+    /// most the newest [`UNSOLICITED_CAP`]; see
+    /// [`take_unsolicited_dropped`](Self::take_unsolicited_dropped) for the rest.
     pub fn take_unsolicited(&self) -> Vec<OscMessage> {
-        std::mem::take(&mut self.unsolicited.borrow_mut())
+        self.unsolicited.borrow_mut().drain(..).collect()
+    }
+
+    /// How many buffered unsolicited messages were dropped (oldest first) because the
+    /// buffer was full, since the last call; resets the count to zero.
+    pub fn take_unsolicited_dropped(&self) -> u64 {
+        self.unsolicited_dropped.take()
     }
 
     /// Subscribes to `format`'s event stream (page 30), auto-renewing every

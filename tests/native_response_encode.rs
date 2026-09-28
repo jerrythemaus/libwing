@@ -1,5 +1,5 @@
 use libwing::native::{encode_responses, BoundedResponseEncoder, NativeResponse, NativeValue};
-use libwing::{FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingNodeDef};
+use libwing::{Error, FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingNodeDef};
 
 fn deframe(wire: &[u8]) -> Vec<u8> {
     assert_eq!(&wire[..2], &[0xdf, 0xd1]);
@@ -142,4 +142,73 @@ fn rejects_incomplete_metadata_instead_of_guessing() {
         def.to_wire_bytes(),
         Err(libwing::Error::InvalidInput)
     ));
+}
+
+fn escape_heavy_responses() -> Vec<NativeResponse> {
+    let mut responses: Vec<NativeResponse> = (0..5000u32)
+        .map(|i| {
+            if i % 1000 == 500 {
+                return NativeResponse::NodeDef(integer_def());
+            }
+            if i % 7 == 0 {
+                return NativeResponse::RequestEnd;
+            }
+            let id = (0xdfdf_0000 | i) as i32;
+            let value = match i % 5 {
+                0 => NativeValue::Integer(0xdf),
+                1 => NativeValue::Integer(i as i32 * 0xdf),
+                2 => NativeValue::Float(f32::from_bits(0xdfdf_dfdf)),
+                3 => NativeValue::String("\u{7ff}".repeat((i % 100) as usize)),
+                _ => NativeValue::RawFloat(i as f32),
+            };
+            if i % 2 == 0 {
+                NativeResponse::NodeData { id, value }
+            } else {
+                NativeResponse::AuthoritativeEvent { id, value }
+            }
+        })
+        .collect();
+    responses.push(NativeResponse::NodeData {
+        id: 0xdf,
+        value: NativeValue::Integer(0xdf),
+    });
+    responses
+}
+
+#[test]
+fn bounded_encoder_running_length_matches_the_frame_across_thousands_of_escaped_responses() {
+    let responses = escape_heavy_responses();
+    let mut encoder = BoundedResponseEncoder::new(usize::MAX);
+    let mut expected_payload = Vec::new();
+    for response in &responses {
+        encoder.push(response).unwrap();
+        let single = encode_responses(std::slice::from_ref(response)).unwrap();
+        expected_payload.extend(deframe(&single));
+        let expected_len = 2 + expected_payload.len() + bytecount(&expected_payload, 0xdf);
+        assert_eq!(encoder.wire_len(), expected_len);
+    }
+    let wire = encoder.finish().unwrap();
+    assert_eq!(
+        wire.len(),
+        2 + expected_payload.len() + bytecount(&expected_payload, 0xdf)
+    );
+    assert_eq!(deframe(&wire), expected_payload);
+
+    let mut exact = BoundedResponseEncoder::new(wire.len());
+    for response in &responses {
+        exact.push(response).unwrap();
+    }
+    assert_eq!(exact.finish().unwrap(), wire);
+
+    let (last, head) = responses.split_last().unwrap();
+    let mut short = BoundedResponseEncoder::new(wire.len() - 1);
+    for response in head {
+        short.push(response).unwrap();
+    }
+    assert!(matches!(short.push(last), Err(Error::InvalidInput)));
+    assert_eq!(short.finish().unwrap(), encode_responses(head).unwrap());
+}
+
+fn bytecount(bytes: &[u8], needle: u8) -> usize {
+    bytes.iter().filter(|&&byte| byte == needle).count()
 }

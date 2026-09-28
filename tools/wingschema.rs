@@ -172,6 +172,19 @@ fn push_entry(raw: &mut Vec<u8>, flag: u8, fullname: &str, def_bytes: &[u8]) {
     raw.extend_from_slice(def_bytes);
 }
 
+/// Number of `push_entry` records in `raw`.
+fn count_entries(raw: &[u8]) -> usize {
+    let (mut i, mut count) = (0, 0);
+    while i < raw.len() {
+        let namelen = u16::from_be_bytes([raw[i + 1], raw[i + 2]]) as usize;
+        i += 3 + namelen;
+        let deflen = u16::from_be_bytes([raw[i], raw[i + 1]]) as usize;
+        i += 2 + deflen;
+        count += 1;
+    }
+    count
+}
+
 /// Write the `propmap.rs` source that embeds `raw` as a `NAME_TO_DEF` lazy static.
 /// The loader emitted here must stay in lockstep with the one already compiled
 /// into `src/propmap.rs` (and `src/empty-propmap.rs`'s empty fallback).
@@ -185,7 +198,12 @@ fn write_propmap_rs(rust_file: &mut impl Write, raw: &[u8]) -> std::io::Result<(
         rust_file,
         "    pub static ref NAME_TO_DEF: HashMap<String, WingNodeDef> = {{"
     )?;
-    writeln!(rust_file, "        let mut m = HashMap::new();")?;
+    // Size the map up front: ~70k entries would otherwise rehash repeatedly at startup.
+    writeln!(
+        rust_file,
+        "        let mut m = HashMap::with_capacity({});",
+        count_entries(raw)
+    )?;
     write!(rust_file, "        let d = b\"")?;
     for b in raw {
         write!(rust_file, "\\x{:02X}", b)?;

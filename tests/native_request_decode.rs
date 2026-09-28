@@ -217,3 +217,132 @@ fn rejects_named_path_byte_flood_and_recovers_after_automatic_reset() {
         })
     );
 }
+
+#[test]
+fn rejects_batch_request_flood_and_recovers_after_automatic_reset() {
+    let limits = NativeLimits {
+        max_batch_requests: 2,
+        ..NativeLimits::default()
+    };
+    let mut decoder = NativeRequestDecoder::new(limits);
+
+    // KeepAlive plus three Gets is four requests from one push.
+    assert!(matches!(
+        decoder.push(&framed(1, &[0xd7, 0, 0, 0, 1, 0xdc, 0xdc, 0xdc])),
+        Err(Error::InvalidData)
+    ));
+
+    let requests = decoder.push(&framed(1, &[0xd7, 0, 0, 0, 2, 0xdc])).unwrap();
+    assert_eq!(
+        requests,
+        vec![
+            NativeRequest::KeepAlive { channel: 1 },
+            NativeRequest::Get { id: 2 },
+        ]
+    );
+}
+
+#[test]
+fn rejects_meter_entry_flood_and_recovers_after_automatic_reset() {
+    let limits = NativeLimits {
+        max_meter_entries: 2,
+        ..NativeLimits::default()
+    };
+    let mut decoder = NativeRequestDecoder::new(limits);
+
+    assert!(matches!(
+        decoder.push(&framed(
+            3,
+            &[0xd3, 0, 1, 0xd4, 0, 0, 0, 1, 0xdc, 0xa0, 0, 1, 2, 0xde],
+        )),
+        Err(Error::InvalidData)
+    ));
+
+    let requests = decoder
+        .push(&framed(
+            3,
+            &[0xd3, 0, 1, 0xd4, 0, 0, 0, 1, 0xdc, 0xa0, 0, 1, 0xde],
+        ))
+        .unwrap();
+    assert_eq!(
+        requests.last(),
+        Some(&NativeRequest::MeterSubscribe {
+            port: 1,
+            report_id: 1,
+            meters: vec![Meter::Channel(1), Meter::Channel(2)],
+        })
+    );
+    decoder.finish().unwrap();
+}
+
+/// Many requests of every token family, with escaped bytes in ids, values,
+/// strings, and report ids.
+fn mixed_stream() -> Vec<u8> {
+    let mut wire = Vec::new();
+    for i in 0..400u32 {
+        let mut audio = vec![0xd7];
+        audio.extend((0xdf00_00df ^ i).to_be_bytes());
+        audio.extend([
+            0xdc, 0xd4, 0xdf, 0, 0, 0xdf, 0xd5, 0x3f, 0x80, 0, 0, 0xd8, 0xd9, 0xdf,
+        ]);
+        audio.extend([0x82, b'a', 0xdf, 0xbf, 0xd0, 7]);
+        audio.extend([0xd1, 69]);
+        audio.extend([b'x'; 70]);
+        audio.extend([
+            0xda, 0xc1, b'c', b'h', 0xd2, 0, i as u8, 0xdd, 0xdb, 0xdc, 0xea,
+        ]);
+        wire.extend(framed(1, &audio));
+        wire.extend(framed(
+            3,
+            &[
+                0xd3, 0x37, 0xdf, 0xd4, 0, 0, 0, i as u8, 0xdc, 0xa0, 0, 1, 0xa9, 0xde, 0xd4, 0, 0,
+                0xdf, 1,
+            ],
+        ));
+    }
+    // A channel select resolves the trailing meter renewal.
+    wire.extend(framed(1, &[0xda, 0xdc]));
+    wire
+}
+
+fn decode_in_chunks(wire: &[u8], mut next_len: impl FnMut() -> usize) -> Vec<NativeRequest> {
+    let limits = NativeLimits {
+        max_batch_requests: usize::MAX,
+        ..NativeLimits::default()
+    };
+    let mut decoder = NativeRequestDecoder::new(limits);
+    let mut requests = Vec::new();
+    let mut rest = wire;
+    while !rest.is_empty() {
+        let (chunk, tail) = rest.split_at(next_len().min(rest.len()));
+        requests.extend(decoder.push(chunk).unwrap());
+        rest = tail;
+    }
+    decoder.finish().unwrap();
+    requests
+}
+
+#[test]
+fn decodes_a_large_stream_identically_whole_bytewise_and_in_random_chunks() {
+    let wire = mixed_stream();
+    let whole = decode_in_chunks(&wire, || usize::MAX);
+    assert_eq!(
+        whole
+            .iter()
+            .filter(|request| matches!(request, NativeRequest::MeterRenew { report_id: 0xdf01 }))
+            .count(),
+        400
+    );
+    assert!(whole.contains(&NativeRequest::Set {
+        id: 0xdf00_00df_u32 as i32,
+        value: NativeValue::String("a\u{7ff}".to_owned()),
+    }));
+
+    assert_eq!(decode_in_chunks(&wire, || 1), whole);
+    let mut seed = 0x2545_f491_u32;
+    let random = decode_in_chunks(&wire, || {
+        seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+        (seed >> 24) as usize % 97 + 1
+    });
+    assert_eq!(random, whole);
+}

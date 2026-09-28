@@ -321,15 +321,12 @@ impl LiveSchema {
     /// fullname (synthesized from parent path where possible). Returns the
     /// number of definitions ingested.
     ///
-    /// `timeout` bounds the wall-clock time this call is willing to wait
-    /// *between* reads; it's checked before each `WingConsole::read()` call,
-    /// not during one. `WingConsole::read()` itself has no read-timeout of
-    /// its own -- it blocks until data arrives, sending keep-alives as
-    /// needed -- so a console that never replies to this request (versus one
-    /// that replies slowly) can still block past `timeout` on a single
-    /// stalled read. That matches `read()`'s existing behavior elsewhere in
-    /// this crate; tightening it is future work if it proves necessary in
-    /// practice.
+    /// `timeout` bounds the whole call, including a read the console never
+    /// answers: each read waits only for what is left of it, then the call
+    /// returns [`Error::Timeout`]. `NodeData` interleaved with the definition
+    /// stream is not part of the refresh; it is handed back to the console's
+    /// pending queue when the call returns, so the next `read()` still
+    /// delivers it.
     pub fn refresh_subtree(
         &mut self,
         console: &mut WingConsole,
@@ -340,25 +337,24 @@ impl LiveSchema {
         console.request_node_definition(subtree_root_id)?;
 
         let mut count = 0;
-        loop {
-            if Instant::now() >= deadline {
-                return Err(Error::Timeout);
+        let mut interleaved = Vec::new();
+        let result = loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break Err(Error::Timeout);
             }
-            match console.read()? {
-                WingResponse::NodeDef(def) => {
+            match console.read_timeout(remaining) {
+                Ok(WingResponse::NodeDef(def)) => {
                     self.apply_node_def(&def, None);
                     count += 1;
                 }
-                WingResponse::RequestEnd => return Ok(count),
-                WingResponse::NodeData(..) => {
-                    // Unsolicited data interleaved with the definition stream
-                    // (e.g. from another in-flight request); not part of this
-                    // refresh, so it's dropped here rather than buffered --
-                    // callers needing both should use the attended-get layer
-                    // (U4) instead of a raw refresh.
-                }
+                Ok(WingResponse::RequestEnd) => break Ok(count),
+                Ok(data @ WingResponse::NodeData(..)) => interleaved.push(data),
+                Err(err) => break Err(err),
             }
-        }
+        };
+        console.requeue(interleaved);
+        result
     }
 }
 

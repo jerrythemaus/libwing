@@ -1,11 +1,11 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use crate::native::{ChannelDecoder, ChannelEvent};
+use crate::native::{ChannelDecoder, ChannelEvent, NativeValue};
 use crate::node::{NodeType, WingNodeData, WingNodeDef};
 use crate::propmap::NAME_TO_DEF;
 use crate::{Error, Result, WingResponse};
@@ -79,6 +79,58 @@ pub enum Meter {
     Matrix2(u8),
 }
 
+impl Meter {
+    /// `(opcode, index, max)`: the family's wire opcode, the 1-based index (0 for the
+    /// index-less `Monitor`/`Rta`), and the family's largest valid index. The single source
+    /// for the family table: subscribe encoding, the server-side subscribe decoder, and the C
+    /// API's meter ids all go through this and [`from_wire`](Self::from_wire).
+    pub(crate) fn wire(self) -> (u8, u8, u8) {
+        match self {
+            Meter::Channel(n) => (0xa0, n, 40),
+            Meter::Aux(n) => (0xa1, n, 8),
+            Meter::Bus(n) => (0xa2, n, 16),
+            Meter::Main(n) => (0xa3, n, 4),
+            Meter::Matrix(n) => (0xa4, n, 8),
+            Meter::Dca(n) => (0xa5, n, 16),
+            Meter::Fx(n) => (0xa6, n, 16),
+            Meter::Source(n) => (0xa7, n, 16),
+            Meter::Output(n) => (0xa8, n, 11),
+            Meter::Monitor => (0xa9, 0, 0),
+            Meter::Rta => (0xaa, 0, 0),
+            Meter::Channel2(n) => (0xab, n, 40),
+            Meter::Aux2(n) => (0xac, n, 8),
+            Meter::Bus2(n) => (0xad, n, 16),
+            Meter::Main2(n) => (0xae, n, 4),
+            Meter::Matrix2(n) => (0xaf, n, 8),
+        }
+    }
+
+    /// Inverse of [`wire`](Self::wire) for a family opcode and 1-based index. The index is not
+    /// range-checked here (encoding does that); `None` for an unknown opcode or a nonzero index
+    /// on `Monitor`/`Rta`.
+    pub(crate) fn from_wire(opcode: u8, index: u8) -> Option<Self> {
+        Some(match opcode {
+            0xa0 => Meter::Channel(index),
+            0xa1 => Meter::Aux(index),
+            0xa2 => Meter::Bus(index),
+            0xa3 => Meter::Main(index),
+            0xa4 => Meter::Matrix(index),
+            0xa5 => Meter::Dca(index),
+            0xa6 => Meter::Fx(index),
+            0xa7 => Meter::Source(index),
+            0xa8 => Meter::Output(index),
+            0xa9 if index == 0 => Meter::Monitor,
+            0xaa if index == 0 => Meter::Rta,
+            0xab => Meter::Channel2(index),
+            0xac => Meter::Aux2(index),
+            0xad => Meter::Bus2(index),
+            0xae => Meter::Main2(index),
+            0xaf => Meter::Matrix2(index),
+            _ => return None,
+        })
+    }
+}
+
 lazy_static::lazy_static! {
     static ref ID_TO_NAME: HashMap<i32, Vec<&'static str>> = {
         let mut id2name = HashMap::<i32, Vec<&'static str>>::new();
@@ -94,6 +146,23 @@ const DATA_KEEP_ALIVE_SECONDS: u64 = 7;
 const METERS_KEEP_ALIVE_SECONDS: u64 = 3;
 const WRITE_TIMEOUT_SECONDS: u64 = 5;
 const MAX_NODE_DEF_BYTES: usize = 1024 * 1024;
+/// The Native channel carrying parameter traffic; bytes on any other channel are not
+/// Audio Engine tokens and are dropped by the reader.
+const AUDIO_ENGINE_CHANNEL: u8 = 1;
+/// Most unrelated responses an attended get buffers while it waits for its target. Far
+/// above any legitimate interleave; a peer that floods past it fails the call closed
+/// ([`Error::InvalidData`]) instead of growing client memory until the deadline.
+const MAX_ATTENDED_BUFFERED: usize = 64 * 1024;
+/// Receive buffer for one meter datagram: a 4-byte header plus big-endian i16 samples.
+const METER_FRAME_BYTES: usize = 8192;
+/// Most samples one meter datagram can carry.
+pub(crate) const MAX_METER_SAMPLES: usize = (METER_FRAME_BYTES - 4) / 2;
+
+fn meter_samples(bytes: &[u8]) -> impl Iterator<Item = i16> + '_ {
+    bytes
+        .chunks_exact(2)
+        .map(|chunk| i16::from_be_bytes([chunk[0], chunk[1]]))
+}
 /// UDP port a WING answers `WING?` discovery and firmware probes on.
 const DISCOVERY_PORT: u16 = 2222;
 /// Upper bound for one de-escaped Native response and for a raw binary-node capture.
@@ -111,7 +180,10 @@ fn ensure_native_response_capacity(len: usize) -> Result<()> {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiscoveryInfo {
+    /// From [`WingConsole::scan`]: the source address of the reply datagram, not the address
+    /// the reply claims for itself, which any host on the LAN can set to anything.
     pub ip: String,
     pub name: String,
     pub model: String,
@@ -119,8 +191,37 @@ pub struct DiscoveryInfo {
     pub firmware: String,
 }
 
+impl DiscoveryInfo {
+    /// Parses a `WING,<ip>,<name>,<model>,<serial>,<firmware>` reply body (the UDP discovery
+    /// reply and the OSC `/?` reply share it). `ip` is the reply's self-asserted address.
+    pub(crate) fn parse(reply: &str) -> Option<Self> {
+        let mut tokens = reply.split(',');
+        if tokens.next()? != "WING" {
+            return None;
+        }
+        Some(Self {
+            ip: tokens.next()?.to_string(),
+            name: tokens.next()?.to_string(),
+            model: tokens.next()?.to_string(),
+            serial: tokens.next()?.to_string(),
+            firmware: tokens.next()?.to_string(),
+        })
+    }
+
+    /// [`parse`](Self::parse) for a discovery datagram that arrived from `from`. The claimed
+    /// ip is replaced by the datagram source, so a responder can only ever point a client at
+    /// itself, never at a third host.
+    fn from_datagram(payload: &[u8], from: IpAddr) -> Option<Self> {
+        let mut info = Self::parse(std::str::from_utf8(payload).ok()?)?;
+        info.ip = from.to_string();
+        Some(info)
+    }
+}
+
 pub struct Meters {
-    pub socket: UdpSocket,
+    /// Shared so `read_meters` can wait on it without holding the meter-state lock, which
+    /// `keep_alive_meters`/`request_meter` on other clones need.
+    pub socket: Arc<UdpSocket>,
     pub port: u16,
 }
 
@@ -191,6 +292,9 @@ struct _WingConsoleMain {
     /// Decoded bytes replayed after a bounded read timed out mid-response. `read_timeout` is
     /// cancellation-safe: bytes already removed from the transport are never discarded.
     replay: VecDeque<(i8, u8)>,
+    /// Whole responses already read off the wire but not yet delivered: an attended get that
+    /// times out hands back what it buffered, and the next `read()` returns these first.
+    pending: VecDeque<WingResponse>,
     read_capture: Vec<(i8, u8)>,
     current_node_id: i32,
     /// Overall deadline for an in-flight attended-get operation (R16/R17), consulted by
@@ -207,6 +311,10 @@ struct _WingConsoleMain {
 
 struct _WingConsoleMeters {
     meters: Option<Meters>,
+    /// The one subscription the meter keepalive renews: the most recent successful
+    /// `request_meter` on this session. Earlier subscriptions are left to lapse.
+    active_meter_id: Option<u16>,
+    /// Report id for the next `request_meter`; wraps, skipping 0.
     next_meter_id: u16,
     keep_alive_meters_timer: std::time::Instant,
 }
@@ -242,6 +350,9 @@ pub struct WingConsole {
     reconnecting: Arc<AtomicBool>,
     /// Clones waiting on `reconnect_gate`; a `dump_subtree` sweep yields to them.
     pending_reconnects: Arc<AtomicUsize>,
+    /// Bumped by every successful reconnect, so a clone that queued behind another clone's
+    /// reconnect can see the session was already replaced and skip a second handshake.
+    session_generation: Arc<AtomicU64>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
     has_meter_socket: Arc<AtomicBool>,
     peer_ip: IpAddr,
@@ -260,35 +371,49 @@ pub struct WingConsole {
 }
 
 impl WingConsole {
+    /// Broadcasts `WING?` and collects replies for up to 5 s. Each console is listed once
+    /// (by source address and serial), however many rebroadcasts it answers.
     pub fn scan(stop_on_first: bool) -> Result<Vec<DiscoveryInfo>> {
         let dsock = UdpSocket::bind("0.0.0.0:0")?;
         dsock.set_broadcast(true)?;
+        Self::scan_on(
+            &dsock,
+            SocketAddr::from(([255, 255, 255, 255], DISCOVERY_PORT)),
+            stop_on_first,
+            Duration::from_secs(5),
+        )
+    }
+
+    fn scan_on(
+        dsock: &UdpSocket,
+        target: SocketAddr,
+        stop_on_first: bool,
+        window: Duration,
+    ) -> Result<Vec<DiscoveryInfo>> {
         dsock.set_read_timeout(Some(Duration::from_millis(500)))?;
 
-        let mut results = Vec::new();
+        let mut results: Vec<DiscoveryInfo> = Vec::new();
         let mut attempts = 0;
-        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + window;
         let mut packets_seen = 0;
 
-        dsock.send_to(b"WING?", "255.255.255.255:2222")?;
+        dsock.send_to(b"WING?", target)?;
         while attempts < 10 && packets_seen < 100 && std::time::Instant::now() < deadline {
             let mut buf = [0u8; 1024];
             match dsock.recv_from(&mut buf) {
-                Ok((received, _)) => {
+                Ok((received, from)) => {
                     packets_seen += 1;
-                    if let Ok(response) = String::from_utf8(buf[..received].to_vec()) {
-                        let tokens: Vec<&str> = response.split(',').collect();
-                        if tokens.len() >= 6 && tokens[0] == "WING" {
-                            results.push(DiscoveryInfo {
-                                ip: tokens[1].to_string(),
-                                name: tokens[2].to_string(),
-                                model: tokens[3].to_string(),
-                                serial: tokens[4].to_string(),
-                                firmware: tokens[5].to_string(),
-                            });
-                            if stop_on_first {
-                                break;
-                            }
+                    let Some(info) = DiscoveryInfo::from_datagram(&buf[..received], from.ip())
+                    else {
+                        continue;
+                    };
+                    if !results
+                        .iter()
+                        .any(|seen| seen.ip == info.ip && seen.serial == info.serial)
+                    {
+                        results.push(info);
+                        if stop_on_first {
+                            break;
                         }
                     }
                 }
@@ -297,7 +422,7 @@ impl WingConsole {
                     // Re-broadcast the probe on each receive timeout. UDP broadcast is
                     // unreliable; sending "WING?" only once means a single dropped packet
                     // yields an empty scan even though a console is present.
-                    let _ = dsock.send_to(b"WING?", "255.255.255.255:2222");
+                    let _ = dsock.send_to(b"WING?", target);
                 }
             }
         }
@@ -383,21 +508,25 @@ impl WingConsole {
     /// broadcast reachability. Non-fatal by design (R37): any failure --
     /// socket error, timeout, malformed reply -- yields `None` rather than
     /// failing `connect()` or guessing a firmware value.
+    ///
+    /// Only a reply from `ip` itself counts: datagrams from any other host are ignored, so
+    /// a LAN host cannot inject the firmware string that drives newer-firmware warnings.
     fn probe_firmware(ip: IpAddr, port: u16) -> Option<String> {
         let dsock = UdpSocket::bind("0.0.0.0:0").ok()?;
-        dsock
-            .set_read_timeout(Some(Duration::from_millis(300)))
-            .ok()?;
         dsock.send_to(b"WING?", (ip, port)).ok()?;
 
+        let deadline = Instant::now() + Duration::from_millis(300);
         let mut buf = [0u8; 1024];
-        let (received, _) = dsock.recv_from(&mut buf).ok()?;
-        let response = String::from_utf8(buf[..received].to_vec()).ok()?;
-        let tokens: Vec<&str> = response.split(',').collect();
-        if tokens.len() >= 6 && tokens[0] == "WING" {
-            Some(tokens[5].to_string())
-        } else {
-            None
+        loop {
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            dsock
+                .set_read_timeout(Some(remaining.max(Duration::from_millis(1))))
+                .ok()?;
+            let (received, from) = dsock.recv_from(&mut buf).ok()?;
+            if from.ip() == ip {
+                return DiscoveryInfo::from_datagram(&buf[..received], ip)
+                    .map(|info| info.firmware);
+            }
         }
     }
 
@@ -453,10 +582,11 @@ impl WingConsole {
                 // Captured/test transports historically pass an already-selected
                 // Audio Engine payload. Starting on channel 1 preserves that API;
                 // a real stream's handshake selection simply selects it again.
-                rx_channels: ChannelDecoder::with_channel(1)
+                rx_channels: ChannelDecoder::with_channel(AUDIO_ENGINE_CHANNEL)
                     .expect("Audio Engine is a valid Native channel"),
                 rx_events: VecDeque::new(),
                 replay: VecDeque::new(),
+                pending: VecDeque::new(),
                 read_capture: Vec::new(),
                 current_node_id: 0,
                 op_deadline: None,
@@ -466,11 +596,13 @@ impl WingConsole {
             reconnect_gate: Arc::new(Mutex::new(())),
             reconnecting: Arc::new(AtomicBool::new(false)),
             pending_reconnects: Arc::new(AtomicUsize::new(0)),
+            session_generation: Arc::new(AtomicU64::new(0)),
             mtrs: Arc::new(Mutex::new(_WingConsoleMeters {
                 keep_alive_meters_timer: std::time::Instant::now()
                     + std::time::Duration::from_secs(METERS_KEEP_ALIVE_SECONDS),
                 meters: None,
-                next_meter_id: 0,
+                active_meter_id: None,
+                next_meter_id: 1,
             })),
             has_meter_socket: Arc::new(AtomicBool::new(false)),
             peer_ip,
@@ -496,16 +628,32 @@ impl WingConsole {
     /// with it; see [`SessionGap::meters_invalidated`] -- callers must call
     /// [`request_meter`](Self::request_meter) again to resume metering.
     ///
+    /// Concurrent calls on several clones are coalesced: a call that had to wait for another
+    /// clone's reconnect to finish returns that session instead of replacing it again, with
+    /// [`ReconnectOutcome::attempts`] `== 0`.
+    ///
     /// Returns `Err(Error::InvalidInput)` immediately for a console built via
     /// [`from_transports`](Self::from_transports) -- there's no real peer to reconnect to.
     pub fn reconnect(&mut self, policy: &ReconnectPolicy) -> Result<ReconnectOutcome> {
         if !self.reconnectable {
             return Err(Error::InvalidInput);
         }
+        let generation = self.session_generation.load(Ordering::Acquire);
         let reconnect_gate = self.reconnect_gate.clone();
         self.pending_reconnects.fetch_add(1, Ordering::AcqRel);
         let _reconnect_guard = reconnect_gate.lock_recover();
         self.pending_reconnects.fetch_sub(1, Ordering::AcqRel);
+        let gap = |console: &Self| SessionGap {
+            dropped_events: true,
+            meters_invalidated: console.has_meter_socket.load(Ordering::Acquire),
+            state_may_have_changed: true,
+        };
+        if self.session_generation.load(Ordering::Acquire) != generation {
+            return Ok(ReconnectOutcome {
+                attempts: 0,
+                gap: gap(self),
+            });
+        }
         let addr = SocketAddr::new(self.peer_ip, self.peer_port);
         let mut backoff = policy.initial_backoff;
         let mut last_err = Error::ConnectionError;
@@ -533,10 +681,11 @@ impl WingConsole {
                         *old_reader = Box::new(rsock);
                         main.rx_buf_tail = 0;
                         main.rx_buf_size = 0;
-                        main.rx_channels = ChannelDecoder::with_channel(1)
+                        main.rx_channels = ChannelDecoder::with_channel(AUDIO_ENGINE_CHANNEL)
                             .expect("Audio Engine is a valid Native channel");
                         main.rx_events.clear();
                         main.replay.clear();
+                        main.pending.clear();
                         main.read_capture.clear();
                         main.capture = None;
                         main.current_node_id = 0;
@@ -544,18 +693,18 @@ impl WingConsole {
                         main.keep_alive_timer =
                             Instant::now() + Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
                     }
+                    // The subscription died with the old session; stop renewing its id on the
+                    // new one. Taken on its own, never under a socket lock (the keepalive
+                    // takes `mtrs` before `wsock`).
+                    self.mtrs.lock_recover().active_meter_id = None;
                     if firmware.is_some() {
                         *self.firmware.lock_recover() = firmware;
                     }
+                    self.session_generation.fetch_add(1, Ordering::AcqRel);
                     self.reconnecting.store(false, Ordering::Release);
-                    let meters_invalidated = self.has_meter_socket.load(Ordering::Acquire);
                     return Ok(ReconnectOutcome {
                         attempts: attempt,
-                        gap: SessionGap {
-                            dropped_events: true,
-                            meters_invalidated,
-                            state_may_have_changed: true,
-                        },
+                        gap: gap(self),
                     });
                 }
                 Err(err) => {
@@ -586,6 +735,9 @@ impl WingConsole {
         }
         let previous_node_id = {
             let mut main = self.main.lock_recover();
+            if let Some(response) = main.pending.pop_front() {
+                return Ok(response);
+            }
             main.read_capture.clear();
             main.current_node_id
         };
@@ -636,12 +788,12 @@ impl WingConsole {
                     WingNodeData::with_string(v),
                 ));
             } else if cmd <= 0xcf {
+                // Node-name selector (navigation), not a value: consume its bytes to stay
+                // framed, as `parse_binary_values` and the request decoder do.
                 let len = cmd - 0xc0 + 1;
-                let v = self.read_string(&mut main, ch, len as usize, &mut raw)?;
-                return Ok(WingResponse::NodeData(
-                    main.current_node_id,
-                    WingNodeData::with_string(v),
-                ));
+                for _ in 0..len {
+                    self.decode_next(&mut main, &mut raw)?;
+                }
             } else if cmd == 0xd0 {
                 let v = String::new();
                 return Ok(WingResponse::NodeData(
@@ -824,15 +976,13 @@ impl WingConsole {
         if m.keep_alive_meters_timer <= std::time::Instant::now() {
             // println!("keep_alive_meters");
             let meters = m.meters.as_ref().ok_or(Error::MeterNotInitialized)?;
-            let mut i = m.next_meter_id as i32;
-            while i > 0 {
+            if let Some(id) = m.active_meter_id {
                 let mut keepalive = vec![0xdf, 0xd3, 0xd4];
-                Self::extend_escaped(&mut keepalive, &(i as u16).to_be_bytes());
+                Self::extend_escaped(&mut keepalive, &id.to_be_bytes());
                 Self::extend_escaped(&mut keepalive, &meters.port.to_be_bytes());
                 keepalive.push(0xdf);
                 keepalive.push(0xd1);
-                self.wsock.clone().lock_recover().write_all(&keepalive)?;
-                i -= 1;
+                self.wsock.lock_recover().write_all(&keepalive)?;
             }
             m.keep_alive_meters_timer = std::time::Instant::now()
                 + std::time::Duration::from_secs(METERS_KEEP_ALIVE_SECONDS);
@@ -869,10 +1019,12 @@ impl WingConsole {
                 return Ok((channel, value));
             }
             while let Some(event) = r.rx_events.pop_front() {
-                if let ChannelEvent::Data(channel, value) = event {
+                // Only Audio Engine bytes are parameter tokens; anything the console sends
+                // on another channel would desync the parser if read as one.
+                if let ChannelEvent::Data(AUDIO_ENGINE_CHANNEL, value) = event {
                     ensure_native_response_capacity(r.read_capture.len())?;
                     raw.push(value);
-                    let decoded = (channel as i8, value);
+                    let decoded = (AUDIO_ENGINE_CHANNEL as i8, value);
                     r.read_capture.push(decoded);
                     return Ok(decoded);
                 }
@@ -959,39 +1111,17 @@ impl WingConsole {
     /// channels 2 and 4 landing at decoded slots 1 and 3. Subtract 1 here, once, so every caller
     /// can keep using the 1-based convention the rest of this crate and wing-core already assume.
     fn encode_meter(buf: &mut Vec<u8>, meter: &Meter) -> Result<()> {
-        let indexed = match meter {
-            Meter::Channel(n) => Some((0xa0, *n, 40)),
-            Meter::Aux(n) => Some((0xa1, *n, 8)),
-            Meter::Bus(n) => Some((0xa2, *n, 16)),
-            Meter::Main(n) => Some((0xa3, *n, 4)),
-            Meter::Matrix(n) => Some((0xa4, *n, 8)),
-            Meter::Dca(n) => Some((0xa5, *n, 16)),
-            Meter::Fx(n) => Some((0xa6, *n, 16)),
-            Meter::Source(n) => Some((0xa7, *n, 16)),
-            Meter::Output(n) => Some((0xa8, *n, 11)),
-            Meter::Monitor => {
-                buf.push(0xa9);
-                None
-            }
-            Meter::Rta => {
-                buf.push(0xaa);
-                None
-            }
-            Meter::Channel2(n) => Some((0xab, *n, 40)),
-            Meter::Aux2(n) => Some((0xac, *n, 8)),
-            Meter::Bus2(n) => Some((0xad, *n, 16)),
-            Meter::Main2(n) => Some((0xae, *n, 4)),
-            Meter::Matrix2(n) => Some((0xaf, *n, 8)),
-        };
-
-        if let Some((opcode, n, max)) = indexed {
-            let index = n
-                .checked_sub(1)
-                .filter(|_| n <= max)
-                .ok_or(Error::InvalidInput)?;
+        let (opcode, n, max) = meter.wire();
+        if max == 0 {
             buf.push(opcode);
-            Self::push_escaped(buf, index);
+            return Ok(());
         }
+        let index = n
+            .checked_sub(1)
+            .filter(|_| n <= max)
+            .ok_or(Error::InvalidInput)?;
+        buf.push(opcode);
+        Self::push_escaped(buf, index);
         Ok(())
     }
 
@@ -1049,22 +1179,41 @@ impl WingConsole {
     /// `Error::Timeout` once `deadline` passes -- enforced primarily inside `decode_next`
     /// (which bounds the underlying socket read), with a check here too so a run of
     /// already-buffered bytes that never matches can't loop forever without ever touching
-    /// the socket again.
+    /// the socket again. On that timeout the buffered responses go back to the front of
+    /// the pending queue, so the next `read()` still delivers them. More than
+    /// [`MAX_ATTENDED_BUFFERED`] unrelated responses fail with [`Error::InvalidData`].
     fn attended_read_until<T>(
         &mut self,
         deadline: Instant,
         matcher: impl Fn(WingResponse) -> std::result::Result<T, Box<WingResponse>>,
     ) -> Result<(T, Vec<WingResponse>)> {
         let mut buffered = Vec::new();
-        loop {
-            let resp = self.read_locked()?;
+        let result = loop {
+            let resp = match self.read_locked() {
+                Ok(resp) => resp,
+                Err(err) => break Err(err),
+            };
             match matcher(resp) {
                 Ok(matched) => return Ok((matched, buffered)),
+                Err(_) if buffered.len() >= MAX_ATTENDED_BUFFERED => break Err(Error::InvalidData),
                 Err(unrelated) => buffered.push(*unrelated),
             }
             if Instant::now() >= deadline {
-                return Err(Error::Timeout);
+                break Err(Error::Timeout);
             }
+        };
+        if matches!(result, Err(Error::Timeout)) {
+            self.requeue(buffered);
+        }
+        result
+    }
+
+    /// Puts responses already read off the wire back in front of the pending queue, in
+    /// order, so the next `read()` on any clone delivers them before anything newer.
+    pub(crate) fn requeue(&self, responses: Vec<WingResponse>) {
+        let mut main = self.main.lock_recover();
+        for resp in responses.into_iter().rev() {
+            main.pending.push_front(resp);
         }
     }
 
@@ -1155,29 +1304,23 @@ impl WingConsole {
 
         let mtrsptr = self.mtrs.clone();
         let mut mtrs = mtrsptr.lock_recover();
-        mtrs.next_meter_id = mtrs
-            .next_meter_id
-            .checked_add(1)
-            .ok_or(Error::InvalidInput)?;
-        if mtrs.next_meter_id == 0 {
-            return Err(Error::InvalidInput);
-        }
+        let id = mtrs.next_meter_id.max(1);
 
         if mtrs.meters.is_none() {
             let socket = UdpSocket::bind("0.0.0.0:0")?;
             let port = socket.local_addr()?.port();
-            socket.set_read_timeout(Some(Duration::from_millis(1000)))?;
-            mtrs.meters = Some(Meters { socket, port });
+            mtrs.meters = Some(Meters {
+                socket: Arc::new(socket),
+                port,
+            });
             self.has_meter_socket.store(true, Ordering::Release);
-        } else {
-            self._keep_alive_meters(&mut mtrs)?;
         }
         let md = mtrs.meters.as_ref().ok_or(Error::MeterNotInitialized)?;
 
         let mut buf = vec![0xdf, 0xd3, 0xd3];
         Self::extend_escaped(&mut buf, &md.port.to_be_bytes());
         buf.push(0xd4);
-        Self::extend_escaped(&mut buf, &mtrs.next_meter_id.to_be_bytes());
+        Self::extend_escaped(&mut buf, &id.to_be_bytes());
         Self::extend_escaped(&mut buf, &md.port.to_be_bytes());
         buf.push(0xdc);
 
@@ -1187,37 +1330,83 @@ impl WingConsole {
         buf.push(0xdf);
         buf.push(0xd1);
 
-        self.wsock.clone().lock_recover().write_all(&buf)?;
+        self.wsock.lock_recover().write_all(&buf)?;
 
-        Ok(mtrs.next_meter_id)
+        // Only a subscription that reached the wire takes over the keepalive, and only then
+        // is its id spent. The new subscription replaces the old one, which now lapses.
+        mtrs.active_meter_id = Some(id);
+        mtrs.next_meter_id = id.wrapping_add(1);
+        mtrs.keep_alive_meters_timer =
+            Instant::now() + Duration::from_secs(METERS_KEEP_ALIVE_SECONDS);
+        Ok(id)
     }
 
-    /// reads any meter values that have been requested with request_meter() and returns the meter
-    /// ID along with the meters values
+    /// Returns the next meter frame for a subscription made with
+    /// [`request_meter`](Self::request_meter): its report id and its samples.
+    ///
+    /// Waits at most one meter-keepalive interval (3 s) and then returns [`Error::Timeout`], so
+    /// a meter loop regains control -- to stop, resubscribe after a reconnect, or notice a dead
+    /// link -- even when no frames arrive (UDP blocked, cable pulled, or a subscription lost
+    /// with its session). Keepalives are sent while waiting.
+    ///
+    /// Frames are accepted only from the console's IP address. The protocol has no
+    /// authentication, so a host able to spoof that source address can still inject levels.
     pub fn read_meters(&mut self) -> Result<(u16, Vec<i16>)> {
-        loop {
-            let mptr = self.mtrs.clone();
-            let mut m = mptr.lock_recover();
+        self.read_meters_timeout(Duration::from_secs(METERS_KEEP_ALIVE_SECONDS))
+    }
 
-            self._keep_alive_meters(&mut m)?;
-            let md = m.meters.as_ref().ok_or(Error::MeterNotInitialized)?;
-            let mut buf = [0u8; 8192];
-            md.socket.set_read_timeout(Some(
-                m.keep_alive_meters_timer
-                    .saturating_duration_since(std::time::Instant::now()),
-            ))?;
-            match md.socket.recv_from(&mut buf) {
+    /// [`read_meters`](Self::read_meters), bounded by `timeout` instead of the keepalive
+    /// interval. Keepalives are still sent on their own cadence while waiting.
+    pub fn read_meters_timeout(&mut self, timeout: Duration) -> Result<(u16, Vec<i16>)> {
+        let mut buf = [0u8; METER_FRAME_BYTES];
+        let (id, received) = self.recv_meter_frame(&mut buf, Instant::now() + timeout)?;
+        Ok((id, meter_samples(&buf[4..received]).collect()))
+    }
+
+    /// [`read_meters`](Self::read_meters) without allocating: decodes the frame's samples
+    /// straight into `out` and returns the report id and the frame's sample count. A frame
+    /// with more samples than `out.len()` is not written at all; the returned count tells the
+    /// caller how much room it needed.
+    pub fn read_meters_into(&mut self, out: &mut [i16]) -> Result<(u16, usize)> {
+        let mut buf = [0u8; METER_FRAME_BYTES];
+        let deadline = Instant::now() + Duration::from_secs(METERS_KEEP_ALIVE_SECONDS);
+        let (id, received) = self.recv_meter_frame(&mut buf, deadline)?;
+        let samples = &buf[4..received];
+        let len = samples.len() / 2;
+        if let Some(out) = out.get_mut(..len) {
+            for (slot, sample) in out.iter_mut().zip(meter_samples(samples)) {
+                *slot = sample;
+            }
+        }
+        Ok((id, len))
+    }
+
+    /// Receives one well-formed meter datagram from the console into `buf`, returning its
+    /// report id and length. The meter-state lock is held only to renew the keepalive, never
+    /// across the blocking receive.
+    fn recv_meter_frame(&mut self, buf: &mut [u8], deadline: Instant) -> Result<(u16, usize)> {
+        loop {
+            let (socket, keepalive_due) = {
+                let mptr = self.mtrs.clone();
+                let mut m = mptr.lock_recover();
+                self._keep_alive_meters(&mut m)?;
+                let md = m.meters.as_ref().ok_or(Error::MeterNotInitialized)?;
+                (md.socket.clone(), m.keep_alive_meters_timer)
+            };
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(Error::Timeout);
+            }
+            let wait = deadline
+                .min(keepalive_due)
+                .saturating_duration_since(now)
+                .max(Duration::from_millis(1));
+            socket.set_read_timeout(Some(wait))?;
+            match socket.recv_from(buf) {
                 Ok((received, addr)) => {
-                    if addr.ip() != self.peer_ip || received < 4 || (received - 4) % 2 != 0 {
-                        continue;
+                    if addr.ip() == self.peer_ip && received >= 4 && (received - 4) % 2 == 0 {
+                        return Ok((u16::from_be_bytes([buf[0], buf[1]]), received));
                     }
-                    return Ok((
-                        u16::from_be_bytes([buf[0], buf[1]]),
-                        buf[4..received]
-                            .chunks_exact(2) // Take 2 bytes at a time
-                            .map(|chunk| i16::from_be_bytes([chunk[0], chunk[1]]))
-                            .collect(),
-                    ));
                 }
                 Err(ref e)
                     if matches!(
@@ -1225,14 +1414,8 @@ impl WingConsole {
                         std::io::ErrorKind::WouldBlock
                             | std::io::ErrorKind::TimedOut
                             | std::io::ErrorKind::Interrupted
-                    ) =>
-                {
-                    std::thread::sleep(Duration::from_millis(10));
-                    continue;
-                }
-                Err(_) => {
-                    return Err(Error::ConnectionError);
-                }
+                    ) => {}
+                Err(_) => return Err(Error::ConnectionError),
             }
         }
     }
@@ -1244,13 +1427,13 @@ impl WingConsole {
     }
 
     pub fn set_float(&mut self, id: i32, value: f32) -> Result<()> {
-        let buf = Self::set_float_message(id, value);
+        let buf = Self::set_float_message(id, value)?;
         self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
 
     pub fn set_int(&mut self, id: i32, value: i32) -> Result<()> {
-        let buf = Self::set_int_message(id, value);
+        let buf = Self::set_int_message(id, value)?;
         self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
@@ -1287,12 +1470,15 @@ impl WingConsole {
         let _read_guard = read_gate.lock_recover();
         self.request_node_data(id)?;
         let deadline = Instant::now() + timeout;
-        {
+        // Responses queued before this request were read off the wire already, so they are
+        // not part of the capture; set them aside so the drain below only sees new traffic.
+        let earlier = {
             let mainptr = self.main.clone();
             let mut main = mainptr.lock_recover();
             main.capture = Some(Vec::new());
             main.op_deadline = Some(deadline);
-        }
+            std::mem::take(&mut main.pending)
+        };
         // Drain the reply stream; the tee in `decode_next` fills `capture` underneath. Read
         // responses themselves are discarded -- the raw bytes are the product here.
         let result = loop {
@@ -1305,6 +1491,7 @@ impl WingConsole {
                 break Err(Error::Timeout);
             }
         };
+        self.requeue(earlier.into());
         let mainptr = self.main.clone();
         let mut main = mainptr.lock_recover();
         main.op_deadline = None;
@@ -1422,46 +1609,26 @@ impl WingConsole {
     }
 
     fn set_string_message(id: i32, value: &str) -> Result<Vec<u8>> {
-        let mut buf = Vec::new();
+        Self::set_value_message(id, &NativeValue::String(value.to_owned()))
+    }
+
+    fn set_float_message(id: i32, value: f32) -> Result<Vec<u8>> {
+        Self::set_value_message(id, &NativeValue::Float(value))
+    }
+
+    fn set_int_message(id: i32, value: i32) -> Result<Vec<u8>> {
+        Self::set_value_message(id, &NativeValue::Integer(value))
+    }
+
+    /// `0xd7 <id>` followed by `value`'s token, all escaped for the wire -- the length byte of a
+    /// `0xd1` string included. Token encoding is shared with the server-side encoder.
+    fn set_value_message(id: i32, value: &NativeValue) -> Result<Vec<u8>> {
+        let mut token = Vec::new();
+        crate::native::encode_value(&mut token, value)?;
+        let mut buf = Vec::with_capacity(token.len() + 8);
         Self::format_id(id, &mut buf, 0xd7, None);
-
-        if value.is_empty() {
-            buf.push(0xd0);
-        } else if value.len() <= 64 {
-            buf.push(0x7f + value.len() as u8);
-        } else if value.len() <= 256 {
-            buf.push(0xd1);
-            buf.push((value.len() - 1) as u8);
-        } else {
-            return Err(Error::InvalidInput);
-        }
-
-        Self::extend_escaped(&mut buf, value.as_bytes());
+        Self::extend_escaped(&mut buf, &token);
         Ok(buf)
-    }
-
-    fn set_float_message(id: i32, value: f32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        Self::format_id(id, &mut buf, 0xd7, Some(0xd5));
-        Self::extend_escaped(&mut buf, &value.to_be_bytes());
-        buf
-    }
-
-    fn set_int_message(id: i32, value: i32) -> Vec<u8> {
-        let mut buf = Vec::new();
-        Self::format_id(id, &mut buf, 0xd7, None);
-        let bytes = value.to_be_bytes();
-
-        if (0..=0x3f).contains(&value) {
-            buf.push(value as u8);
-        } else if (-32768..=32767).contains(&value) {
-            buf.push(0xd3);
-            Self::extend_escaped(&mut buf, &(value as i16).to_be_bytes());
-        } else {
-            buf.push(0xd4);
-            Self::extend_escaped(&mut buf, &bytes);
-        }
-        buf
     }
 
     pub fn name_to_id(fullname: &str) -> Option<i32> {
@@ -1491,6 +1658,16 @@ impl WingConsole {
 
     #[cfg(test)]
     pub(crate) fn test_with_meter_socket(peer_ip: IpAddr, socket: UdpSocket) -> Self {
+        Self::test_with_meter_socket_and_server(peer_ip, socket).0
+    }
+
+    /// [`test_with_meter_socket`](Self::test_with_meter_socket), keeping the TCP server half
+    /// open (and returned) so keepalive writes succeed.
+    #[cfg(test)]
+    pub(crate) fn test_with_meter_socket_and_server(
+        peer_ip: IpAddr,
+        socket: UdpSocket,
+    ) -> (Self, TcpStream) {
         let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let addr = listener.local_addr().unwrap();
         let client = TcpStream::connect(addr).unwrap();
@@ -1500,14 +1677,17 @@ impl WingConsole {
 
         {
             let mut meters = console.mtrs.lock_recover();
-            meters.meters = Some(Meters { socket, port });
-            meters.next_meter_id = 1;
+            meters.meters = Some(Meters {
+                socket: Arc::new(socket),
+                port,
+            });
+            meters.active_meter_id = Some(1);
+            meters.next_meter_id = 2;
             meters.keep_alive_meters_timer = std::time::Instant::now()
                 + std::time::Duration::from_secs(METERS_KEEP_ALIVE_SECONDS);
         }
 
-        drop(server);
-        console
+        (console, server)
     }
 
     pub fn id_to_defs(id: i32) -> Option<Vec<(String, WingNodeDef)>> {
@@ -1543,9 +1723,10 @@ impl WingConsole {
     /// before issuing a fresh request for that later id, so a value that
     /// happened to arrive early isn't requested twice. Anything buffered for an
     /// id *not* in `ids` is dropped, same as a bare `get_node_data` call would
-    /// drop it. A timed-out id contributes nothing to this stash either way --
-    /// `get_node_data`'s `Err` path carries no partial buffer with it -- but a
-    /// timeout on one id never stops the rest of `ids` from being attempted.
+    /// drop it. What a timed-out `get_node_data` buffered goes back to the
+    /// console's pending queue, so the next id's request reads (and stashes) it
+    /// first. A timeout on one id never stops the rest of `ids` from being
+    /// attempted.
     pub fn get_nodes(
         &mut self,
         ids: &[i32],
@@ -1994,32 +2175,14 @@ pub fn encode_binary_values(pairs: &[(i32, NodeValue)]) -> Vec<u8> {
     let mut out = Vec::new();
 
     for (id, value) in pairs {
+        let value = match value {
+            NodeValue::Int(v) => NativeValue::Integer(*v),
+            NodeValue::Float(v) => NativeValue::Float(*v),
+            NodeValue::String(s) => NativeValue::String(s.clone()),
+        };
         let mut encoded_value = Vec::new();
-        match value {
-            NodeValue::Int(v) if (0..=0x3f).contains(v) => encoded_value.push(*v as u8),
-            NodeValue::Int(v) if (-32768..=32767).contains(v) => {
-                encoded_value.push(0xd3);
-                encoded_value.extend_from_slice(&(*v as i16).to_be_bytes());
-            }
-            NodeValue::Int(v) => {
-                encoded_value.push(0xd4);
-                encoded_value.extend_from_slice(&v.to_be_bytes());
-            }
-            NodeValue::Float(v) => {
-                encoded_value.push(0xd5);
-                encoded_value.extend_from_slice(&v.to_be_bytes());
-            }
-            NodeValue::String(s) if s.is_empty() => encoded_value.push(0xd0),
-            NodeValue::String(s) if s.len() <= 64 => {
-                encoded_value.push(0x80 + (s.len() as u8 - 1));
-                encoded_value.extend_from_slice(s.as_bytes());
-            }
-            NodeValue::String(s) if s.len() <= 256 => {
-                encoded_value.push(0xd1);
-                encoded_value.push((s.len() - 1) as u8);
-                encoded_value.extend_from_slice(s.as_bytes());
-            }
-            NodeValue::String(_) => continue,
+        if crate::native::encode_value(&mut encoded_value, &value).is_err() {
+            continue;
         }
 
         out.push(0xd7);
@@ -2093,14 +2256,10 @@ fn restore_order_key(fullname: &str) -> (bool, usize) {
 impl Drop for WingConsole {
     fn drop(&mut self) {
         if Arc::strong_count(&self.wsock) == 1 {
-            if let Ok(sock) = self.wsock.lock() {
-                let _ = sock.shutdown(std::net::Shutdown::Both);
-            }
+            let _ = self.wsock.lock_recover().shutdown(Shutdown::Both);
         }
         if Arc::strong_count(&self.rsock) == 1 {
-            if let Ok(sock) = self.rsock.lock() {
-                let _ = sock.shutdown(std::net::Shutdown::Both);
-            }
+            let _ = self.rsock.lock_recover().shutdown(Shutdown::Both);
         }
     }
 }
@@ -2408,13 +2567,13 @@ mod tests {
 
     #[test]
     fn set_int_uses_correct_i16_bytes() {
-        let msg = WingConsole::set_int_message(0x01020304, 1000);
+        let msg = WingConsole::set_int_message(0x01020304, 1000).unwrap();
         assert_eq!(msg, vec![0xd7, 1, 2, 3, 4, 0xd3, 0x03, 0xe8]);
     }
 
     #[test]
     fn set_int_escapes_i16_payload() {
-        let msg = WingConsole::set_int_message(1, -8448);
+        let msg = WingConsole::set_int_message(1, -8448).unwrap();
         assert_eq!(msg, vec![0xd7, 0, 0, 0, 1, 0xd3, 0xdf, 0xde, 0x00]);
     }
 
@@ -2431,7 +2590,7 @@ mod tests {
     #[test]
     fn set_float_escapes_payload() {
         let value = f32::from_bits(0xdf000001);
-        let msg = WingConsole::set_float_message(1, value);
+        let msg = WingConsole::set_float_message(1, value).unwrap();
         assert_eq!(msg, vec![0xd7, 0, 0, 0, 1, 0xd5, 0xdf, 0xde, 0, 0, 1]);
     }
 
@@ -2751,5 +2910,352 @@ mod tests {
             names,
             vec!["/fx/2/mdl", "/fx/1/mdl", "/ch/1/eq/mdl", "/fx/1/HALL/pdel"]
         );
+    }
+
+    /// A meter console on loopback: the UDP pair it reads frames from, and the live TCP server.
+    fn live_meter_console() -> (WingConsole, UdpSocket, SocketAddr, TcpStream) {
+        let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let receiver_addr = receiver.local_addr().unwrap();
+        let sender = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer_ip = sender.local_addr().unwrap().ip();
+        let (console, server) = WingConsole::test_with_meter_socket_and_server(peer_ip, receiver);
+        (console, sender, receiver_addr, server)
+    }
+
+    fn meter_frame(id: u16, samples: &[i16]) -> Vec<u8> {
+        let mut frame = id.to_be_bytes().to_vec();
+        frame.extend_from_slice(&0u16.to_be_bytes());
+        for sample in samples {
+            frame.extend_from_slice(&sample.to_be_bytes());
+        }
+        frame
+    }
+
+    #[test]
+    fn read_meters_returns_timeout_when_no_frames_arrive() {
+        let (mut console, _sender, _addr, _server) = live_meter_console();
+
+        let start = Instant::now();
+        assert!(matches!(console.read_meters(), Err(Error::Timeout)));
+        let elapsed = start.elapsed();
+        assert!(elapsed >= Duration::from_millis(2500), "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(5), "{elapsed:?}");
+
+        let start = Instant::now();
+        assert!(matches!(
+            console.read_meters_timeout(Duration::from_millis(100)),
+            Err(Error::Timeout)
+        ));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn read_meters_skips_malformed_datagrams_and_returns_the_real_frame() {
+        let (mut console, sender, addr, _server) = live_meter_console();
+        for _ in 0..200 {
+            sender.send_to(&[1, 2, 3], addr).unwrap(); // too short
+            sender.send_to(&[0, 1, 0, 0, 9], addr).unwrap(); // odd sample bytes
+        }
+        sender.send_to(&meter_frame(1, &[-6, 12]), addr).unwrap();
+
+        let start = Instant::now();
+        let (id, samples) = console.read_meters_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!((id, samples), (1, vec![-6, 12]));
+        assert!(start.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn read_meters_into_decodes_without_allocating_and_reports_short_buffers() {
+        let (mut console, sender, addr, _server) = live_meter_console();
+        sender.send_to(&meter_frame(1, &[-6, 12, 3]), addr).unwrap();
+        let mut out = [0i16; 4];
+        assert_eq!(console.read_meters_into(&mut out).unwrap(), (1, 3));
+        assert_eq!(out, [-6, 12, 3, 0]);
+
+        sender.send_to(&meter_frame(1, &[1, 2, 3]), addr).unwrap();
+        let mut short = [7i16; 2];
+        assert_eq!(console.read_meters_into(&mut short).unwrap(), (1, 3));
+        assert_eq!(short, [7, 7], "a frame that does not fit is not written");
+    }
+
+    /// Reads the renewals a meter keepalive wrote to the server, as report ids.
+    fn renewed_ids(server: &mut TcpStream) -> Vec<u16> {
+        server
+            .set_read_timeout(Some(Duration::from_millis(200)))
+            .unwrap();
+        let mut bytes = Vec::new();
+        let mut buf = [0u8; 256];
+        while let Ok(n) = server.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+            bytes.extend_from_slice(&buf[..n]);
+        }
+        let mut decoder = ChannelDecoder::default();
+        let data: Vec<u8> = decoder
+            .push(&bytes)
+            .unwrap()
+            .into_iter()
+            .filter_map(|event| match event {
+                ChannelEvent::Data(3, byte) => Some(byte),
+                _ => None,
+            })
+            .collect();
+        data.chunks_exact(5)
+            .filter(|renew| renew[0] == 0xd4)
+            .map(|renew| u16::from_be_bytes([renew[1], renew[2]]))
+            .collect()
+    }
+
+    #[test]
+    fn meter_keepalive_renews_only_the_active_subscription() {
+        let (mut console, _sender, _addr, mut server) = live_meter_console();
+        console.mtrs.lock_recover().active_meter_id = None;
+        let first = console.request_meter(&[Meter::Channel(1)]).unwrap();
+        let second = console.request_meter(&[Meter::Channel(2)]).unwrap();
+        assert_ne!(first, second);
+        let _ = renewed_ids(&mut server); // drain the subscribe requests
+
+        console.mtrs.lock_recover().keep_alive_meters_timer = Instant::now();
+        console.keep_alive_meters().unwrap();
+        assert_eq!(renewed_ids(&mut server), vec![second]);
+    }
+
+    struct FailingWriter;
+
+    impl Read for FailingWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::BrokenPipe.into())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for FailingWriter {
+        fn set_read_timeout(&mut self, _dur: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_failed_subscribe_spends_no_id_and_ids_wrap_past_zero() {
+        let mut console = WingConsole::from_transports(
+            FailingWriter,
+            FailingWriter,
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        assert!(console.request_meter(&[Meter::Channel(1)]).is_err());
+        {
+            let m = console.mtrs.lock_recover();
+            assert_eq!((m.active_meter_id, m.next_meter_id), (None, 1));
+        }
+
+        let (mut console, _sender, _addr, _server) = live_meter_console();
+        console.mtrs.lock_recover().next_meter_id = u16::MAX;
+        assert_eq!(
+            console.request_meter(&[Meter::Channel(1)]).unwrap(),
+            u16::MAX
+        );
+        assert_eq!(console.request_meter(&[Meter::Channel(1)]).unwrap(), 1);
+    }
+
+    #[test]
+    fn meter_wire_table_round_trips_every_family() {
+        for meter in [
+            Meter::Channel(40),
+            Meter::Aux(8),
+            Meter::Bus(16),
+            Meter::Main(4),
+            Meter::Matrix(8),
+            Meter::Dca(16),
+            Meter::Fx(16),
+            Meter::Source(16),
+            Meter::Output(11),
+            Meter::Monitor,
+            Meter::Rta,
+            Meter::Channel2(40),
+            Meter::Aux2(8),
+            Meter::Bus2(16),
+            Meter::Main2(4),
+            Meter::Matrix2(8),
+        ] {
+            let (opcode, index, _) = meter.wire();
+            assert_eq!(Meter::from_wire(opcode, index), Some(meter));
+        }
+        assert_eq!(Meter::from_wire(0xa9, 1), None);
+        assert_eq!(Meter::from_wire(0xb0, 1), None);
+    }
+
+    #[test]
+    fn a_224_byte_string_escapes_its_length_byte() {
+        // 112 two-byte Cyrillic letters: 224 bytes, so the length byte is 223 (0xdf), and the
+        // body starts with 0xd0, which would read as a channel select after a raw 0xdf.
+        let value = "\u{0430}".repeat(112);
+        let msg = WingConsole::set_string_message(1, &value).unwrap();
+
+        let mut decoder = ChannelDecoder::with_channel(AUDIO_ENGINE_CHANNEL).unwrap();
+        let decoded: Vec<u8> = decoder
+            .push(&msg)
+            .unwrap()
+            .into_iter()
+            .map(|event| match event {
+                ChannelEvent::Data(AUDIO_ENGINE_CHANNEL, byte) => byte,
+                other => panic!("unexpected event {other:?}"),
+            })
+            .collect();
+        let mut expected = vec![0xd7, 0, 0, 0, 1, 0xd1, 223];
+        expected.extend_from_slice(value.as_bytes());
+        assert_eq!(decoded, expected);
+
+        let mut console = console_with_input(&msg);
+        match console.read_timeout(Duration::from_millis(500)).unwrap() {
+            WingResponse::NodeData(1, data) => assert_eq!(data.get_string(), value),
+            _ => panic!("expected the string value"),
+        }
+    }
+
+    #[test]
+    fn node_name_selectors_are_navigation_not_values() {
+        let mut input = vec![0xd7];
+        input.extend(42i32.to_be_bytes());
+        input.extend([0xc2, b'a', b'b', b'c']);
+        input.push(0xd4);
+        input.extend(7i32.to_be_bytes());
+        let mut console = console_with_input(&input);
+
+        match console.read_timeout(Duration::from_millis(500)).unwrap() {
+            WingResponse::NodeData(42, data) => assert_eq!(data.get_int(), 7),
+            _ => panic!("expected NodeData(42, 7)"),
+        }
+    }
+
+    #[test]
+    fn bytes_on_other_native_channels_are_not_parsed_as_values() {
+        let mut input = vec![0xdf, 0xd2, 0x05, 0xdf, 0xd1, 0xd7];
+        input.extend(42i32.to_be_bytes());
+        input.push(0x03);
+        let mut console = console_with_input(&input);
+
+        match console.read_timeout(Duration::from_millis(500)).unwrap() {
+            WingResponse::NodeData(42, data) => assert_eq!(data.get_int(), 3),
+            _ => panic!("expected NodeData(42, 3)"),
+        }
+    }
+
+    #[test]
+    fn scan_lists_each_console_once_at_its_source_address() {
+        let responder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let target = responder.local_addr().unwrap();
+        let replier = std::thread::spawn(move || {
+            let mut buf = [0u8; 16];
+            let (_, client) = responder.recv_from(&mut buf).unwrap();
+            for _ in 0..3 {
+                responder
+                    .send_to(b"WING,10.9.9.9,Desk,WING,SER1,3.1.0", client)
+                    .unwrap();
+            }
+            responder.send_to(b"not a wing reply", client).unwrap();
+        });
+
+        let dsock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let found =
+            WingConsole::scan_on(&dsock, target, false, Duration::from_millis(800)).unwrap();
+        replier.join().unwrap();
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].ip, "127.0.0.1", "the claimed 10.9.9.9 is ignored");
+        assert_eq!(
+            (found[0].serial.as_str(), found[0].firmware.as_str()),
+            ("SER1", "3.1.0")
+        );
+    }
+
+    #[test]
+    fn a_reconnect_that_waited_for_another_clones_reuses_its_session() {
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (console, listener) = reconnectable_console(silent.local_addr().unwrap().port());
+        listener.set_nonblocking(true).unwrap();
+        let gate = console.reconnect_gate.clone();
+        let guard = gate.lock_recover();
+
+        let mut waiter = console.clone();
+        let worker = std::thread::spawn(move || waiter.reconnect(&ReconnectPolicy::default()));
+        while console.pending_reconnects.load(Ordering::Acquire) == 0 {
+            std::thread::yield_now();
+        }
+        // Another clone's reconnect completes while this one waits on the gate.
+        console.session_generation.fetch_add(1, Ordering::AcqRel);
+        drop(guard);
+
+        let outcome = worker.join().unwrap().unwrap();
+        assert_eq!(outcome.attempts, 0);
+        assert!(listener.accept().is_err(), "no second handshake was made");
+    }
+
+    #[test]
+    fn reconnect_and_keepalives_on_other_clones_never_deadlock() {
+        let silent = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (console, listener) = reconnectable_console(silent.local_addr().unwrap().port());
+        let acceptor = std::thread::spawn(move || {
+            (0..3)
+                .map(|_| listener.accept().unwrap().0)
+                .collect::<Vec<_>>()
+        });
+        let stop = Arc::new(AtomicBool::new(false));
+
+        let mut keeper = console.clone();
+        let keeper_stop = stop.clone();
+        let keepalives = std::thread::spawn(move || {
+            while !keeper_stop.load(Ordering::Acquire) {
+                keeper.main.lock_recover().keep_alive_timer = Instant::now();
+                keeper.mtrs.lock_recover().keep_alive_meters_timer = Instant::now();
+                let _ = keeper.keep_alive();
+                let _ = keeper.keep_alive_meters();
+            }
+        });
+
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let mut reconnector = console.clone();
+        std::thread::spawn(move || {
+            for _ in 0..3 {
+                reconnector.reconnect(&ReconnectPolicy::default()).unwrap();
+            }
+            done_tx.send(()).unwrap();
+        });
+
+        let finished = done_rx.recv_timeout(Duration::from_secs(10));
+        stop.store(true, Ordering::Release);
+        assert!(finished.is_ok(), "reconnect deadlocked against keepalives");
+        keepalives.join().unwrap();
+        acceptor.join().unwrap();
+    }
+
+    #[test]
+    fn a_binary_capture_ignores_responses_queued_before_its_request() {
+        let mut input = vec![0xd7];
+        input.extend(9i32.to_be_bytes());
+        input.push(0x05);
+        input.push(0xde);
+        let mut console = console_with_input(&input);
+        console.requeue(vec![WingResponse::RequestEnd]);
+
+        let captured = console
+            .get_binary_node(9, Duration::from_millis(500))
+            .unwrap();
+        assert_eq!(
+            captured, input,
+            "the queued RequestEnd did not end the capture"
+        );
+        assert!(matches!(
+            console.read_timeout(Duration::from_millis(100)),
+            Ok(WingResponse::RequestEnd)
+        ));
     }
 }
