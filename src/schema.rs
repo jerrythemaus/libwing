@@ -111,7 +111,7 @@ impl Schema {
     /// if `id` is known but the live model doesn't identify a single
     /// candidate.
     pub fn resolve_id(id: i32, model: Option<&str>) -> Option<Resolution> {
-        let candidates = WingConsole::id_to_defs(id)?;
+        let candidates = WingConsole::id_to_defs_iter(id)?;
         Some(resolve_candidates(
             id,
             model,
@@ -263,21 +263,41 @@ impl LiveSchema {
             .get(&def.parent_id)
             .map(|v| v.as_slice())
             .and_then(single_path)
-            .or_else(|| WingConsole::id_to_defs(def.parent_id).and_then(|v| single_path(&v)))?;
+            .or_else(|| {
+                let mut candidates = WingConsole::id_to_defs_iter(def.parent_id)?;
+                let (path, _) = candidates.next()?;
+                candidates.next().is_none().then(|| path.to_owned())
+            })?;
         Some(format!("{parent_path}/{}", def.name))
     }
 
-    /// Overlay-aware equivalent of [`Schema::resolve_id`]: checks this
-    /// overlay's ingested definitions first (returning
-    /// [`Provenance::Live`]), then falls back to the embedded map.
+    /// Overlay-aware equivalent of [`Schema::resolve_id`]. Live definitions
+    /// take precedence; an unobserved model variant can still resolve from
+    /// the embedded map when the live overlay has no candidate for that model.
     pub fn resolve_id(&self, id: i32, model: Option<&str>) -> Option<Resolution> {
         match self.by_id.get(&id) {
-            Some(candidates) => Some(resolve_candidates(
-                id,
-                model,
-                candidates.clone(),
-                Provenance::Live,
-            )),
+            Some(candidates) => {
+                let live = resolve_candidates(
+                    id,
+                    model,
+                    candidates.iter().map(|(name, def)| (name.as_str(), def)),
+                    Provenance::Live,
+                );
+                if let Some(model) = model {
+                    let needle = format!("/{model}/");
+                    let live_has_model = candidates.iter().any(|(name, _)| name.contains(&needle));
+                    let unplaced_live = candidates.iter().any(|(name, _)| name.starts_with('#'));
+                    if !live_has_model && !unplaced_live {
+                        if let Some(embedded) = Schema::resolve_id(id, Some(model)) {
+                            if matches!(&embedded, Resolution::Confirmed { fullname, .. } if fullname.contains(&needle))
+                            {
+                                return Some(embedded);
+                            }
+                        }
+                    }
+                }
+                Some(live)
+            }
             None => Schema::resolve_id(id, model),
         }
     }
@@ -451,20 +471,29 @@ fn single_path(candidates: &[(String, WingNodeDef)]) -> Option<String> {
 /// run of path segments, because every `/` inside `model` lines up with a real
 /// segment boundary in `fullname`, and it needs no prior knowledge of where
 /// the slot's base path ends or the parameter name begins.
-fn resolve_candidates(
+fn resolve_candidates<'a>(
     id: i32,
     model: Option<&str>,
-    candidates: Vec<(String, WingNodeDef)>,
+    candidates: impl IntoIterator<Item = (&'a str, &'a WingNodeDef)>,
     provenance: Provenance,
 ) -> Resolution {
+    let mut candidates = candidates.into_iter();
+    let Some(first) = candidates.next() else {
+        return Resolution::Unknown {
+            id,
+            model: model.map(str::to_owned),
+        };
+    };
+    let second = candidates.next();
+
     // A single candidate is unambiguous regardless of model context: either a
     // base node with no `mdl` sibling, or (incidentally) a slot where only one
     // model exposes this id.
-    if candidates.len() == 1 {
-        let (fullname, def) = candidates.into_iter().next().unwrap();
+    if second.is_none() {
+        let (fullname, def) = first;
         return Resolution::Confirmed {
-            fullname,
-            def,
+            fullname: fullname.to_owned(),
+            def: def.clone(),
             provenance,
         };
     }
@@ -474,13 +503,14 @@ fn resolve_candidates(
     };
 
     let needle = format!("/{model}/");
-    let mut matches = candidates
-        .into_iter()
+    let mut matches = std::iter::once(first)
+        .chain(second)
+        .chain(candidates)
         .filter(|(fullname, _)| fullname.contains(&needle));
     match (matches.next(), matches.next()) {
         (Some((fullname, def)), None) => Resolution::Confirmed {
-            fullname,
-            def,
+            fullname: fullname.to_owned(),
+            def: def.clone(),
             provenance,
         },
         _ => Resolution::Unknown {

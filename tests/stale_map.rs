@@ -238,6 +238,54 @@ fn overlay_disambiguates_reused_id_by_model_after_simulated_change() {
 }
 
 #[test]
+#[cfg(feature = "propmap")]
+fn partial_live_overlay_does_not_resolve_another_model_as_its_own() {
+    const SHARED_ID: i32 = 638586229;
+    let Resolution::Confirmed { def, .. } =
+        Schema::resolve_id(SHARED_ID, Some("HALL")).expect("known shared id")
+    else {
+        panic!("expected the embedded HALL definition");
+    };
+    let mut live = LiveSchema::new();
+    live.apply_node_def(&def, Some("/fx/1/HALL/pdel"));
+
+    assert_confirmed(
+        live.resolve_id(SHARED_ID, Some("EXT"))
+            .expect("known embedded EXT definition"),
+        "/fx/1/EXT/egrp",
+        Provenance::Embedded,
+    );
+}
+
+#[test]
+#[cfg(feature = "propmap")]
+fn renamed_live_base_definition_shadows_its_stale_embedded_path() {
+    let id = WingConsole::name_to_id("/ch/1/fdr").unwrap();
+    let mut live = LiveSchema::new();
+    live.apply_node_def(&def(id, 0, "level", -90.0, 10.0), Some("/ch/1/level"));
+
+    assert_confirmed(
+        live.resolve_id(id, None).unwrap(),
+        "/ch/1/level",
+        Provenance::Live,
+    );
+}
+
+#[test]
+#[cfg(feature = "propmap")]
+fn unplaced_live_definition_keeps_priority_over_embedded_candidates() {
+    const SHARED_ID: i32 = 638586229;
+    let mut live = LiveSchema::new();
+    live.apply_node_def(&def(SHARED_ID, i32::MIN + 73, "fresh", 0.0, 1.0), None);
+
+    assert_confirmed(
+        live.resolve_id(SHARED_ID, Some("HALL")).unwrap(),
+        &format!("#{SHARED_ID}"),
+        Provenance::Live,
+    );
+}
+
+#[test]
 fn apply_node_def_synthesizes_fullname_from_known_parent() {
     let mut live = LiveSchema::new();
     const PARENT_ID: i32 = i32::MIN + 3;

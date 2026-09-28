@@ -8,6 +8,8 @@
 //! arbitrary port instead of the hardcoded 2222 `connect()` uses.
 
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, TcpStream};
+use std::sync::{mpsc, Arc, Barrier};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use libwing::{Error, Meter, ReconnectPolicy, WingConsole};
@@ -119,4 +121,38 @@ fn reconnect_on_transport_injected_console_is_invalid_input() {
 
     let err = console.reconnect(&ReconnectPolicy::default()).unwrap_err();
     assert!(matches!(err, Error::InvalidInput));
+}
+
+#[test]
+fn reconnect_completes_while_another_clone_is_blocked_reading() {
+    let (listener, addr) = local_listener();
+    let mut console = WingConsole::connect_addr(addr).unwrap();
+    let (_old_server, _) = listener.accept().unwrap();
+    let mut reader = console.clone();
+    let start = Arc::new(Barrier::new(2));
+    let reader_start = start.clone();
+    let reader_thread = thread::spawn(move || {
+        reader_start.wait();
+        reader.read_timeout(Duration::from_secs(1))
+    });
+    start.wait();
+    thread::sleep(Duration::from_millis(50));
+
+    let (done_tx, done_rx) = mpsc::channel();
+    let reconnect_thread = thread::spawn(move || {
+        let result = console.reconnect(&ReconnectPolicy::default());
+        let _ = done_tx.send(result);
+    });
+    let outcome = done_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("reconnect must not wait for a blocked reader")
+        .expect("reconnect should succeed");
+    assert_eq!(outcome.attempts, 1);
+
+    let (_new_server, _) = listener.accept().unwrap();
+    reconnect_thread.join().unwrap();
+    assert!(
+        matches!(reader_thread.join().unwrap(), Err(Error::Reconnecting)),
+        "the interrupted reader must not look like a dropped session"
+    );
 }

@@ -61,6 +61,18 @@ fn round_trips_empty_string_arg() {
 }
 
 #[test]
+fn encode_rejects_embedded_nul_in_osc_strings() {
+    let nul_address = OscMessage::new("/ch/1\0/fdr", vec![]);
+    assert!(matches!(encode(&nul_address), Err(OscError::Malformed(_))));
+
+    let nul_argument = OscMessage::new(
+        "/ch/1/name",
+        vec![OscArg::Str("front\0of-house".to_string())],
+    );
+    assert!(matches!(encode(&nul_argument), Err(OscError::Malformed(_))));
+}
+
+#[test]
 fn round_trips_blob_padding_edge_cases() {
     // Exercise blob lengths that land on every padding remainder (0, 1, 2, 3 extra bytes).
     for len in [0, 1, 2, 3, 4, 5, 6, 7, 8] {
@@ -95,6 +107,59 @@ fn decode_rejects_non_slash_address() {
     let mut bytes = b"#bundle\0".to_vec();
     bytes.resize(bytes.len() + 8, 0); // OSC time-tag, irrelevant -- decode should bail first.
     assert!(matches!(decode(&bytes), Err(OscError::Malformed(_))));
+}
+
+// Padding carries no data, and no hardware OSC capture has confirmed the WING zeroes it, so
+// decode ignores padding content instead of failing a live reply over it.
+#[test]
+fn decode_ignores_nonzero_string_and_blob_padding() {
+    let cases = [
+        // Address `/x` uses one terminator and one padding byte.
+        (vec![b'/', b'x', 0, 1, b',', 0, 0, 0], vec![]),
+        // Type tag `,s` uses one terminator and one padding byte.
+        (
+            vec![b'/', b'x', 0, 0, b',', b's', 0, 1, 0, 0, 0, 0],
+            vec![OscArg::Str(String::new())],
+        ),
+        // String argument `x` uses one terminator and two padding bytes.
+        (
+            vec![b'/', b'x', 0, 0, b',', b's', 0, 0, b'x', 0, 1, 0],
+            vec![OscArg::Str("x".to_string())],
+        ),
+        // A one-byte blob has three padding bytes.
+        (
+            vec![
+                b'/', b'x', 0, 0, b',', b'b', 0, 0, 0, 0, 0, 1, 0xaa, 0, 1, 0,
+            ],
+            vec![OscArg::Blob(vec![0xaa])],
+        ),
+    ];
+
+    for (bytes, args) in cases {
+        let msg = decode(&bytes).unwrap_or_else(|e| panic!("rejected {bytes:02x?}: {e:?}"));
+        assert_eq!(msg.addr, "/x");
+        assert_eq!(msg.args, args);
+    }
+}
+
+#[test]
+fn decode_rejects_trailing_bytes_after_declared_arguments() {
+    let mut bytes = encode(&OscMessage::new("/x", vec![OscArg::Int(7)])).unwrap();
+    bytes.extend_from_slice(&[0, 0, 0, 0]);
+
+    assert!(matches!(decode(&bytes), Err(OscError::Malformed(_))));
+}
+
+#[test]
+fn decode_rejects_truncated_datagrams_without_panicking() {
+    let cases: &[&[u8]] = &[b"/x\0", b"/x\0\0,s\0\0x\0", b"/x\0\0,b\0\0\0\0\0\x02\xaa"];
+
+    for bytes in cases {
+        assert!(
+            matches!(decode(bytes), Err(OscError::Malformed(_))),
+            "accepted truncated OSC datagram: {bytes:02x?}"
+        );
+    }
 }
 
 #[test]

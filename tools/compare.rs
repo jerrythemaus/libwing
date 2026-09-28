@@ -1,6 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use libwing::native::{NativeRequest, NativeRequestDecoder};
@@ -401,11 +403,13 @@ fn decode_control(events: &[(String, Vec<u8>)]) -> Result<Control, String> {
         .flat_map(|(_, bytes)| bytes.iter().copied())
         .collect::<Vec<_>>();
     let reader = MemoryTransport::new(bytes);
+    let bytes_read = Arc::clone(&reader.bytes_read);
     let writer = MemoryTransport::default();
     let mut console = WingConsole::from_transports(reader, writer, IpAddr::V4(Ipv4Addr::LOCALHOST));
     let mut control = Control::default();
     loop {
-        match console.read_timeout(Duration::from_millis(1)) {
+        let before = bytes_read.load(Ordering::Relaxed);
+        match console.read_timeout(Duration::from_secs(30)) {
             Ok(WingResponse::NodeData(id, data)) => control
                 .values
                 .entry(id)
@@ -415,7 +419,12 @@ fn decode_control(events: &[(String, Vec<u8>)]) -> Result<Control, String> {
                 control.definitions.insert(definition.id);
             }
             Ok(WingResponse::RequestEnd) => control.request_ends += 1,
-            Err(Error::Timeout) => return Ok(control),
+            Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
+                if bytes_read.load(Ordering::Relaxed) == before {
+                    return Ok(control);
+                }
+                return Err("truncated Native response at capture end".to_string());
+            }
             Err(error) => return Err(error.to_string()),
         }
     }
@@ -424,29 +433,35 @@ fn decode_control(events: &[(String, Vec<u8>)]) -> Result<Control, String> {
 #[derive(Default)]
 struct MemoryTransport {
     bytes: VecDeque<u8>,
+    bytes_read: Arc<AtomicUsize>,
 }
 
 impl MemoryTransport {
     fn new(bytes: Vec<u8>) -> Self {
         Self {
             bytes: bytes.into(),
+            bytes_read: Arc::new(AtomicUsize::new(0)),
         }
     }
 }
 
 impl Read for MemoryTransport {
     fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        if buffer.is_empty() {
+            return Ok(0);
+        }
         if self.bytes.is_empty() {
             return Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
+                std::io::ErrorKind::UnexpectedEof,
                 "capture exhausted",
             ));
         }
-        let count = buffer.len().min(self.bytes.len()).max(1);
-        for byte in buffer.iter_mut().take(count) {
-            *byte = self.bytes.pop_front().expect("count is bounded by length");
-        }
-        Ok(count)
+        // Avoid prefetching bytes from the next response. The caller uses the
+        // count consumed during one read to distinguish a clean boundary from
+        // a response cut off by the end of the capture.
+        buffer[0] = self.bytes.pop_front().expect("checked above");
+        self.bytes_read.fetch_add(1, Ordering::Relaxed);
+        Ok(1)
     }
 }
 
@@ -469,8 +484,19 @@ impl Transport for MemoryTransport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_transport_empty_read_does_not_consume_capture() {
+        let mut transport = MemoryTransport::new(vec![0x42]);
+        assert_eq!(transport.read(&mut []).unwrap(), 0);
+        let mut byte = [0];
+        assert_eq!(transport.read(&mut byte).unwrap(), 1);
+        assert_eq!(byte, [0x42]);
+    }
+    #[cfg(feature = "propmap")]
     use libwing::native::{encode_responses, NativeResponse, NativeValue};
 
+    #[cfg(feature = "propmap")]
     fn node_data(path: &str, value: i32) -> Vec<(String, Vec<u8>)> {
         let id = WingConsole::name_to_id(path).expect("known property-map path");
         let bytes = encode_responses(&[NativeResponse::NodeData {
@@ -482,6 +508,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "propmap")]
     fn identical_inputs_have_no_deviations() {
         let events = node_data("/ch/1/fdr", 1);
         let report = compare_fidelity(&events, &events);
@@ -491,6 +518,14 @@ mod tests {
     }
 
     #[test]
+    fn truncated_native_response_is_a_decode_failure() {
+        let events = vec![("N<".to_string(), vec![0xdf, 0xd1, 0xd7, 0x00])];
+        assert!(decode_control(&events).is_err());
+        assert!(compare_fidelity(&events, &events).deviations > 0);
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
     fn differing_node_data_is_one_named_deviation() {
         let hardware = node_data("/ch/1/fdr", 1);
         let emulator = node_data("/ch/1/fdr", 2);

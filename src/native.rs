@@ -44,38 +44,46 @@ impl ChannelDecoder {
     pub fn push(&mut self, input: &[u8]) -> Result<Vec<ChannelEvent>> {
         let mut events = Vec::with_capacity(input.len());
         for &byte in input {
-            if !self.escaped {
-                if byte == ESCAPE {
-                    self.escaped = true;
-                } else {
-                    let channel = self.channel.ok_or(Error::InvalidData)?;
-                    events.push(ChannelEvent::Data(channel, byte));
-                }
-                continue;
-            }
-
-            self.escaped = false;
-            match byte {
-                ESCAPED_ESCAPE | ESCAPE => {
-                    let channel = self.channel.ok_or(Error::InvalidData)?;
-                    events.push(ChannelEvent::Data(channel, ESCAPE));
-                }
-                CHANNEL_BASE..=0xdd => {
-                    let channel = byte - CHANNEL_BASE;
-                    self.channel = Some(channel);
-                    events.push(ChannelEvent::Selected(channel));
-                }
-                // A raw protocol token 0xdf followed by a non-channel byte is
-                // legal. Preserve both bytes rather than silently discarding one.
-                other if self.channel.is_some() => {
-                    let channel = self.channel.expect("checked above");
-                    events.push(ChannelEvent::Data(channel, ESCAPE));
-                    events.push(ChannelEvent::Data(channel, other));
-                }
-                _ => return Err(Error::InvalidData),
-            }
+            events.extend(self.push_byte(byte)?.into_iter().flatten());
         }
         Ok(events)
+    }
+
+    /// Decode one byte without allocating; a raw escape token can emit two events.
+    pub(crate) fn push_byte(&mut self, byte: u8) -> Result<[Option<ChannelEvent>; 2]> {
+        if !self.escaped {
+            if byte == ESCAPE {
+                self.escaped = true;
+                return Ok([None, None]);
+            }
+            let channel = self.channel.ok_or(Error::InvalidData)?;
+            return Ok([Some(ChannelEvent::Data(channel, byte)), None]);
+        }
+
+        self.escaped = false;
+        let event = match byte {
+            ESCAPED_ESCAPE | ESCAPE => [
+                Some(ChannelEvent::Data(
+                    self.channel.ok_or(Error::InvalidData)?,
+                    ESCAPE,
+                )),
+                None,
+            ],
+            CHANNEL_BASE..=0xdd => {
+                let channel = byte - CHANNEL_BASE;
+                self.channel = Some(channel);
+                [Some(ChannelEvent::Selected(channel)), None]
+            }
+            // A raw protocol token 0xdf followed by a non-channel byte is legal.
+            other => {
+                let channel = self.channel.ok_or(Error::InvalidData)?;
+                [
+                    Some(ChannelEvent::Data(channel, ESCAPE)),
+                    Some(ChannelEvent::Data(channel, other)),
+                ]
+            }
+        };
+        Ok(event)
     }
 
     /// Reject a stream ending halfway through an escape/channel sequence.

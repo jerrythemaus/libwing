@@ -144,6 +144,11 @@ pub enum Error {
     MeterNotInitialized,
     #[error("Operation timed out waiting for a response")]
     Timeout,
+    /// Another clone of this console is reconnecting. The interrupted operation should be
+    /// retried once that reconnect returns; reconnecting again from here would only drop the
+    /// fresh session (and its meter subscription) a second time.
+    #[error("Interrupted by a reconnect on another handle; retry once it completes")]
+    Reconnecting,
     /// A raw meter frame's length didn't match what the request it was decoded against
     /// implies (see [`decode_frame`]) -- either a short/truncated UDP datagram or a
     /// mismatch between the `request` passed to `decode_frame` and the one that actually

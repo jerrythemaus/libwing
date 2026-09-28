@@ -311,3 +311,52 @@ fn verify_second_pass_keeps_persistent_mismatch() {
     assert_eq!(report.mismatches.len(), 1);
     assert_eq!(report.mismatches[0].actual, Some(NodeValue::Float(-3.0)));
 }
+
+/// A peer that answers a binary-node request with node-data records forever and never
+/// sends the end-of-data token.
+struct EndlessReply {
+    offset: usize,
+}
+
+impl EndlessReply {
+    const RECORD: [u8; 10] = [0xd7, 0x0a, 0x0b, 0x0c, 0x0d, 0xd4, 0x00, 0x00, 0x00, 0x01];
+}
+
+impl Read for EndlessReply {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        for slot in buf.iter_mut() {
+            *slot = Self::RECORD[self.offset % Self::RECORD.len()];
+            self.offset += 1;
+        }
+        Ok(buf.len())
+    }
+}
+
+impl Write for EndlessReply {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Transport for EndlessReply {
+    fn set_read_timeout(&mut self, _dur: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn get_binary_node_stops_a_reply_that_never_ends_at_the_capture_limit() {
+    let mut console = WingConsole::from_transports(
+        EndlessReply { offset: 0 },
+        RecordingWriter::default(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    );
+
+    assert!(matches!(
+        console.get_binary_node(0x0a0b0c0d, Duration::from_secs(120)),
+        Err(libwing::Error::InvalidData)
+    ));
+}

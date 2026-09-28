@@ -21,6 +21,8 @@
 //! Free-text identifiers (console/channel/show names) have no reliable pattern to
 //! scan for; redact those by hand before running this tool.
 
+#[path = "atomic_write.rs"]
+mod atomic_write;
 #[path = "compare.rs"]
 mod compare;
 #[path = "redact.rs"]
@@ -238,10 +240,13 @@ fn sanitize_file(input_path: &str, output_path: &str) -> Result<(), String> {
 
     let mut output = out_lines.join("\n");
     output.push('\n');
-    fs::write(output_path, output).map_err(|e| format!("writing {output_path}: {e}"))?;
+    atomic_write::publish_outputs(&[(Path::new(output_path), output.as_bytes())])
+        .map_err(|error| format!("writing {output_path}: {error}"))?;
     Ok(())
 }
 
+/// Publish a complete candidate by replacing its directory entry. Renaming over a
+/// symlink replaces the link itself rather than following it to an unrelated file.
 fn split_capture_line(line: &str) -> Option<(String, &str)> {
     if line.starts_with('@') {
         let mut fields = line.splitn(4, char::is_whitespace);
@@ -1005,6 +1010,15 @@ fn sanitize_from_quarantine(quarantine: &Path, raw: &Path, candidate: &Path) -> 
 fn validate_review_candidate(candidate: &Path) -> Result<(), String> {
     if is_synchronized(candidate) {
         return Err("sanitized candidate cannot use a known synchronized destination".to_string());
+    }
+    match candidate.symlink_metadata() {
+        Ok(metadata) if metadata.file_type().is_symlink() => {
+            return Err("sanitized candidate cannot be a symlink".to_string());
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+            return Err(format!("inspecting sanitized candidate: {error}"));
+        }
+        _ => {}
     }
     let repository = Path::new(env!("CARGO_MANIFEST_DIR"))
         .canonicalize()
@@ -2034,6 +2048,21 @@ mod tests {
         let review = temp_root("review");
         fs::create_dir_all(&review).unwrap();
         validate_review_candidate(&review.join("candidate.wingcap")).unwrap();
+        fs::remove_dir_all(review).unwrap();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sanitized_review_candidate_rejects_existing_output_symlink() {
+        let review = temp_root("review-symlink");
+        fs::create_dir_all(&review).unwrap();
+        let target = review.join("target.wingcap");
+        fs::write(&target, "keep me").unwrap();
+        let candidate = review.join("candidate.wingcap");
+        std::os::unix::fs::symlink(&target, &candidate).unwrap();
+
+        assert!(validate_review_candidate(&candidate).is_err());
+        assert_eq!(fs::read_to_string(&target).unwrap(), "keep me");
         fs::remove_dir_all(review).unwrap();
     }
 

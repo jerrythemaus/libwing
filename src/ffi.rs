@@ -46,6 +46,7 @@ fn error_to_code(err: &Error) -> c_int {
         Error::MeterNotInitialized => 6,
         Error::Timeout => 7,
         Error::MeterFrameLength { .. } => 8,
+        Error::Reconnecting => 9,
         _ => 99,
     }
 }
@@ -498,7 +499,10 @@ pub extern "C" fn wing_response_get_type(handle: *const ResponseHandle) -> Respo
         Some(WingResponse::RequestEnd) => ResponseType::End,
         Some(WingResponse::NodeDef(_)) => ResponseType::NodeDefinition,
         Some(WingResponse::NodeData(_, _)) => ResponseType::NodeData,
-        None => ResponseType::End,
+        None => {
+            record_ffi_usage_error("wing_response_get_type: null response handle");
+            ResponseType::End
+        }
     }
 }
 
@@ -1216,9 +1220,11 @@ pub extern "C" fn wing_console_request_meter(
     meters_count: usize,
 ) -> u16 {
     let Some(handle) = (unsafe { handle.as_ref() }) else {
+        record_ffi_usage_error("wing_console_request_meter: null console handle");
         return 0;
     };
     if meters_count > 0 && meters.is_null() {
+        record_ffi_usage_error("wing_console_request_meter: null meter array for nonzero len");
         return 0;
     }
 
@@ -1240,8 +1246,8 @@ pub extern "C" fn wing_console_request_meter(
             0xa600 => Some(Meter::Fx((m & 0xff) as u8)),
             0xa700 => Some(Meter::Source((m & 0xff) as u8)),
             0xa800 => Some(Meter::Output((m & 0xff) as u8)),
-            0xa900 => Some(Meter::Monitor),
-            0xaa00 => Some(Meter::Rta),
+            0xa900 if *m == 0xa900 => Some(Meter::Monitor),
+            0xaa00 if *m == 0xaa00 => Some(Meter::Rta),
             0xab00 => Some(Meter::Channel2((m & 0xff) as u8)),
             0xac00 => Some(Meter::Aux2((m & 0xff) as u8)),
             0xad00 => Some(Meter::Bus2((m & 0xff) as u8)),
@@ -1251,11 +1257,18 @@ pub extern "C" fn wing_console_request_meter(
         })
         .collect::<Option<Vec<_>>>()
     else {
+        record_ffi_usage_error("wing_console_request_meter: invalid meter id");
         return 0;
     };
 
     let mut console = handle.console.clone();
-    console.request_meter(&meters).unwrap_or_default()
+    match console.request_meter(&meters) {
+        Ok(id) => id,
+        Err(err) => {
+            record_error(&err);
+            0
+        }
+    }
 }
 
 #[no_mangle]
@@ -1410,6 +1423,82 @@ mod tests {
         );
         assert_eq!(id, 0xbeef);
         assert_eq!(data, [123]);
+    }
+
+    #[test]
+    fn meter_request_reports_null_handle_via_last_error() {
+        set_last_error("previous error", 99);
+
+        assert_eq!(
+            wing_console_request_meter(ptr::null_mut(), ptr::null(), 0),
+            0
+        );
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+        let message = unsafe { CStr::from_ptr(wing_last_error_message()) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("wing_console_request_meter"));
+        assert!(message.contains("null console handle"));
+    }
+
+    #[test]
+    fn meter_request_reports_null_meter_array_via_last_error() {
+        let (_, _, mut handle) = meter_handle();
+        set_last_error("previous error", 99);
+
+        assert_eq!(wing_console_request_meter(&mut handle, ptr::null(), 1), 0);
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+        let message = unsafe { CStr::from_ptr(wing_last_error_message()) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("wing_console_request_meter"));
+        assert!(message.contains("null meter array"));
+    }
+
+    #[test]
+    fn meter_request_reports_invalid_meter_id_via_last_error() {
+        let (_, _, mut handle) = meter_handle();
+        let invalid_meter = 0x0101_u16;
+        set_last_error("previous error", 99);
+
+        assert_eq!(
+            wing_console_request_meter(&mut handle, &invalid_meter, 1),
+            0
+        );
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+        let message = unsafe { CStr::from_ptr(wing_last_error_message()) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("wing_console_request_meter"));
+        assert!(message.contains("invalid meter id"));
+    }
+
+    #[test]
+    fn meter_request_reports_out_of_range_index_via_last_error() {
+        let (_, _, mut handle) = meter_handle();
+        let channel_zero = 0xa000_u16;
+        set_last_error("previous error", 99);
+
+        assert_eq!(wing_console_request_meter(&mut handle, &channel_zero, 1), 0);
+        assert_eq!(wing_last_error_code(), error_to_code(&Error::InvalidInput));
+        let message = unsafe { CStr::from_ptr(wing_last_error_message()) }
+            .to_str()
+            .unwrap();
+        assert_eq!(message, Error::InvalidInput.to_string());
+    }
+
+    #[test]
+    fn reconnect_interruption_has_its_own_error_code() {
+        assert_eq!(error_to_code(&Error::Reconnecting), 9);
+    }
+
+    #[test]
+    fn meter_request_rejects_an_index_on_non_indexed_family() {
+        let (_, _, mut handle) = meter_handle();
+        let indexed_rta = 0xaa01_u16;
+
+        assert_eq!(wing_console_request_meter(&mut handle, &indexed_rta, 1), 0);
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
     }
 
     #[test]
@@ -1611,6 +1700,19 @@ mod tests {
             .to_str()
             .unwrap()
             .contains("null"));
+    }
+
+    #[test]
+    fn response_type_reports_null_handle_instead_of_aliasing_request_end() {
+        set_last_error("previous error", 99);
+
+        assert!(wing_response_get_type(ptr::null()) == ResponseType::End);
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+        let message = unsafe { CStr::from_ptr(wing_last_error_message()) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("wing_response_get_type"));
+        assert!(message.contains("null response handle"));
     }
 
     #[test]

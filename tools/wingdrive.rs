@@ -101,6 +101,28 @@ fn snap(data: &WingNodeData) -> Snap {
     }
 }
 
+fn snap_for_def(data: &WingNodeData, def: &WingNodeDef) -> Snap {
+    if def.node_type == NodeType::StringEnum {
+        Snap::Str(data.display_string(def))
+    } else {
+        snap(data)
+    }
+}
+
+fn restorable_snap_for_def(data: &WingNodeData, def: &WingNodeDef) -> Result<Snap, String> {
+    if def.node_type != NodeType::StringEnum {
+        return Ok(snap(data));
+    }
+    data.string_enum_item(def)
+        .map(|item| Snap::Str(item.to_owned()))
+        .ok_or_else(|| {
+            format!(
+                "StringEnum value {:?} is neither a known index nor a known label",
+                data.get_string()
+            )
+        })
+}
+
 /// Deterministic, leaf-only sample spread evenly across the compiled property map. The same
 /// binary yields the same list on every invocation and on both console and emulator, so the
 /// recorded `N>` request stream is identical by construction.
@@ -334,10 +356,11 @@ fn capture_models(
             continue;
         };
         let mdl_id = mdl_def.id;
-        let original = wing
+        let (original_data, _) = wing
             .get_node_data(mdl_id, timeout)
-            .ok()
-            .map(|(data, _)| data.get_string());
+            .map_err(|error| format!("cannot capture original selector {mdl_path}: {error}"))?;
+        let original = restorable_snap_for_def(&original_data, mdl_def)
+            .map_err(|error| format!("cannot restore selector {mdl_path}: {error}"))?;
         let models: Vec<String> = mdl_def
             .string_enum
             .as_ref()
@@ -360,11 +383,17 @@ fn capture_models(
                 }
             }
         }
-        if let Some(original) = original {
-            if wing.set_string(mdl_id, &original).is_ok() {
-                restored += 1;
-            }
-        }
+        let Snap::Str(original_value) = &original else {
+            unreachable!("model selectors are strings")
+        };
+        let write_result = wing.set_string(mdl_id, original_value);
+        let readback = if write_result.is_ok() {
+            read_settled_for_def(wing, mdl_def, timeout)
+        } else {
+            Err(libwing::Error::Timeout)
+        };
+        verify_restore(slot, &original, write_result, readback)?;
+        restored += 1;
         eprintln!(
             "wingdrive: models captured for {slot} ({} models)",
             models.len()
@@ -504,10 +533,11 @@ fn probe_echo(
     let mut records: Vec<(&'static str, SetVal, Snap)> = Vec::new();
     for (path, def) in &targets {
         let id = def.id;
-        let original = wing
+        let (original_data, _) = wing
             .get_node_data(id, timeout)
-            .ok()
-            .map(|(data, _)| snap(&data));
+            .map_err(|error| format!("cannot capture original value for {path}: {error}"))?;
+        let original = restorable_snap_for_def(&original_data, def)
+            .map_err(|error| format!("cannot safely restore {path}: {error}"))?;
         for input in probe_inputs(def) {
             let sent = match &input {
                 SetVal::Float(v) => wing.set_float(id, *v),
@@ -521,13 +551,17 @@ fn probe_echo(
                 records.push((path, input, echo));
             }
         }
-        if let Some(original) = original {
-            let _ = match original {
-                Snap::Float(v) => wing.set_float(id, v),
-                Snap::Int(v) => wing.set_int(id, v),
-                Snap::Str(s) => wing.set_string(id, &s),
-            };
-        }
+        let write_result = match &original {
+            Snap::Float(v) => wing.set_float(id, *v),
+            Snap::Int(v) => wing.set_int(id, *v),
+            Snap::Str(s) => wing.set_string(id, s),
+        };
+        let readback = if write_result.is_ok() {
+            read_settled_for_def(wing, def, timeout)
+        } else {
+            Err(libwing::Error::Timeout)
+        };
+        verify_restore(path, &original, write_result, readback)?;
     }
     write_echo_records(out_path, &records)?;
     println!(
@@ -926,15 +960,28 @@ fn drive_restorable_write(
     }
 
     // Restore the captured original value.
-    match &before {
-        Snap::Str(s) => wing.set_string(id, s)?,
-        Snap::Float(f) => wing.set_float(id, *f)?,
-        Snap::Int(i) => wing.set_int(id, *i)?,
-    }
+    let write_result = match &before {
+        Snap::Str(s) => wing.set_string(id, s),
+        Snap::Float(f) => wing.set_float(id, *f),
+        Snap::Int(i) => wing.set_int(id, *i),
+    };
+    let readback = read_settled(wing, id, timeout);
+    verify_restore(path, &before, write_result, readback)
+}
 
-    let after = read_settled(wing, id, timeout)?;
-    if after != before {
-        return Err(format!("RESTORE FAILED for {path}: before={before:?} after={after:?}").into());
+fn verify_restore(
+    path: &str,
+    original: &Snap,
+    write_result: Result<(), libwing::Error>,
+    readback: Result<Snap, libwing::Error>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    write_result.map_err(|error| format!("RESTORE FAILED for {path}: write: {error}"))?;
+    let readback =
+        readback.map_err(|error| format!("RESTORE FAILED for {path}: readback: {error}"))?;
+    if &readback != original {
+        return Err(
+            format!("RESTORE FAILED for {path}: before={original:?} after={readback:?}").into(),
+        );
     }
     Ok(())
 }
@@ -943,20 +990,102 @@ fn drive_restorable_write(
 /// `NodeData` event, so a plain `get` can match a stale echo of our own write; taking the *last*
 /// `NodeData(id)` seen within `window` reflects the value after all queued writes have applied.
 fn read_settled(wing: &mut WingConsole, id: i32, window: Duration) -> Result<Snap, libwing::Error> {
+    read_settled_with(wing, id, window, snap)
+}
+
+fn read_settled_for_def(
+    wing: &mut WingConsole,
+    def: &WingNodeDef,
+    window: Duration,
+) -> Result<Snap, libwing::Error> {
+    read_settled_with(wing, def.id, window, |data| snap_for_def(data, def))
+}
+
+fn read_settled_with(
+    wing: &mut WingConsole,
+    id: i32,
+    window: Duration,
+    snapshot: impl Fn(&WingNodeData) -> Snap,
+) -> Result<Snap, libwing::Error> {
     wing.request_node_data(id)?;
     let deadline = Instant::now() + window;
-    let mut last: Option<Snap> = None;
+    let mut last = None;
     loop {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
         match wing.read_timeout(deadline - now) {
-            Ok(WingResponse::NodeData(rid, data)) if rid == id => last = Some(snap(&data)),
+            Ok(WingResponse::NodeData(response_id, data)) if response_id == id => {
+                last = Some(snapshot(&data));
+            }
             Ok(_) => {}
             Err(libwing::Error::Timeout) => break,
             Err(error) => return Err(error),
         }
     }
     last.ok_or(libwing::Error::Timeout)
+}
+
+#[cfg(test)]
+mod restore_tests {
+    use super::*;
+
+    #[test]
+    fn model_selector_restore_requires_matching_readback() {
+        let result = verify_restore(
+            "/fx/1/mdl",
+            &Snap::Str("HALL".to_string()),
+            Ok(()),
+            Ok(Snap::Str("PLATE".to_string())),
+        );
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn model_selector_snapshot_uses_enum_label_instead_of_raw_index() {
+        let def = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let expected = def.string_enum.as_ref().unwrap()[1].item.clone();
+        let data = WingNodeData::with_i32(1);
+
+        assert_eq!(snap_for_def(&data, def), Snap::Str(expected));
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn unknown_string_enum_index_is_not_restorable() {
+        let def = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let unknown_index = def.string_enum.as_ref().unwrap().len() as i32 + 10;
+        let data = WingNodeData::with_i32(unknown_index);
+
+        assert!(restorable_snap_for_def(&data, def).is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn string_enum_label_reply_is_restorable() {
+        let def = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let label = def.string_enum.as_ref().unwrap()[1].item.clone();
+
+        assert_eq!(
+            restorable_snap_for_def(&WingNodeData::with_string(label.clone()), def),
+            Ok(Snap::Str(label))
+        );
+        assert!(
+            restorable_snap_for_def(&WingNodeData::with_string("unexpected".into()), def).is_err()
+        );
+    }
+
+    #[test]
+    fn echo_probe_restore_error_is_propagated() {
+        let original = Snap::Int(7);
+        assert!(verify_restore(
+            "/ch/1/mute",
+            &original,
+            Err(libwing::Error::InvalidInput),
+            Err(libwing::Error::Timeout),
+        )
+        .is_err());
+    }
 }

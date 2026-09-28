@@ -1,16 +1,26 @@
 mod utils;
 use utils::Args;
+#[path = "atomic_write.rs"]
+mod atomic_write;
+use atomic_write::{publish_outputs, staged_path};
 
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::Write;
+use std::path::Path;
 use std::result::Result;
 
-use libwing::{WingConsole, WingNodeData, WingNodeDef, WingResponse};
+use libwing::{NodeType, WingConsole, WingNodeData, WingNodeDef, WingResponse};
 
 /// One model selector's pre-crawl state: its node id, its full path (for
 /// reporting), and the value it held before the crawl started flipping it.
-type SelectorSnapshot = (i32, String, String);
+#[derive(Clone)]
+struct SelectorSnapshot {
+    id: i32,
+    fullname: String,
+    value: String,
+    def: WingNodeDef,
+}
 
 /// Read a node's current value directly (`request_node_data` + read loop),
 /// bypassing the propmap so this works during the crawl itself, before any
@@ -40,9 +50,44 @@ fn plan_restore(snapshot: &[SelectorSnapshot]) -> Vec<SelectorSnapshot> {
     let mut seen = std::collections::HashSet::new();
     snapshot
         .iter()
-        .filter(|(id, _, _)| seen.insert(*id))
+        .filter(|entry| seen.insert(entry.id))
         .cloned()
         .collect()
+}
+
+fn selector_value(data: &WingNodeData, def: &WingNodeDef) -> String {
+    data.display_string(def)
+}
+
+fn selector_snapshot(
+    fullname: &str,
+    def: &WingNodeDef,
+    data: Option<WingNodeData>,
+) -> Result<SelectorSnapshot, String> {
+    let data = data.ok_or_else(|| {
+        format!(
+            "could not read current value of {fullname} ({}) before crawl; refusing to mutate it",
+            def.id
+        )
+    })?;
+    let value = if def.node_type == NodeType::StringEnum {
+        data.string_enum_item(def)
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                format!(
+                    "{fullname} returned unknown StringEnum value {:?}; refusing to guess its restore value",
+                    data.get_string()
+                )
+            })?
+    } else {
+        selector_value(&data, def)
+    };
+    Ok(SelectorSnapshot {
+        id: def.id,
+        fullname: fullname.to_string(),
+        value,
+        def: def.clone(),
+    })
 }
 
 /// Outcome of one restore attempt, used to build a [`RestoreReport`].
@@ -83,13 +128,37 @@ impl RestoreReport {
 fn restore_selectors(wing: &mut WingConsole, snapshot: &[SelectorSnapshot]) -> RestoreReport {
     let outcomes: Vec<RestoreOutcome> = plan_restore(snapshot)
         .into_iter()
-        .map(|(id, fullname, value)| RestoreOutcome {
-            restored: wing.set_string(id, &value).is_ok(),
-            id,
-            fullname,
+        .map(|entry| {
+            let write_result = wing.set_string(entry.id, &entry.value);
+            let readback = if write_result.is_ok() {
+                read_node_data(wing, entry.id).map(|data| selector_value(&data, &entry.def))
+            } else {
+                None
+            };
+            restore_outcome_from_readback(
+                entry.id,
+                &entry.fullname,
+                &entry.value,
+                write_result,
+                readback.as_deref(),
+            )
         })
         .collect();
     RestoreReport::from_outcomes(&outcomes)
+}
+
+fn restore_outcome_from_readback(
+    id: i32,
+    fullname: &str,
+    expected: &str,
+    write_result: Result<(), libwing::Error>,
+    readback: Option<&str>,
+) -> RestoreOutcome {
+    RestoreOutcome {
+        id,
+        fullname: fullname.to_string(),
+        restored: write_result.is_ok() && readback == Some(expected),
+    }
 }
 
 /// Append one `[flag u8][namelen u16][name][deflen u16][def]` entry to the raw
@@ -106,7 +175,7 @@ fn push_entry(raw: &mut Vec<u8>, flag: u8, fullname: &str, def_bytes: &[u8]) {
 /// Write the `propmap.rs` source that embeds `raw` as a `NAME_TO_DEF` lazy static.
 /// The loader emitted here must stay in lockstep with the one already compiled
 /// into `src/propmap.rs` (and `src/empty-propmap.rs`'s empty fallback).
-fn write_propmap_rs(rust_file: &mut File, raw: &[u8]) -> std::io::Result<()> {
+fn write_propmap_rs(rust_file: &mut impl Write, raw: &[u8]) -> std::io::Result<()> {
     // rustfmt import order (crate before std), so a fmt pass over the
     // generated file is a no-op and regeneration produces no diff noise.
     writeln!(rust_file, "use crate::node::WingNodeDef;")?;
@@ -233,16 +302,10 @@ fn add(
             // StringEnum's raw NodeData is an index, not the name `set_string`
             // expects) before the first mutation, so it can be restored after.
             let mdl_fullname = String::new() + parent_fullname + "/mdl";
-            match read_node_data(wing, mdl_def.id) {
-                Some(data) => {
-                    snapshot.push((mdl_def.id, mdl_fullname, data.display_string(mdl_def)))
-                }
-                None => eprintln!(
-                    "\nwarning: could not read current value of {mdl_fullname} ({}) before crawl; \
-                     it will not be restored afterward",
-                    mdl_def.id
-                ),
-            }
+            let captured =
+                selector_snapshot(&mdl_fullname, mdl_def, read_node_data(wing, mdl_def.id))
+                    .unwrap_or_else(|error| panic!("{error}"));
+            snapshot.push(captured);
 
             for item in mdl_def.string_enum.as_ref().unwrap().iter() {
                 let parent_fullname = String::new() + parent_fullname + "/" + &item.item;
@@ -458,7 +521,11 @@ fn encode_def_bytes(
     buf
 }
 
-fn embed_from_sweep(input_path: &str) -> Result<(), libwing::Error> {
+fn embed_from_sweep_to(
+    input_path: &str,
+    json_output_path: &Path,
+    rust_output_path: &Path,
+) -> Result<(), libwing::Error> {
     let text = std::fs::read_to_string(input_path)?;
 
     // First pass: parse every row once and index by fullname, both to catch
@@ -489,11 +556,7 @@ fn embed_from_sweep(input_path: &str) -> Result<(), libwing::Error> {
     }
 
     let mut raw = Vec::<u8>::new();
-    let mut json_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open("src/propmap.jsonl")?;
+    let mut json_output = Vec::new();
 
     for (fullname, line, row) in &rows {
         let id = row["id"].as_i32().unwrap();
@@ -513,21 +576,29 @@ fn embed_from_sweep(input_path: &str) -> Result<(), libwing::Error> {
             parent_id, id, index, name, long_name, tcode, ucode, read_only, &payload,
         );
         push_entry(&mut raw, 0, fullname, &def_bytes);
-        writeln!(json_file, "{line}")?;
+        writeln!(json_output, "{line}")?;
     }
 
-    let mut rust_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open("src/propmap.rs")?;
-    write_propmap_rs(&mut rust_file, &raw)?;
+    let mut rust_output = Vec::new();
+    write_propmap_rs(&mut rust_output, &raw)?;
+    publish_outputs(&[
+        (json_output_path, json_output.as_slice()),
+        (rust_output_path, rust_output.as_slice()),
+    ])?;
 
     println!(
         "Embedded {} entries from {input_path} into src/propmap.rs and src/propmap.jsonl",
         rows.len()
     );
     Ok(())
+}
+
+fn embed_from_sweep(input_path: &str) -> Result<(), libwing::Error> {
+    embed_from_sweep_to(
+        input_path,
+        Path::new("src/propmap.jsonl"),
+        Path::new("src/propmap.rs"),
+    )
 }
 
 fn main() -> Result<(), libwing::Error> {
@@ -599,18 +670,12 @@ Do you have a backup snapshot you can restore after, and want to continue?
 
     let mut wing = WingConsole::connect(host.as_deref())?;
 
+    let json_temp = staged_path(Path::new("propmap.jsonl"), "crawl");
     let mut json_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(true)
-        .open("propmap.jsonl")
-        .unwrap();
-
-    let mut rust_file = std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(true)
-        .open("propmap.rs")
+        .open(&json_temp)
         .unwrap();
 
     let mut raw = Vec::<u8>::new();
@@ -643,14 +708,21 @@ Do you have a backup snapshot you can restore after, and want to continue?
     println!("done");
 
     if crawl_result.is_err() {
+        let _ = std::fs::remove_file(&json_temp);
         eprintln!("\nSchema crawl aborted partway through (see panic above).");
     } else {
-        // The sweep data is complete and valid regardless of how the restore
-        // went — a destructive crawl is expensive, so never discard its output
-        // over a restore failure (that gets its own report + nonzero exit).
         print!("\nFinishing up... ");
         std::io::stdout().flush().unwrap();
-        write_propmap_rs(&mut rust_file, &raw).unwrap();
+        json_file.flush().unwrap();
+        let json_output = std::fs::read(&json_temp).unwrap();
+        let mut rust_output = Vec::new();
+        write_propmap_rs(&mut rust_output, &raw).unwrap();
+        publish_outputs(&[
+            (Path::new("propmap.jsonl"), json_output.as_slice()),
+            (Path::new("propmap.rs"), rust_output.as_slice()),
+        ])
+        .unwrap();
+        let _ = std::fs::remove_file(&json_temp);
         println!("done");
     }
 
@@ -677,11 +749,18 @@ Do you have a backup snapshot you can restore after, and want to continue?
 mod restore_tests {
     use super::*;
 
+    #[cfg(feature = "propmap")]
     fn snap(id: i32, fullname: &str, value: &str) -> SelectorSnapshot {
-        (id, fullname.to_string(), value.to_string())
+        SelectorSnapshot {
+            id,
+            fullname: fullname.to_string(),
+            value: value.to_string(),
+            def: WingConsole::name_to_def("/fx/1/mdl").unwrap().clone(),
+        }
     }
 
     #[test]
+    #[cfg(feature = "propmap")]
     fn plan_restore_dedups_by_id_keeping_first_value() {
         let snapshot = vec![
             snap(1, "/fx/1/mdl", "HALL"),
@@ -692,8 +771,12 @@ mod restore_tests {
         ];
         let plan = plan_restore(&snapshot);
         assert_eq!(plan.len(), 2);
-        assert_eq!(plan[0], snap(1, "/fx/1/mdl", "HALL"));
-        assert_eq!(plan[1], snap(2, "/fx/2/mdl", "PLATE"));
+        assert_eq!(plan[0].id, 1);
+        assert_eq!(plan[0].fullname, "/fx/1/mdl");
+        assert_eq!(plan[0].value, "HALL");
+        assert_eq!(plan[1].id, 2);
+        assert_eq!(plan[1].fullname, "/fx/2/mdl");
+        assert_eq!(plan[1].value, "PLATE");
     }
 
     #[test]
@@ -734,5 +817,99 @@ mod restore_tests {
         assert_eq!(report.attempted, 2);
         assert!(report.is_degraded());
         assert_eq!(report.failed, vec![(2, "/fx/2/mdl".to_string())]);
+    }
+
+    #[test]
+    fn successful_restore_write_without_matching_readback_is_degraded() {
+        let outcome = restore_outcome_from_readback(42, "/fx/1/mdl", "HALL", Ok(()), Some("PLATE"));
+        let report = RestoreReport::from_outcomes(&[outcome]);
+
+        assert!(report.is_degraded());
+        assert_eq!(report.failed, vec![(42, "/fx/1/mdl".to_string())]);
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn selector_readback_uses_enum_label_instead_of_raw_index() {
+        let def = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let expected = def.string_enum.as_ref().unwrap()[1].item.clone();
+        let data = WingNodeData::with_i32(1);
+
+        assert_eq!(selector_value(&data, def), expected);
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn missing_selector_snapshot_aborts_before_mutation() {
+        let def = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let result = selector_snapshot("/fx/1/mdl", def, None);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn unknown_selector_enum_index_aborts_before_mutation() {
+        let def = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let unknown_index = def.string_enum.as_ref().unwrap().len() as i32 + 10;
+        let result = selector_snapshot(
+            "/fx/1/mdl",
+            def,
+            Some(WingNodeData::with_i32(unknown_index)),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn selector_carried_as_a_known_label_is_restorable() {
+        let def = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let label = def.string_enum.as_ref().unwrap()[1].item.clone();
+        let snapshot = selector_snapshot(
+            "/fx/1/mdl",
+            def,
+            Some(WingNodeData::with_string(label.clone())),
+        )
+        .unwrap();
+
+        assert_eq!(snapshot.value, label);
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn selector_without_integer_index_aborts_before_mutation() {
+        let def = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let result = selector_snapshot(
+            "/fx/1/mdl",
+            def,
+            Some(WingNodeData::with_string("unexpected".to_string())),
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn embed_failure_preserves_both_last_known_good_outputs() {
+        let temp =
+            std::env::temp_dir().join(format!("wingschema-staged-output-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&temp);
+        std::fs::create_dir_all(&temp).unwrap();
+        let sweep = Path::new("src/propmap.jsonl");
+        let json_output = temp.join("propmap.jsonl");
+        let rust_output = temp.join("propmap.rs");
+        std::fs::write(&json_output, "known-good-json\n").unwrap();
+        std::fs::create_dir(&rust_output).unwrap();
+        std::fs::write(rust_output.join("keep"), "not replaceable").unwrap();
+
+        assert!(embed_from_sweep_to(sweep.to_str().unwrap(), &json_output, &rust_output).is_err());
+        assert_eq!(
+            std::fs::read_to_string(&json_output).unwrap(),
+            "known-good-json\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(rust_output.join("keep")).unwrap(),
+            "not replaceable"
+        );
     }
 }

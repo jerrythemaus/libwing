@@ -1,7 +1,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,7 +21,9 @@ use crate::{Error, Result, WingResponse};
 /// so recovering the guard is safe and deliberate: a peer-thread panic no longer bricks the
 /// console. For the transport locks this also degrades cleanly — a genuinely broken socket still
 /// surfaces as an I/O error on the next read/write, which the caller maps to
-/// [`Error::ConnectionError`] and recovers via reconnect, exactly as before.
+/// [`Error::ConnectionError`] and recovers via reconnect, exactly as before. A read cut short
+/// by a reconnect on another clone reports [`Error::Reconnecting`] instead, so it is not
+/// mistaken for a drop that needs a second reconnect.
 trait LockRecover<T> {
     fn lock_recover(&self) -> std::sync::MutexGuard<'_, T>;
 }
@@ -78,14 +80,10 @@ pub enum Meter {
 }
 
 lazy_static::lazy_static! {
-    static ref ID_TO_NAME: HashMap<i32, Vec<String>> = {
-        let mut id2name = HashMap::<i32, Vec<String>>::new();
-        if id2name.is_empty() {
-            for (fullname, def) in NAME_TO_DEF.iter() {
-                id2name.get_mut(&def.id).map(|x| x.push(fullname.to_string())).unwrap_or_else(|| {
-                    id2name.insert(def.id, vec![fullname.to_string()]);
-                });
-            }
+    static ref ID_TO_NAME: HashMap<i32, Vec<&'static str>> = {
+        let mut id2name = HashMap::<i32, Vec<&'static str>>::new();
+        for (fullname, def) in NAME_TO_DEF.iter() {
+            id2name.entry(def.id).or_default().push(fullname.as_str());
         }
         id2name
     };
@@ -96,6 +94,22 @@ const DATA_KEEP_ALIVE_SECONDS: u64 = 7;
 const METERS_KEEP_ALIVE_SECONDS: u64 = 3;
 const WRITE_TIMEOUT_SECONDS: u64 = 5;
 const MAX_NODE_DEF_BYTES: usize = 1024 * 1024;
+/// UDP port a WING answers `WING?` discovery and firmware probes on.
+const DISCOVERY_PORT: u16 = 2222;
+/// Upper bound for one de-escaped Native response and for a raw binary-node capture.
+///
+/// A whole-desk dump is normally well below 1 MiB. Keeping 16 MiB leaves ample room for
+/// future firmware growth while preventing a malformed or hostile peer from growing the
+/// timeout replay and binary-capture buffers without bound.
+const MAX_NATIVE_RESPONSE_BYTES: usize = 16 * 1024 * 1024;
+
+fn ensure_native_response_capacity(len: usize) -> Result<()> {
+    if len >= MAX_NATIVE_RESPONSE_BYTES {
+        Err(Error::InvalidData)
+    } else {
+        Ok(())
+    }
+}
 
 pub struct DiscoveryInfo {
     pub ip: String,
@@ -224,6 +238,10 @@ pub struct WingConsole {
     wsock: Arc<Mutex<Box<dyn Transport>>>,
     main: Arc<Mutex<_WingConsoleMain>>,
     read_gate: Arc<Mutex<()>>,
+    reconnect_gate: Arc<Mutex<()>>,
+    reconnecting: Arc<AtomicBool>,
+    /// Clones waiting on `reconnect_gate`; a `dump_subtree` sweep yields to them.
+    pending_reconnects: Arc<AtomicUsize>,
     mtrs: Arc<Mutex<_WingConsoleMeters>>,
     has_meter_socket: Arc<AtomicBool>,
     peer_ip: IpAddr,
@@ -232,6 +250,8 @@ pub struct WingConsole {
     /// have). Unused (and meaningless) on a [`from_transports`](Self::from_transports)
     /// console, which never reconnects.
     peer_port: u16,
+    /// UDP port `reconnect` re-probes for firmware; the WING discovery port outside tests.
+    firmware_probe_port: u16,
     /// `true` for consoles backed by a real TCP connection ([`connect`](Self::connect) /
     /// [`connect_addr`](Self::connect_addr)); `false` for [`from_transports`](Self::from_transports)
     /// consoles (tests/replay), which have no real peer to reconnect to.
@@ -308,7 +328,7 @@ impl WingConsole {
                 Ok(console) => {
                     let firmware = firmware_hint
                         .clone()
-                        .or_else(|| Self::probe_firmware(addr.ip()));
+                        .or_else(|| Self::probe_firmware(addr.ip(), DISCOVERY_PORT));
                     *console.firmware.lock_recover() = firmware;
                     return Ok(console);
                 }
@@ -330,7 +350,7 @@ impl WingConsole {
     /// always probed).
     pub fn connect_addr(addr: SocketAddr) -> Result<Self> {
         let console = Self::handshake(addr)?;
-        *console.firmware.lock_recover() = Self::probe_firmware(addr.ip());
+        *console.firmware.lock_recover() = Self::probe_firmware(addr.ip(), DISCOVERY_PORT);
         Ok(console)
     }
 
@@ -363,12 +383,12 @@ impl WingConsole {
     /// broadcast reachability. Non-fatal by design (R37): any failure --
     /// socket error, timeout, malformed reply -- yields `None` rather than
     /// failing `connect()` or guessing a firmware value.
-    fn probe_firmware(ip: IpAddr) -> Option<String> {
+    fn probe_firmware(ip: IpAddr, port: u16) -> Option<String> {
         let dsock = UdpSocket::bind("0.0.0.0:0").ok()?;
         dsock
             .set_read_timeout(Some(Duration::from_millis(300)))
             .ok()?;
-        dsock.send_to(b"WING?", (ip, 2222)).ok()?;
+        dsock.send_to(b"WING?", (ip, port)).ok()?;
 
         let mut buf = [0u8; 1024];
         let (received, _) = dsock.recv_from(&mut buf).ok()?;
@@ -385,7 +405,9 @@ impl WingConsole {
     ///
     /// Populated at [`connect`](Self::connect) time: from the broadcast scan
     /// reply when connecting via discovery, or from a best-effort unicast
-    /// probe when connecting to an explicit IP. `None` if neither produced a
+    /// probe when connecting to an explicit IP. Refreshed by the same unicast
+    /// probe after [`reconnect`](Self::reconnect); a reconnect probe that gets no
+    /// reply keeps the previous value. `None` if neither produced a
     /// reply (e.g. probing blocked by network policy) -- never a guessed or
     /// default value. Feeds [`crate::Schema::staleness`].
     pub fn firmware(&self) -> Option<String> {
@@ -441,6 +463,9 @@ impl WingConsole {
                 capture: None,
             })),
             read_gate: Arc::new(Mutex::new(())),
+            reconnect_gate: Arc::new(Mutex::new(())),
+            reconnecting: Arc::new(AtomicBool::new(false)),
+            pending_reconnects: Arc::new(AtomicUsize::new(0)),
             mtrs: Arc::new(Mutex::new(_WingConsoleMeters {
                 keep_alive_meters_timer: std::time::Instant::now()
                     + std::time::Duration::from_secs(METERS_KEEP_ALIVE_SECONDS),
@@ -450,6 +475,7 @@ impl WingConsole {
             has_meter_socket: Arc::new(AtomicBool::new(false)),
             peer_ip,
             peer_port,
+            firmware_probe_port: DISCOVERY_PORT,
             reconnectable,
             firmware: Arc::new(Mutex::new(None)),
         }
@@ -462,7 +488,8 @@ impl WingConsole {
     /// The new streams are swapped into this console's transports **in place**, so clones of
     /// this `WingConsole` (e.g. a meter-reading loop on another thread) keep working without
     /// needing to be re-obtained. Buffered receive state (partial frame, escape flag, current
-    /// node id) is reset -- a fresh TCP session has no partial frame to resume.
+    /// node id) is reset -- a fresh TCP session has no partial frame to resume. An in-flight
+    /// read on another clone is interrupted with a connection error before the swap.
     ///
     /// The meter UDP socket, if any, is left untouched: it's a client-side socket and still
     /// usable. But the meter *subscription* lived server-side on the old session and is gone
@@ -475,16 +502,35 @@ impl WingConsole {
         if !self.reconnectable {
             return Err(Error::InvalidInput);
         }
+        let reconnect_gate = self.reconnect_gate.clone();
+        self.pending_reconnects.fetch_add(1, Ordering::AcqRel);
+        let _reconnect_guard = reconnect_gate.lock_recover();
+        self.pending_reconnects.fetch_sub(1, Ordering::AcqRel);
         let addr = SocketAddr::new(self.peer_ip, self.peer_port);
         let mut backoff = policy.initial_backoff;
         let mut last_err = Error::ConnectionError;
         for attempt in 1..=policy.max_attempts {
             match Self::handshake_streams(addr) {
                 Ok((wsock, rsock)) => {
-                    *self.wsock.lock_recover() = Box::new(wsock);
-                    *self.rsock.lock_recover() = Box::new(rsock);
+                    let firmware = Self::probe_firmware(addr.ip(), self.firmware_probe_port);
+                    // Close the old read half to wake a clone blocked in `read()`.
+                    // Release the writer lock before waiting for that reader: it may
+                    // itself need the writer lock to finish a keepalive.
+                    self.reconnecting.store(true, Ordering::Release);
+                    let _ = self.wsock.lock_recover().shutdown(Shutdown::Read);
+                    let read_gate = self.read_gate.clone();
+                    let _read_guard = read_gate.lock_recover();
+                    // No reader is active now. Keep the writer locked until both
+                    // streams and their parser state belong to the new session.
+                    // Lock `main` before the sockets: `keep_alive` and `read_inner`
+                    // hold `main` while taking a socket lock, so the reverse order
+                    // would deadlock against a clone keeping the session alive.
                     {
                         let mut main = self.main.lock_recover();
+                        let mut old_writer = self.wsock.lock_recover();
+                        let mut old_reader = self.rsock.lock_recover();
+                        *old_writer = Box::new(wsock);
+                        *old_reader = Box::new(rsock);
                         main.rx_buf_tail = 0;
                         main.rx_buf_size = 0;
                         main.rx_channels = ChannelDecoder::with_channel(1)
@@ -498,6 +544,10 @@ impl WingConsole {
                         main.keep_alive_timer =
                             Instant::now() + Duration::from_secs(DATA_KEEP_ALIVE_SECONDS);
                     }
+                    if firmware.is_some() {
+                        *self.firmware.lock_recover() = firmware;
+                    }
+                    self.reconnecting.store(false, Ordering::Release);
                     let meters_invalidated = self.has_meter_socket.load(Ordering::Acquire);
                     return Ok(ReconnectOutcome {
                         attempts: attempt,
@@ -526,6 +576,14 @@ impl WingConsole {
         // reader cannot replay bytes already committed by another reader.
         let read_gate = self.read_gate.clone();
         let _read_guard = read_gate.lock_recover();
+        self.read_locked()
+    }
+
+    /// Complete one read while the caller holds `read_gate`.
+    fn read_locked(&mut self) -> Result<WingResponse> {
+        if self.reconnecting.load(Ordering::Acquire) {
+            return Err(Error::Reconnecting);
+        }
         let previous_node_id = {
             let mut main = self.main.lock_recover();
             main.read_capture.clear();
@@ -542,7 +600,16 @@ impl WingConsole {
         } else {
             main.read_capture.clear();
         }
-        result
+        // A reconnect on another clone shuts the old read half down to wake this reader; the
+        // resulting EOF or I/O error is that reconnect, not a dropped session.
+        match result {
+            Err(Error::ConnectionError | Error::Io(_))
+                if self.reconnecting.load(Ordering::Acquire) =>
+            {
+                Err(Error::Reconnecting)
+            }
+            result => result,
+        }
     }
 
     fn read_inner(&mut self) -> Result<WingResponse> {
@@ -671,9 +738,11 @@ impl WingConsole {
     /// with the same deadline mechanism the attended-get paths already use, so a caller can poll
     /// with a short timeout and loop back to check its own outbound work on every `Timeout`.
     pub fn read_timeout(&mut self, timeout: Duration) -> Result<WingResponse> {
+        let read_gate = self.read_gate.clone();
+        let _read_guard = read_gate.lock_recover();
         let deadline = Instant::now() + timeout;
         self.set_op_deadline(Some(deadline));
-        let result = self.read();
+        let result = self.read_locked();
         self.set_op_deadline(None);
         result
     }
@@ -778,6 +847,7 @@ impl WingConsole {
     fn decode_next(&mut self, r: &mut _WingConsoleMain, raw: &mut Vec<u8>) -> Result<(i8, u8)> {
         let (ch, byte) = self.decode_next_inner(r, raw)?;
         if let Some(cap) = r.capture.as_mut() {
+            ensure_native_response_capacity(cap.len())?;
             cap.push(byte);
         }
         Ok((ch, byte))
@@ -789,13 +859,18 @@ impl WingConsole {
         raw: &mut Vec<u8>,
     ) -> Result<(i8, u8)> {
         loop {
+            if self.reconnecting.load(Ordering::Acquire) {
+                return Err(Error::Reconnecting);
+            }
             if let Some((channel, value)) = r.replay.pop_front() {
+                ensure_native_response_capacity(r.read_capture.len())?;
                 raw.push(value);
                 r.read_capture.push((channel, value));
                 return Ok((channel, value));
             }
             while let Some(event) = r.rx_events.pop_front() {
                 if let ChannelEvent::Data(channel, value) = event {
+                    ensure_native_response_capacity(r.read_capture.len())?;
                     raw.push(value);
                     let decoded = (channel as i8, value);
                     r.read_capture.push(decoded);
@@ -866,7 +941,8 @@ impl WingConsole {
             r.rx_buf_tail += 1;
             r.rx_buf_size -= 1;
 
-            r.rx_events.extend(r.rx_channels.push(&[byte])?);
+            r.rx_events
+                .extend(r.rx_channels.push_byte(byte)?.into_iter().flatten());
         }
     }
 
@@ -882,71 +958,41 @@ impl WingConsole {
     /// as the first decoded object — a uniform one-channel shift reproduced with live signal on
     /// channels 2 and 4 landing at decoded slots 1 and 3. Subtract 1 here, once, so every caller
     /// can keep using the 1-based convention the rest of this crate and wing-core already assume.
-    fn encode_meter(buf: &mut Vec<u8>, meter: &Meter) {
-        match meter {
-            Meter::Channel(n) => {
-                buf.push(0xa0);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Aux(n) => {
-                buf.push(0xa1);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Bus(n) => {
-                buf.push(0xa2);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Main(n) => {
-                buf.push(0xa3);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Matrix(n) => {
-                buf.push(0xa4);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Dca(n) => {
-                buf.push(0xa5);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Fx(n) => {
-                buf.push(0xa6);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Source(n) => {
-                buf.push(0xa7);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Output(n) => {
-                buf.push(0xa8);
-                Self::push_escaped(buf, *n - 1);
-            }
+    fn encode_meter(buf: &mut Vec<u8>, meter: &Meter) -> Result<()> {
+        let indexed = match meter {
+            Meter::Channel(n) => Some((0xa0, *n, 40)),
+            Meter::Aux(n) => Some((0xa1, *n, 8)),
+            Meter::Bus(n) => Some((0xa2, *n, 16)),
+            Meter::Main(n) => Some((0xa3, *n, 4)),
+            Meter::Matrix(n) => Some((0xa4, *n, 8)),
+            Meter::Dca(n) => Some((0xa5, *n, 16)),
+            Meter::Fx(n) => Some((0xa6, *n, 16)),
+            Meter::Source(n) => Some((0xa7, *n, 16)),
+            Meter::Output(n) => Some((0xa8, *n, 11)),
             Meter::Monitor => {
                 buf.push(0xa9);
+                None
             }
             Meter::Rta => {
                 buf.push(0xaa);
+                None
             }
-            Meter::Channel2(n) => {
-                buf.push(0xab);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Aux2(n) => {
-                buf.push(0xac);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Bus2(n) => {
-                buf.push(0xad);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Main2(n) => {
-                buf.push(0xae);
-                Self::push_escaped(buf, *n - 1);
-            }
-            Meter::Matrix2(n) => {
-                buf.push(0xaf);
-                Self::push_escaped(buf, *n - 1);
-            }
+            Meter::Channel2(n) => Some((0xab, *n, 40)),
+            Meter::Aux2(n) => Some((0xac, *n, 8)),
+            Meter::Bus2(n) => Some((0xad, *n, 16)),
+            Meter::Main2(n) => Some((0xae, *n, 4)),
+            Meter::Matrix2(n) => Some((0xaf, *n, 8)),
+        };
+
+        if let Some((opcode, n, max)) = indexed {
+            let index = n
+                .checked_sub(1)
+                .filter(|_| n <= max)
+                .ok_or(Error::InvalidInput)?;
+            buf.push(opcode);
+            Self::push_escaped(buf, index);
         }
+        Ok(())
     }
 
     fn push_escaped(buf: &mut Vec<u8>, byte: u8) {
@@ -1011,7 +1057,7 @@ impl WingConsole {
     ) -> Result<(T, Vec<WingResponse>)> {
         let mut buffered = Vec::new();
         loop {
-            let resp = self.read()?;
+            let resp = self.read_locked()?;
             match matcher(resp) {
                 Ok(matched) => return Ok((matched, buffered)),
                 Err(unrelated) => buffered.push(*unrelated),
@@ -1043,6 +1089,8 @@ impl WingConsole {
         id: i32,
         timeout: Duration,
     ) -> Result<(WingNodeData, Vec<WingResponse>)> {
+        let read_gate = self.read_gate.clone();
+        let _read_guard = read_gate.lock_recover();
         self.request_node_data(id)?;
         let deadline = Instant::now() + timeout;
         self.set_op_deadline(Some(deadline));
@@ -1073,6 +1121,8 @@ impl WingConsole {
         id: i32,
         timeout: Duration,
     ) -> Result<(WingNodeDef, Vec<WingResponse>)> {
+        let read_gate = self.read_gate.clone();
+        let _read_guard = read_gate.lock_recover();
         self.request_node_definition(id)?;
         let deadline = Instant::now() + timeout;
         self.set_op_deadline(Some(deadline));
@@ -1098,6 +1148,11 @@ impl WingConsole {
     /// Subscribes to meters from the Wing mixer and returns a meter ID that can be used to
     /// associate the values that come back when you call read_meter()
     pub fn request_meter(&mut self, meters: &[Meter]) -> Result<u16> {
+        let mut encoded_meters = Vec::with_capacity(meters.len() * 2);
+        for meter in meters {
+            Self::encode_meter(&mut encoded_meters, meter)?;
+        }
+
         let mtrsptr = self.mtrs.clone();
         let mut mtrs = mtrsptr.lock_recover();
         mtrs.next_meter_id = mtrs
@@ -1126,9 +1181,7 @@ impl WingConsole {
         Self::extend_escaped(&mut buf, &md.port.to_be_bytes());
         buf.push(0xdc);
 
-        for meter in meters {
-            Self::encode_meter(&mut buf, meter);
-        }
+        buf.extend_from_slice(&encoded_meters);
 
         buf.push(0xde); // end of def
         buf.push(0xdf);
@@ -1230,6 +1283,8 @@ impl WingConsole {
     /// session -- interleaved unrelated traffic would be captured into the buffer. Bounded
     /// by `timeout`, returning [`Error::Timeout`] if the stream doesn't terminate in time.
     pub fn get_binary_node(&mut self, id: i32, timeout: Duration) -> Result<Vec<u8>> {
+        let read_gate = self.read_gate.clone();
+        let _read_guard = read_gate.lock_recover();
         self.request_node_data(id)?;
         let deadline = Instant::now() + timeout;
         {
@@ -1241,7 +1296,7 @@ impl WingConsole {
         // Drain the reply stream; the tee in `decode_next` fills `capture` underneath. Read
         // responses themselves are discarded -- the raw bytes are the product here.
         let result = loop {
-            match self.read() {
+            match self.read_locked() {
                 Ok(WingResponse::RequestEnd) => break Ok(()),
                 Ok(_) => {}
                 Err(e) => break Err(e),
@@ -1456,14 +1511,25 @@ impl WingConsole {
     }
 
     pub fn id_to_defs(id: i32) -> Option<Vec<(String, WingNodeDef)>> {
-        ID_TO_NAME.get(&id).cloned().map(|names| {
-            names
-                .iter()
-                .map(|n| (n, NAME_TO_DEF.get(n)))
-                .filter(|x| x.1.is_some())
-                .map(|x| (x.0, x.1.unwrap()))
-                .map(|(n, v)| (n.clone(), v.clone()))
+        Self::id_to_defs_iter(id).map(|defs| {
+            defs.map(|(name, def)| (name.to_owned(), def.clone()))
                 .collect()
+        })
+    }
+
+    /// Borrow every embedded definition that shares `id` without cloning its
+    /// path or definition. The owned [`Self::id_to_defs`] API remains useful
+    /// when callers need to retain or mutate the returned values.
+    pub fn id_to_defs_iter(
+        id: i32,
+    ) -> Option<impl ExactSizeIterator<Item = (&'static str, &'static WingNodeDef)>> {
+        ID_TO_NAME.get(&id).map(|names| {
+            names.iter().map(|&name| {
+                let def = NAME_TO_DEF
+                    .get(name)
+                    .expect("reverse property index references embedded definition");
+                (name, def)
+            })
         })
     }
 
@@ -1534,30 +1600,111 @@ impl WingConsole {
     /// The subtree's *shape* comes from the embedded map, not the console --
     /// no definition round-trip is needed to know which ids exist under the
     /// prefix. Each leaf's *value*, though, is only known live, so this issues
-    /// one attended `get_node_data` per leaf, in a fixed order (sorted by
-    /// fullname) so a dump taken twice in a row requests things in the same
-    /// order. Plain container nodes (`NodeType::Node`, which never carry a
+    /// attended `get_node_data` calls in a fixed order (sorted by fullname)
+    /// after reading model selectors. Only active model branches are captured,
+    /// and selectors are checked again afterward to catch model changes that
+    /// persist through the sweep. A change away and back between checks cannot
+    /// be detected by this serial protocol, so strict snapshots require a
+    /// quiescent console. A selector whose value the embedded map does not know
+    /// (a model added by newer firmware) is captured as-is, none of its known
+    /// branches are, and its fullname is listed in [`NodeDump::unknown_models`]
+    /// so the caller can warn -- newer firmware warns, it never blocks.
+    ///
+    /// Reconnects on other clones are fenced for the sweep: a clone that asks to
+    /// reconnect makes the sweep stop with [`Error::Reconnecting`] at its next
+    /// request instead of waiting for the whole dump. Plain container
+    /// nodes (`NodeType::Node`, which never carry a
     /// value) and read-only leaves are excluded (R18): restoring a read-only
     /// node would fail anyway, and including a valueless container would just
     /// waste a request that could never resolve to a value.
     ///
     /// Fails fast on the first leaf that doesn't respond within `timeout`
-    /// rather than collecting partial results -- a dump is meant to represent
-    /// one consistent snapshot, and a partial one masquerading as complete
-    /// would be worse than an explicit error.
+    /// rather than collecting partial results.
     pub fn dump_subtree(&mut self, root_fullname: &str, timeout: Duration) -> Result<NodeDump> {
+        let reconnect_gate = self.reconnect_gate.clone();
+        let _reconnect_guard = reconnect_gate.lock_recover();
         let leaves = dumpable_leaves(NAME_TO_DEF.iter(), root_fullname);
+
+        // A model sweep contains mutually exclusive definitions with reused ids.
+        // Read selectors first, from outermost to innermost, so only the active
+        // branch contributes values to the snapshot.
+        let root_prefix = format!("{root_fullname}/");
+        let mut selectors: Vec<_> = NAME_TO_DEF
+            .iter()
+            .filter(|(name, def)| {
+                let Some(parent) = name.strip_suffix("/mdl") else {
+                    return false;
+                };
+                def.node_type == NodeType::StringEnum
+                    && (name.as_str() == root_fullname
+                        || parent == root_fullname
+                        || parent.starts_with(&root_prefix)
+                        || root_fullname.starts_with(&format!("{parent}/")))
+            })
+            .collect();
+        selectors.sort_by(|a, b| {
+            a.0.matches('/')
+                .count()
+                .cmp(&b.0.matches('/').count())
+                .then_with(|| a.0.cmp(b.0))
+        });
+
+        let mut active_models = Vec::new();
+        let mut selector_values = HashMap::new();
+        let mut unknown_models = Vec::new();
+        for (fullname, def) in selectors {
+            if !path_matches_active_models(fullname, &active_models) {
+                continue;
+            }
+            let data = self.dump_get(def.id, timeout)?;
+            let value = dump_value(&data, def)?;
+            if data.string_enum_item(def).is_none() {
+                unknown_models.push(fullname.clone());
+            }
+            active_models.push(ActiveModel {
+                parent: fullname.strip_suffix("/mdl").unwrap(),
+                definition: def,
+                selected: value.clone(),
+            });
+            selector_values.insert(fullname.as_str(), value);
+        }
 
         let mut entries = Vec::with_capacity(leaves.len());
         for (fullname, id) in leaves {
-            let (data, _buffered) = self.get_node_data(id, timeout)?;
+            if !path_matches_active_models(&fullname, &active_models) {
+                continue;
+            }
+            let value = if let Some(value) = selector_values.remove(fullname.as_str()) {
+                value
+            } else {
+                let data = self.dump_get(id, timeout)?;
+                dump_value(&data, NAME_TO_DEF.get(&fullname).unwrap())?
+            };
             entries.push(DumpEntry {
                 fullname,
                 id,
-                value: NodeValue::from_data(&data),
+                value,
             });
         }
-        Ok(NodeDump { entries })
+        for model in &active_models {
+            let data = self.dump_get(model.definition.id, timeout)?;
+            if dump_value(&data, model.definition)? != model.selected {
+                return Err(Error::InvalidData);
+            }
+        }
+        Ok(NodeDump {
+            entries,
+            unknown_models,
+        })
+    }
+
+    /// One attended read inside a `dump_subtree` sweep, which first yields to any clone
+    /// waiting to reconnect.
+    fn dump_get(&mut self, id: i32, timeout: Duration) -> Result<WingNodeData> {
+        if self.pending_reconnects.load(Ordering::Acquire) > 0 {
+            return Err(Error::Reconnecting);
+        }
+        Ok(self.get_node_data(id, timeout)?.0)
     }
 
     /// Applies a [`NodeDump`] back to the console (U6, R18).
@@ -1600,6 +1747,56 @@ impl WingConsole {
             })
             .collect()
     }
+}
+
+struct ActiveModel<'a> {
+    parent: &'a str,
+    definition: &'a WingNodeDef,
+    /// The selector's captured value; a `NodeValue::String` naming a known item unless
+    /// the model is unknown to the embedded map, in which case no known branch matches.
+    selected: NodeValue,
+}
+
+fn path_matches_active_models(path: &str, models: &[ActiveModel<'_>]) -> bool {
+    models.iter().all(|model| {
+        let Some(relative) = path
+            .strip_prefix(model.parent)
+            .and_then(|suffix| suffix.strip_prefix('/'))
+        else {
+            return true;
+        };
+        model
+            .definition
+            .string_enum
+            .as_ref()
+            .and_then(|items| {
+                items
+                    .iter()
+                    .filter(|item| {
+                        relative == item.item
+                            || relative
+                                .strip_prefix(&item.item)
+                                .is_some_and(|suffix| suffix.starts_with('/'))
+                    })
+                    .max_by_key(|item| item.item.len())
+            })
+            .is_none_or(
+                |item| matches!(&model.selected, NodeValue::String(name) if *name == item.item),
+            )
+    })
+}
+
+fn dump_value(data: &WingNodeData, def: &WingNodeDef) -> Result<NodeValue> {
+    if def.node_type != NodeType::StringEnum {
+        return Ok(NodeValue::from_data(data));
+    }
+    if def.string_enum.is_none() {
+        return Err(Error::InvalidData);
+    }
+    Ok(data
+        .string_enum_item(def)
+        .map(|item| NodeValue::String(item.to_owned()))
+        .unwrap_or_else(|| NodeValue::from_data(data)))
 }
 
 /// A node value in whichever facet it was carried in on the wire -- the same
@@ -1657,7 +1854,7 @@ fn id_is_read_only(id: i32) -> bool {
     match ID_TO_NAME.get(&id) {
         Some(names) if !names.is_empty() => names
             .iter()
-            .all(|n| NAME_TO_DEF.get(n).is_some_and(|d| d.read_only)),
+            .all(|n| NAME_TO_DEF.get(*n).is_some_and(|d| d.read_only)),
         _ => false,
     }
 }
@@ -1693,7 +1890,7 @@ fn values_match_at(id: i32, a: &NodeValue, b: &NodeValue) -> bool {
     };
     ID_TO_NAME.get(&id).is_some_and(|names| {
         names.iter().any(|name| {
-            NAME_TO_DEF.get(name).is_some_and(|def| {
+            NAME_TO_DEF.get(*name).is_some_and(|def| {
                 def.string_enum
                     .as_ref()
                     .and_then(|items| items.get(idx))
@@ -1849,6 +2046,10 @@ pub struct DumpEntry {
 #[derive(Clone, Debug, PartialEq, Default)]
 pub struct NodeDump {
     pub entries: Vec<DumpEntry>,
+    /// Model selectors (e.g. `/fx/1/mdl`) whose value the embedded property map does not
+    /// know, typically a model added by newer firmware. The branches under them were not
+    /// captured, so a caller should warn that the dump is incomplete there.
+    pub unknown_models: Vec<String>,
 }
 
 /// The embedded-map walk shared by [`WingConsole::dump_subtree`]: every
@@ -1909,6 +2110,146 @@ mod tests {
     use super::*;
     use std::net::{TcpListener, TcpStream};
 
+    #[test]
+    fn dump_subtree_holds_the_reconnect_fence_until_it_finishes() {
+        let _ = WingConsole::propmap_len();
+        let mut console = console_with_input(&[]);
+        let gate = console.reconnect_gate.clone();
+        let guard = gate.lock_recover();
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            started_tx.send(()).unwrap();
+            done_tx
+                .send(console.dump_subtree("/not-a-propmap-path", Duration::from_millis(50)))
+                .unwrap();
+        });
+        started_rx.recv().unwrap();
+        assert!(done_rx.recv_timeout(Duration::from_millis(100)).is_err());
+        drop(guard);
+        assert!(done_rx
+            .recv_timeout(Duration::from_secs(1))
+            .unwrap()
+            .is_ok());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn a_read_during_another_clones_reconnect_reports_reconnecting_and_keeps_the_bytes() {
+        let mut frame = vec![0xd7];
+        frame.extend(42i32.to_be_bytes());
+        frame.push(0xd4);
+        frame.extend(7i32.to_be_bytes());
+        let mut console = console_with_input(&frame);
+
+        console.reconnecting.store(true, Ordering::Release);
+        assert!(matches!(
+            console.read_timeout(Duration::from_millis(200)),
+            Err(Error::Reconnecting)
+        ));
+        console.reconnecting.store(false, Ordering::Release);
+        assert!(matches!(
+            console.read_timeout(Duration::from_millis(500)),
+            Ok(WingResponse::NodeData(42, _))
+        ));
+    }
+
+    #[test]
+    fn decoding_stops_once_a_reconnect_starts() {
+        let mut console = console_with_input(&[0xd7]);
+        console.reconnecting.store(true, Ordering::Release);
+        let main = console.main.clone();
+        let mut r = main.lock_recover();
+
+        assert!(matches!(
+            console.decode_next(&mut r, &mut Vec::new()),
+            Err(Error::Reconnecting)
+        ));
+    }
+
+    #[test]
+    #[cfg(feature = "propmap")]
+    fn dump_subtree_yields_to_a_pending_reconnect() {
+        let mut console = console_with_input(&[]);
+        console.pending_reconnects.store(1, Ordering::Release);
+
+        assert!(matches!(
+            console.dump_subtree("/cfg/amix", Duration::from_millis(100)),
+            Err(Error::Reconnecting)
+        ));
+    }
+
+    /// A connected, reconnectable console whose firmware re-probe goes to `probe_port`.
+    fn reconnectable_console(probe_port: u16) -> (WingConsole, TcpListener) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut console = WingConsole::connect_addr(listener.local_addr().unwrap()).unwrap();
+        let _ = listener.accept().unwrap();
+        console.firmware_probe_port = probe_port;
+        (console, listener)
+    }
+
+    #[test]
+    fn reconnect_refreshes_the_firmware_identity() {
+        let probe = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut console, listener) = reconnectable_console(probe.local_addr().unwrap().port());
+        *console.firmware.lock_recover() = Some("1.0.0".to_string());
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0; 16];
+            let (len, peer) = probe.recv_from(&mut buf).unwrap();
+            assert_eq!(&buf[..len], b"WING?");
+            probe
+                .send_to(b"WING,127.0.0.1,Test,WING,serial,2.0.0", peer)
+                .unwrap();
+        });
+
+        console.reconnect(&ReconnectPolicy::default()).unwrap();
+        let _ = listener.accept().unwrap();
+        responder.join().unwrap();
+        assert_eq!(console.firmware().as_deref(), Some("2.0.0"));
+    }
+
+    #[test]
+    fn reconnect_keeps_the_known_firmware_when_the_probe_gets_no_reply() {
+        // Bound but silent: the probe times out instead of seeing a refused port.
+        let silent = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (mut console, listener) = reconnectable_console(silent.local_addr().unwrap().port());
+        *console.firmware.lock_recover() = Some("1.0.0".to_string());
+
+        console.reconnect(&ReconnectPolicy::default()).unwrap();
+        let _ = listener.accept().unwrap();
+        assert_eq!(console.firmware().as_deref(), Some("1.0.0"));
+    }
+
+    // `_keep_alive` holds `main` while it takes `wsock`. A reconnect on another clone must not
+    // hold `wsock` while it waits for `main`, or the two block each other forever.
+    #[test]
+    fn reconnect_waits_for_main_before_taking_the_writer() {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut console = WingConsole::connect_addr(listener.local_addr().unwrap()).unwrap();
+        let (_old_server, _) = listener.accept().unwrap();
+        let keeper = console.clone();
+
+        let main = keeper.main.lock_recover();
+        let reconnect = std::thread::spawn(move || console.reconnect(&ReconnectPolicy::default()));
+        let (_new_server, _) = listener.accept().unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !keeper.reconnecting.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "reconnect never reached the swap"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // Give reconnect time to reach its lock sequence, then act as `_keep_alive` would.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(
+            keeper.wsock.try_lock().is_ok(),
+            "reconnect holds the writer while waiting for main"
+        );
+        drop(main);
+        reconnect.join().unwrap().unwrap();
+    }
+
     // U4: a mutex poisoned by a peer thread's panic is recovered rather than cascading into a
     // panic on every subsequent lock. `lock_recover` returns the guard (and the intact data).
     #[test]
@@ -1952,6 +2293,15 @@ mod tests {
         bytes
     }
 
+    #[test]
+    fn native_response_limit_accepts_the_last_byte_and_rejects_the_next() {
+        assert!(ensure_native_response_capacity(MAX_NATIVE_RESPONSE_BYTES - 1).is_ok());
+        assert!(matches!(
+            ensure_native_response_capacity(MAX_NATIVE_RESPONSE_BYTES),
+            Err(Error::InvalidData)
+        ));
+    }
+
     // Regression (confirmed against a real WING rack console, 2026-07-06): every indexed Meter
     // variant's wire index byte must be one less than its 1-based `n`, or the console streams a
     // uniform one-channel-shifted set of levels (channel N's live signal lands on decoded slot
@@ -1959,7 +2309,7 @@ mod tests {
     #[test]
     fn encode_meter_channel_index_is_zero_based_on_the_wire() {
         let mut buf = Vec::new();
-        WingConsole::encode_meter(&mut buf, &Meter::Channel(1));
+        WingConsole::encode_meter(&mut buf, &Meter::Channel(1)).unwrap();
         assert_eq!(
             buf,
             vec![0xa0, 0],
@@ -1967,7 +2317,7 @@ mod tests {
         );
 
         let mut buf = Vec::new();
-        WingConsole::encode_meter(&mut buf, &Meter::Channel(4));
+        WingConsole::encode_meter(&mut buf, &Meter::Channel(4)).unwrap();
         assert_eq!(
             buf,
             vec![0xa0, 3],
@@ -1995,7 +2345,7 @@ mod tests {
         ];
         for (meter, opcode) in cases {
             let mut buf = Vec::new();
-            WingConsole::encode_meter(&mut buf, meter);
+            WingConsole::encode_meter(&mut buf, meter).unwrap();
             assert_eq!(
                 buf,
                 vec![*opcode, 1],
@@ -2007,12 +2357,53 @@ mod tests {
     #[test]
     fn encode_meter_monitor_and_rta_have_no_index_byte() {
         let mut buf = Vec::new();
-        WingConsole::encode_meter(&mut buf, &Meter::Monitor);
+        WingConsole::encode_meter(&mut buf, &Meter::Monitor).unwrap();
         assert_eq!(buf, vec![0xa9]);
 
         let mut buf = Vec::new();
-        WingConsole::encode_meter(&mut buf, &Meter::Rta);
+        WingConsole::encode_meter(&mut buf, &Meter::Rta).unwrap();
         assert_eq!(buf, vec![0xaa]);
+    }
+
+    #[test]
+    fn encode_meter_rejects_indices_outside_each_family() {
+        let cases = [
+            Meter::Channel(0),
+            Meter::Channel(41),
+            Meter::Aux(9),
+            Meter::Bus(17),
+            Meter::Main(5),
+            Meter::Matrix(9),
+            Meter::Dca(17),
+            Meter::Fx(17),
+            Meter::Source(17),
+            Meter::Output(12),
+            Meter::Channel2(41),
+            Meter::Aux2(9),
+            Meter::Bus2(17),
+            Meter::Main2(5),
+            Meter::Matrix2(9),
+        ];
+
+        for meter in cases {
+            let mut buf = Vec::new();
+            assert!(matches!(
+                WingConsole::encode_meter(&mut buf, &meter),
+                Err(Error::InvalidInput)
+            ));
+            assert!(buf.is_empty(), "{meter:?} must not be partially encoded");
+        }
+    }
+
+    #[test]
+    fn request_meter_rejects_zero_before_initializing_the_subscription() {
+        let mut console = console_with_input(&[]);
+
+        assert!(matches!(
+            console.request_meter(&[Meter::Channel(0)]),
+            Err(Error::InvalidInput)
+        ));
+        assert!(!console.has_meter_socket.load(Ordering::Acquire));
     }
 
     #[test]

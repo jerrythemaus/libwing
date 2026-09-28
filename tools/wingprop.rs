@@ -3,7 +3,48 @@ use utils::Args;
 
 use std::result::Result;
 
-use libwing::{NodeType, WingConsole, WingNodeDef, WingResponse};
+use libwing::{NodeType, WingConsole, WingNodeData, WingNodeDef, WingResponse};
+
+#[derive(Debug)]
+enum SetValue {
+    String(String),
+    Integer(i32),
+    Float(f32),
+}
+
+fn parse_set_value(node_type: NodeType, value: &str) -> Result<SetValue, String> {
+    match node_type {
+        NodeType::StringEnum | NodeType::String => Ok(SetValue::String(value.to_string())),
+        NodeType::Integer => value
+            .parse()
+            .map(SetValue::Integer)
+            .map_err(|_| format!("expected an integer, got {value}")),
+        NodeType::FloatEnum
+        | NodeType::FaderLevel
+        | NodeType::LogarithmicFloat
+        | NodeType::LinearFloat => value
+            .parse()
+            .map(SetValue::Float)
+            .map_err(|_| format!("expected a floating point number, got {value}")),
+        NodeType::Node => Err("nodes cannot be set".to_string()),
+        _ => Err("node type is unknown to this libwing version".to_string()),
+    }
+}
+
+/// One property lookup line: `name = value`, or with `-j` a bare JSON value -- a string for
+/// String/StringEnum properties, a number for numeric ones.
+fn format_lookup(propname: &str, proptype: NodeType, data: &WingNodeData, json: bool) -> String {
+    let value = data.get_string();
+    if !json {
+        return format!("{propname} = {value}");
+    }
+    match proptype {
+        NodeType::StringEnum | NodeType::String => jzon::stringify(jzon::JsonValue::String(value)),
+        _ if data.has_float() => jzon::stringify(data.get_float()),
+        _ if data.has_int() => jzon::stringify(data.get_int()),
+        _ => jzon::stringify(jzon::JsonValue::String(value)),
+    }
+}
 
 fn main() -> Result<(), libwing::Error> {
     let mut args = Args::new(
@@ -36,7 +77,7 @@ Usage: wingprop [-h host] [-j] property[=value|?]
     #[derive(Debug)]
     enum Action {
         Lookup,
-        Set(String),
+        Set(SetValue),
         Definition,
     }
 
@@ -93,7 +134,11 @@ Usage: wingprop [-h host] [-j] property[=value|?]
         let parts: Vec<&str> = arg.split("=").collect();
         if parts.len() == 2 {
             (propid, propparentid, propname, proptype) = parse_id(parts[0]);
-            Action::Set(parts[1].to_string())
+            let value = parse_set_value(proptype, parts[1]).unwrap_or_else(|error| {
+                eprintln!("Invalid value for {propname}: {error}");
+                std::process::exit(1);
+            });
+            Action::Set(value)
         } else if parts.len() == 1 {
             (propid, propparentid, propname, proptype) = parse_id(parts[0]);
             Action::Lookup
@@ -114,53 +159,13 @@ Usage: wingprop [-h host] [-j] property[=value|?]
             }
         }
         Action::Set(val) => {
-            match proptype {
-                NodeType::Node => {
-                    eprintln!(
-                        "Can not set node {} because it's a node, and not a property.",
-                        propname
-                    );
-                    std::process::exit(1);
-                }
-                NodeType::StringEnum | NodeType::String => {
-                    wing.set_string(propid, &val)?;
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    std::process::exit(0);
-                }
-                NodeType::Integer => {
-                    if let Ok(v) = val.parse::<i32>() {
-                        wing.set_int(propid, v)?;
-                    } else {
-                        eprintln!(
-                            "Property {} is an integer, but that was not passed: {}",
-                            propname, val
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    std::process::exit(0);
-                }
-                NodeType::FloatEnum
-                | NodeType::FaderLevel
-                | NodeType::LogarithmicFloat
-                | NodeType::LinearFloat => {
-                    if let Ok(v) = val.parse::<f32>() {
-                        wing.set_float(propid, v)?;
-                    } else {
-                        eprintln!(
-                            "Property {} is a floating point number, but that was not passed: {}",
-                            propname, val
-                        );
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(100));
-                    std::process::exit(0);
-                }
-                // NodeType is non_exhaustive (R21): a node type this build of libwing
-                // doesn't know about falls here rather than being guessed at.
-                _ => {
-                    eprintln!("Property {} has a node type unknown to this libwing version; refusing to guess how to set it.", propname);
-                    std::process::exit(1);
-                }
+            match val {
+                SetValue::String(v) => wing.set_string(propid, &v)?,
+                SetValue::Integer(v) => wing.set_int(propid, v)?,
+                SetValue::Float(v) => wing.set_float(propid, v)?,
             }
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            std::process::exit(0);
         }
         Action::Definition => {
             if proptype == NodeType::Node {
@@ -206,12 +211,7 @@ Usage: wingprop [-h host] [-j] property[=value|?]
                         | NodeType::LogarithmicFloat
                         | NodeType::FaderLevel
                         | NodeType::String => {
-                            let value = data.get_string();
-                            if jsonoutput {
-                                println!("{}", value);
-                            } else {
-                                println!("{} = {}", propname, value);
-                            }
+                            println!("{}", format_lookup(&propname, proptype, &data, jsonoutput));
                         }
                         // NodeType is non_exhaustive (R21): print the raw value for a
                         // node type this build of libwing doesn't know about.
@@ -241,5 +241,62 @@ Usage: wingprop [-h host] [-j] property[=value|?]
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn json_string_lookup_is_escaped_and_parseable() {
+        let data = WingNodeData::with_string("line \"one\"\nline two".to_string());
+        let output = format_lookup("/ch/1/name", NodeType::String, &data, true);
+        let parsed = jzon::parse(&output).expect("-j must emit valid JSON");
+        assert_eq!(parsed.as_str(), Some("line \"one\"\nline two"));
+    }
+
+    #[test]
+    fn json_string_enum_lookup_is_a_json_string() {
+        let data = WingNodeData::with_string("HALL".to_string());
+        let output = format_lookup("/fx/1/mdl", NodeType::StringEnum, &data, true);
+        assert_eq!(output, "\"HALL\"");
+    }
+
+    #[test]
+    fn json_numeric_lookups_stay_json_numbers() {
+        let float = format_lookup(
+            "/ch/1/fdr",
+            NodeType::FaderLevel,
+            &WingNodeData::with_float(-6.5),
+            true,
+        );
+        assert_eq!(jzon::parse(&float).unwrap().as_f32(), Some(-6.5));
+        let int = format_lookup(
+            "/cfg/amix/x",
+            NodeType::Integer,
+            &WingNodeData::with_i32(3),
+            true,
+        );
+        assert_eq!(jzon::parse(&int).unwrap().as_i32(), Some(3));
+    }
+
+    #[test]
+    fn plain_lookup_keeps_the_name_equals_value_form() {
+        let data = WingNodeData::with_string("HALL".to_string());
+        assert_eq!(
+            format_lookup("/fx/1/mdl", NodeType::StringEnum, &data, false),
+            "/fx/1/mdl = HALL"
+        );
+    }
+
+    #[test]
+    fn invalid_integer_set_is_rejected_before_connecting() {
+        assert!(parse_set_value(NodeType::Integer, "not-an-integer").is_err());
+    }
+
+    #[test]
+    fn invalid_float_set_is_rejected_before_connecting() {
+        assert!(parse_set_value(NodeType::LinearFloat, "not-a-float").is_err());
     }
 }

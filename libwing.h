@@ -66,6 +66,11 @@ typedef enum {
     MATRIX2 = 0xAF
 } MeterType;
 #define METER_ID(type, index) (((type << 8) | (index & 0xFF)) & 0xFFFF)
+// Meter ids for wing_console_request_meter(). `index` is 1-based and must be within the
+// family: CHANNEL/CHANNEL2 1-40, AUX/AUX2 1-8, BUS/BUS2 1-16, MAIN/MAIN2 1-4,
+// MATRIX/MATRIX2 1-8, DCA 1-16, FX 1-16, SOURCE 1-16, OUTPUT 1-11. MONITOR and RTA take no
+// index and must pass 0. Any other id makes wing_console_request_meter() return 0 without
+// subscribing anything (see wing_last_error_message()).
 
 WingDiscoveryInfo* wing_discover_scan                             (int stop_on_first); // Return value must be freed by wing_discover_destroy()
 int                wing_discover_count                            (const WingDiscoveryInfo* handle);
@@ -162,8 +167,9 @@ Response*          wing_id_to_defs_get_def                        (int32_t id, s
 // owned by the library and valid until the next failing call on the same thread --
 // do not free it, and do not pass it to wing_string_destroy(). wing_last_error_code()
 // returns 0 if nothing has failed yet, -1 for an FFI-usage error (bad argument
-// detected at the FFI boundary, e.g. a null pointer), 1-8 for a specific underlying
-// error, or 99 for a future/unrecognized error variant.
+// detected at the FFI boundary, e.g. a null pointer), 1-9 for a specific underlying
+// error (9: interrupted by a reconnect on another handle -- retry, do not reconnect
+// again), or 99 for a future/unrecognized error variant.
 const char*        wing_last_error_message                        (void);
 int                wing_last_error_code                            (void);
 

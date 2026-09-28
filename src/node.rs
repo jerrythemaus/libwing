@@ -478,6 +478,24 @@ impl WingNodeData {
             crate::helpers::EnumDecode::Unknown(_) => self.get_string(),
         }
     }
+
+    /// The `def.string_enum` item this value names, carried either as an in-range
+    /// index or as one of the item labels (the console and emulator use both forms).
+    /// `None` for anything else, so a caller never restores a guessed value.
+    pub fn string_enum_item<'a>(&self, def: &'a WingNodeDef) -> Option<&'a str> {
+        let items = def.string_enum.as_ref()?;
+        let item = if self.has_int() {
+            usize::try_from(self.get_int())
+                .ok()
+                .and_then(|index| items.get(index))
+        } else if self.has_string() {
+            let name = self.get_string();
+            items.iter().find(|item| item.item == name)
+        } else {
+            None
+        };
+        item.map(|item| item.item.as_str())
+    }
 }
 
 impl WingNodeDef {

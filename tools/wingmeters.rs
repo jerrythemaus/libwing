@@ -8,6 +8,16 @@ use utils::Args;
 // Number of channels to request meters for max 40
 const CHANNEL_COUNT: u8 = 16;
 
+fn meter_color(value: f32) -> Color32 {
+    if value > 0.9 {
+        Color32::RED
+    } else if value > 0.7 {
+        Color32::YELLOW
+    } else {
+        Color32::GREEN
+    }
+}
+
 fn main() -> Result<(), libwing::Error> {
     let mut args = Args::new(
         r#"
@@ -37,6 +47,18 @@ Usage: wingmeters [-h host]
     .unwrap();
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stereo_meter_colors_are_chosen_from_each_channel_value() {
+        assert_eq!(meter_color(0.95), Color32::RED);
+        assert_eq!(meter_color(0.80), Color32::YELLOW);
+        assert_eq!(meter_color(0.25), Color32::GREEN);
+    }
 }
 
 struct WingMetersApp {
@@ -99,13 +121,8 @@ impl eframe::App for WingMetersApp {
                     let (_id, rect) = ui.allocate_space(vec2(ui.available_width(), meter_height));
 
                     // Draw meter value
-                    let color = if left > 0.9 {
-                        Color32::RED
-                    } else if left > 0.7 {
-                        Color32::YELLOW
-                    } else {
-                        Color32::GREEN
-                    };
+                    let left_color = meter_color(left);
+                    let right_color = meter_color(right);
 
                     // bg left
                     ui.painter().rect_filled(
@@ -123,7 +140,7 @@ impl eframe::App for WingMetersApp {
                             vec2(rect.width() / 2.0 - 1.0, meter_height * left),
                         ),
                         0.0,
-                        color,
+                        left_color,
                     );
 
                     // bg right
@@ -148,7 +165,7 @@ impl eframe::App for WingMetersApp {
                             rect.max,
                         ),
                         0.0,
-                        color,
+                        right_color,
                     );
                 });
             }

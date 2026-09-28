@@ -156,9 +156,21 @@ fn push_osc_blob(buf: &mut Vec<u8>, data: &[u8]) {
 /// 8 bytes, page 20) as *input*; [`decode`] accepts that shape too, but `encode` always
 /// produces the shorter, spec-canonical one.
 ///
-/// Errors with [`OscError::TooLarge`] if the encoded message would exceed
-/// [`MAX_PACKET_BYTES`].
+/// Errors with [`OscError::Malformed`] if the address or a string argument contains an
+/// embedded NUL (which cannot be represented in an OSC string), or with
+/// [`OscError::TooLarge`] if the encoded message would exceed [`MAX_PACKET_BYTES`].
 pub fn encode(msg: &OscMessage) -> Result<Vec<u8>> {
+    if msg.addr.as_bytes().contains(&0)
+        || msg
+            .args
+            .iter()
+            .any(|arg| matches!(arg, OscArg::Str(value) if value.as_bytes().contains(&0)))
+    {
+        return Err(OscError::Malformed(
+            "OSC strings cannot contain embedded NULs",
+        ));
+    }
+
     let mut buf = Vec::new();
     push_osc_string(&mut buf, &msg.addr);
 
@@ -206,6 +218,8 @@ fn read_osc_string(bytes: &[u8], i: &mut usize) -> Result<String> {
     if start + padded_total > bytes.len() {
         return Err(OscError::Malformed("truncated OSC string padding"));
     }
+    // Padding carries no data. The spec says it is zero, but no hardware OSC capture has
+    // confirmed the WING honors that, so its content is ignored rather than rejected.
     *i = start + padded_total;
     Ok(s)
 }
@@ -244,7 +258,7 @@ fn read_blob(bytes: &[u8], i: &mut usize) -> Result<Vec<u8>> {
     if *i + pad > bytes.len() {
         return Err(OscError::Malformed("truncated blob padding"));
     }
-    *i += pad;
+    *i += pad; // content ignored, as for string padding
     Ok(data)
 }
 
@@ -284,6 +298,9 @@ pub fn decode(bytes: &[u8]) -> Result<OscMessage> {
             'b' => OscArg::Blob(read_blob(bytes, &mut i)?),
             _ => return Err(OscError::Malformed("unsupported OSC type tag")),
         });
+    }
+    if i != bytes.len() {
+        return Err(OscError::Malformed("trailing bytes after OSC arguments"));
     }
     Ok(OscMessage { addr, args })
 }

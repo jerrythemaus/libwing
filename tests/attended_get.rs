@@ -8,7 +8,8 @@
 use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Condvar, Mutex};
+use std::thread;
 use std::time::{Duration, Instant};
 
 use libwing::{Error, Transport, WingConsole, WingResponse};
@@ -100,6 +101,104 @@ fn console_with_script(bytes: Vec<u8>, chunk_size: usize) -> WingConsole {
     let writer = RecordingWriter::default();
     let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     WingConsole::from_transports(reader, writer, peer_ip)
+}
+
+#[derive(Default)]
+struct CoordinatedState {
+    requests: Vec<i32>,
+    responses: VecDeque<u8>,
+    request_order_decided: bool,
+    serialized_requests: bool,
+}
+
+struct CoordinatedReader {
+    state: Arc<(Mutex<CoordinatedState>, Condvar)>,
+    first_read_started: mpsc::Sender<()>,
+}
+
+impl Read for CoordinatedReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let _ = self.first_read_started.send(());
+        let (state, requests_changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        if !state.request_order_decided {
+            let (next, _) = requests_changed
+                .wait_timeout_while(state, Duration::from_millis(100), |state| {
+                    state.requests.len() < 2
+                })
+                .unwrap();
+            state = next;
+            state.request_order_decided = true;
+            state.serialized_requests = state.requests.len() == 1;
+            if state.serialized_requests {
+                state.responses.extend(node_data_i32(50, 500));
+            } else {
+                state.responses.extend(node_data_i32(51, 510));
+                state.responses.extend(node_data_i32(50, 500));
+            }
+        }
+        if state.responses.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no more coordinated responses",
+            ));
+        }
+        let n = buf.len().min(state.responses.len());
+        for slot in buf.iter_mut().take(n) {
+            *slot = state.responses.pop_front().unwrap();
+        }
+        Ok(n)
+    }
+}
+
+impl Write for CoordinatedReader {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Transport for CoordinatedReader {
+    fn set_read_timeout(&mut self, _dur: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+struct CoordinatedWriter {
+    state: Arc<(Mutex<CoordinatedState>, Condvar)>,
+}
+
+impl Read for CoordinatedWriter {
+    fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+        unreachable!("writer transport is never read")
+    }
+}
+
+impl Write for CoordinatedWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let id = i32::from_be_bytes(buf[1..5].try_into().unwrap());
+        let (state, requests_changed) = &*self.state;
+        let mut state = state.lock().unwrap();
+        state.requests.push(id);
+        if state.request_order_decided && state.serialized_requests && id == 51 {
+            state.responses.extend(node_data_i32(51, 510));
+        }
+        requests_changed.notify_all();
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Transport for CoordinatedWriter {
+    fn set_read_timeout(&mut self, _dur: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 /// A `NodeData` response frame carrying an i32: select-node (0xd7) + id, then the i32
@@ -271,6 +370,41 @@ fn by_name_variants_reject_unknown_names() {
         console.get_node_definition_by_name("/not/a/real/path", Duration::from_millis(50)),
         Err(Error::InvalidInput)
     ));
+}
+
+#[test]
+fn concurrent_attended_gets_do_not_consume_each_others_responses() {
+    let state = Arc::new((
+        Mutex::new(CoordinatedState {
+            requests: Vec::new(),
+            responses: VecDeque::new(),
+            request_order_decided: false,
+            serialized_requests: false,
+        }),
+        Condvar::new(),
+    ));
+    let (first_read_started_tx, first_read_started_rx) = mpsc::channel();
+    let reader = CoordinatedReader {
+        state: state.clone(),
+        first_read_started: first_read_started_tx,
+    };
+    let writer = CoordinatedWriter {
+        state: state.clone(),
+    };
+    let mut first = WingConsole::from_transports(reader, writer, IpAddr::V4(Ipv4Addr::LOCALHOST));
+    let mut second = first.clone();
+
+    let first_get = thread::spawn(move || first.get_node_data(50, Duration::from_millis(500)));
+    first_read_started_rx
+        .recv_timeout(Duration::from_millis(500))
+        .expect("first get should be waiting in the shared reader");
+    let second_get = thread::spawn(move || second.get_node_data(51, Duration::from_millis(500)));
+
+    let (first_data, _) = first_get.join().unwrap().expect("id 50 should resolve");
+    let (second_data, _) = second_get.join().unwrap().expect("id 51 should resolve");
+    assert_eq!(first_data.get_int(), 500);
+    assert_eq!(second_data.get_int(), 510);
+    assert_eq!(state.0.lock().unwrap().requests, vec![50, 51]);
 }
 
 fn variant_name(resp: &WingResponse) -> &'static str {

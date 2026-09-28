@@ -1,5 +1,38 @@
 # Change Log
 
+## [Unreleased]
+
+### Breaking
+
+- `NodeDump` gains a public `unknown_models` field; struct literals must set it (or
+  use `..Default::default()`).
+- `dump_subtree` now captures StringEnum leaves (including model selectors) as
+  `NodeValue::String(label)` instead of `NodeValue::Int(index)`. Restoring through
+  `set_nodes`/`restore` and comparing through `values_match_at` treat both forms
+  alike, but a stored dump compared byte-for-byte against one taken before this
+  change will differ on every StringEnum entry.
+- `request_meter` / `wing_console_request_meter` reject out-of-family meter
+  indices and nonzero MONITOR/RTA indices instead of sending them; see the ranges
+  documented beside `METER_ID` in `libwing.h`.
+
+### Added
+
+- `Error::Reconnecting` (C code 9): an operation was interrupted by a reconnect on
+  another clone. Retry it; do not reconnect again.
+- `WingNodeData::string_enum_item`: resolves a StringEnum value sent either as an
+  index or as a label.
+
+### Fixed
+
+- `reconnect` no longer deadlocks against `keep_alive` on another clone.
+- `reconnect` keeps the known firmware when its re-probe gets no reply.
+- `dump_subtree` no longer fails on a model the embedded map does not know (newer
+  firmware); it skips that model's branches and lists the selector in
+  `NodeDump::unknown_models`. It also stops with `Error::Reconnecting` when another
+  clone asks to reconnect instead of holding that reconnect for the whole sweep.
+- OSC decode ignores the content of padding bytes (trailing bytes after the
+  declared arguments are still rejected).
+
 ## [2.0.0] - 2026-07-05
 
 The wing-control-first v1 release: dynamic firmware-aware schema, a higher-level
