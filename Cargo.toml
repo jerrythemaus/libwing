@@ -22,7 +22,7 @@ propmap = []
 
 [lib]
 name = "libwing"
-crate-type = ["rlib", "cdylib"]
+crate-type = ["rlib"]
 
 [dependencies]
 lazy_static = "1.5"

@@ -155,8 +155,6 @@ const AUDIO_ENGINE_CHANNEL: u8 = 1;
 const MAX_ATTENDED_BUFFERED: usize = 64 * 1024;
 /// Receive buffer for one meter datagram: a 4-byte header plus big-endian i16 samples.
 const METER_FRAME_BYTES: usize = 8192;
-/// Most samples one meter datagram can carry.
-pub(crate) const MAX_METER_SAMPLES: usize = (METER_FRAME_BYTES - 4) / 2;
 
 /// Big-endian samples of a meter frame body. `as_chunks` gives LLVM fixed-size pairs, which it
 /// vectorizes (about 2x `chunks_exact` on a full frame).
