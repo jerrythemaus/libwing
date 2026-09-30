@@ -12,7 +12,7 @@ use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use libwing::{Error, LiveSchema, Transport, WingConsole, WingResponse};
+use libwing::{Error, LiveSchema, Resolution, Transport, WingConsole, WingResponse};
 
 /// Feeds pre-scripted wire bytes to the console's reader. An empty script reports
 /// `TimedOut` (matching what a real timed-out socket read looks like to `decode_next`)
@@ -101,6 +101,43 @@ fn console_with_script(bytes: Vec<u8>, chunk_size: usize) -> WingConsole {
     let writer = RecordingWriter::default();
     let peer_ip = IpAddr::V4(Ipv4Addr::LOCALHOST);
     WingConsole::from_transports(reader, writer, peer_ip)
+}
+
+struct AppendableReader {
+    bytes: Arc<Mutex<VecDeque<u8>>>,
+}
+
+impl Read for AppendableReader {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut bytes = self.bytes.lock().unwrap();
+        if bytes.is_empty() {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "no response available",
+            ));
+        }
+        let n = buf.len().min(bytes.len());
+        for slot in buf.iter_mut().take(n) {
+            *slot = bytes.pop_front().unwrap();
+        }
+        Ok(n)
+    }
+}
+
+impl Write for AppendableReader {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Transport for AppendableReader {
+    fn set_read_timeout(&mut self, _dur: Option<Duration>) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
@@ -216,14 +253,18 @@ fn node_data_i32(id: i32, value: i32) -> Vec<u8> {
 /// wire form (`0xdf 0xdf` marker + u16 length sentinel + u32 length + body), same shape
 /// as `console.rs`'s `extended_node_definition_uses_u32_length` test.
 fn node_def(id: i32, parent_id: i32) -> Vec<u8> {
+    node_def_named(id, parent_id, "n")
+}
+
+fn node_def_named(id: i32, parent_id: i32, name: &str) -> Vec<u8> {
     let mut def = Vec::new();
     def.extend_from_slice(&parent_id.to_be_bytes());
     def.extend_from_slice(&id.to_be_bytes());
     def.extend_from_slice(&3_u16.to_be_bytes()); // index
-    def.push(1);
-    def.push(b'n');
-    def.push(1);
-    def.push(b'N');
+    def.push(name.len() as u8);
+    def.extend_from_slice(name.as_bytes());
+    def.push(name.len() as u8);
+    def.extend(name.bytes().map(|byte| byte.to_ascii_uppercase()));
     def.extend_from_slice(&0_u16.to_be_bytes()); // flags: Node type, no unit, r/w
 
     let mut frame = vec![0xdf, 0xdf, 0, 0];
@@ -464,6 +505,67 @@ fn refresh_subtree_times_out_on_a_silent_console_and_keeps_interleaved_data() {
             other.is_ok()
         ),
     }
+}
+
+#[test]
+fn refresh_ignores_an_uncorrelated_end_marker() {
+    let mut script = request_end();
+    script.extend(node_def(7, 0));
+    script.extend(request_end());
+    let mut console = console_with_script(script, 4096);
+    let mut schema = LiveSchema::new();
+
+    assert_eq!(
+        schema
+            .refresh_subtree(&mut console, 7, Duration::from_millis(500))
+            .unwrap(),
+        1
+    );
+    assert!(matches!(
+        console.read_timeout(Duration::from_millis(100)),
+        Ok(WingResponse::RequestEnd)
+    ));
+}
+
+#[test]
+fn refresh_excludes_a_stale_definition_batch_queued_by_a_timed_out_get() {
+    let mut stale = node_def_named(7, 0, "old");
+    stale.extend(request_end());
+    let shared = Arc::new(Mutex::new(VecDeque::from(stale)));
+    let reader = AppendableReader {
+        bytes: shared.clone(),
+    };
+    let writer = RecordingWriter::default();
+    let mut console = WingConsole::from_transports(reader, writer, IpAddr::V4(Ipv4Addr::LOCALHOST));
+
+    assert!(matches!(
+        console.get_node_data(999, Duration::from_millis(50)),
+        Err(Error::Timeout)
+    ));
+    let mut fresh = node_def_named(7, 0, "fresh");
+    fresh.extend(request_end());
+    shared.lock().unwrap().extend(fresh);
+
+    let mut schema = LiveSchema::new();
+    assert_eq!(
+        schema
+            .refresh_subtree(&mut console, 7, Duration::from_millis(500))
+            .unwrap(),
+        1
+    );
+    match schema.resolve_id(7, None).unwrap() {
+        Resolution::Confirmed { def, .. } => assert_eq!(def.name, "fresh"),
+        Resolution::Unknown { .. } => panic!("fresh definition should resolve"),
+        _ => panic!("unexpected resolution variant"),
+    }
+    match console.read_timeout(Duration::from_millis(100)) {
+        Ok(WingResponse::NodeDef(def)) => assert_eq!(def.name, "old"),
+        _ => panic!("stale queued definition was not restored"),
+    }
+    assert!(matches!(
+        console.read_timeout(Duration::from_millis(100)),
+        Ok(WingResponse::RequestEnd)
+    ));
 }
 
 fn variant_name(resp: &WingResponse) -> &'static str {

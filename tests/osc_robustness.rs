@@ -72,6 +72,34 @@ fn duplicate_reply_does_not_corrupt_next_request() {
     responder.join().unwrap();
 }
 
+#[test]
+fn duplicate_reply_flood_does_not_extend_request_deadline() {
+    let console_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let console_addr = console_sock.local_addr().unwrap();
+    let client = WingOscClient::connect_addr(console_addr).unwrap();
+    let request = osc::get_param("/ch/1/fdr").unwrap();
+    let reply = fdr_reply("/ch/1/fdr", -6.0);
+
+    let responder = std::thread::spawn(move || {
+        let mut buf = [0u8; 1024];
+        let (_, from) = console_sock.recv_from(&mut buf).unwrap();
+        let bytes = encode(&reply).unwrap();
+        let until = Instant::now() + Duration::from_millis(100);
+        while Instant::now() < until {
+            console_sock.send_to(&bytes, from).unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    });
+
+    let started = Instant::now();
+    client.request(&request, Duration::from_millis(10)).unwrap();
+    assert!(
+        started.elapsed() < Duration::from_millis(60),
+        "duplicate draining exceeded the request deadline"
+    );
+    responder.join().unwrap();
+}
+
 // ---------------------------------------------------------------------------
 // R75: out-of-order replies
 // ---------------------------------------------------------------------------
@@ -502,6 +530,34 @@ fn poll_event_requires_an_active_subscription() {
 
     let err = client.poll_event(Duration::from_millis(50)).unwrap_err();
     assert!(matches!(err, OscError::Malformed(_)));
+}
+
+#[test]
+fn subscription_and_renewal_target_the_bound_reply_port() {
+    let console_sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let console_addr = console_sock.local_addr().unwrap();
+    let reply_port = UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let client = WingOscClient::connect_addr(console_addr)
+        .unwrap()
+        .bind_reply_port(reply_port)
+        .unwrap();
+
+    client
+        .subscribe_with_renewal(SubscriptionFormat::OscTriplet, Duration::ZERO)
+        .unwrap();
+    client.renew().unwrap();
+
+    let mut buf = [0u8; 1024];
+    for _ in 0..2 {
+        let (n, _) = console_sock.recv_from(&mut buf).unwrap();
+        let message = decode(&buf[..n]).unwrap();
+        assert_eq!(message.addr, format!("/%{reply_port}/*s"));
+        assert!(message.args.is_empty());
+    }
 }
 
 #[test]

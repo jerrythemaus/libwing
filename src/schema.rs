@@ -12,12 +12,12 @@
 
 use std::cmp::Ordering;
 use std::collections::HashMap;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use crate::console::WingConsole;
 use crate::node::WingNodeDef;
 use crate::safety::Operation;
-use crate::{Error, Result, WingResponse};
+use crate::Result;
 
 /// The firmware version the checked-in embedded map (`src/propmap.jsonl` /
 /// `src/propmap.rs`) was swept from. A single obvious const so downstream
@@ -168,14 +168,14 @@ impl Schema {
 
 /// Parses a dotted-numeric version string into its per-segment integers,
 /// tolerating a trailing non-digit suffix per segment (see
-/// [`Schema::staleness`]). Returns `None` if the first segment has no leading
-/// digits at all (nothing sane to compare).
+/// [`Schema::staleness`]). Returns `None` if any segment has no leading digits
+/// at all (nothing sane to compare).
 fn parse_version(s: &str) -> Option<Vec<u32>> {
     let mut parts = Vec::new();
     for segment in s.split('.') {
         let digits: String = segment.chars().take_while(|c| c.is_ascii_digit()).collect();
         if digits.is_empty() {
-            break;
+            return None;
         }
         parts.push(digits.parse().ok()?);
     }
@@ -247,6 +247,10 @@ impl LiveSchema {
         let key = resolved.clone().unwrap_or_else(|| format!("#{}", def.id));
 
         let candidates = self.by_id.entry(def.id).or_default();
+        if resolved.is_some() {
+            let placeholder = format!("#{}", def.id);
+            candidates.retain(|(name, _)| name != &placeholder);
+        }
         match candidates.iter_mut().find(|(name, _)| *name == key) {
             Some(slot) => slot.1 = def.clone(),
             None => candidates.push((key.clone(), def.clone())),
@@ -268,7 +272,13 @@ impl LiveSchema {
                 let (path, _) = candidates.next()?;
                 candidates.next().is_none().then(|| path.to_owned())
             })?;
-        Some(format!("{parent_path}/{}", def.name))
+        let fullname = format!("{parent_path}/{}", def.name);
+        let suffix = format!("/{}", def.name);
+        let is_unqualified_model_child =
+            WingConsole::id_to_defs_iter(def.id).is_some_and(|mut defs| {
+                defs.any(|(embedded, _)| embedded != fullname && embedded.ends_with(&suffix))
+            });
+        (!is_unqualified_model_child).then_some(fullname)
     }
 
     /// Overlay-aware equivalent of [`Schema::resolve_id`]. Live definitions
@@ -323,7 +333,7 @@ impl LiveSchema {
     ///
     /// `timeout` bounds the whole call, including a read the console never
     /// answers: each read waits only for what is left of it, then the call
-    /// returns [`Error::Timeout`]. `NodeData` interleaved with the definition
+    /// returns [`crate::Error::Timeout`]. `NodeData` interleaved with the definition
     /// stream is not part of the refresh; it is handed back to the console's
     /// pending queue when the call returns, so the next `read()` still
     /// delivers it.
@@ -333,28 +343,12 @@ impl LiveSchema {
         subtree_root_id: i32,
         timeout: Duration,
     ) -> Result<usize> {
-        let deadline = Instant::now() + timeout;
-        console.request_node_definition(subtree_root_id)?;
-
-        let mut count = 0;
-        let mut interleaved = Vec::new();
-        let result = loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
-                break Err(Error::Timeout);
-            }
-            match console.read_timeout(remaining) {
-                Ok(WingResponse::NodeDef(def)) => {
-                    self.apply_node_def(&def, None);
-                    count += 1;
-                }
-                Ok(WingResponse::RequestEnd) => break Ok(count),
-                Ok(data @ WingResponse::NodeData(..)) => interleaved.push(data),
-                Err(err) => break Err(err),
-            }
-        };
-        console.requeue(interleaved);
-        result
+        let definitions = console.get_node_definitions(subtree_root_id, timeout)?;
+        let count = definitions.len();
+        for def in definitions {
+            self.apply_node_def(&def, None);
+        }
+        Ok(count)
     }
 }
 

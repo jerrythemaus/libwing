@@ -17,19 +17,46 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 SCEN="$ROOT/crates/wing-emulator/tests/fixtures/scenarios"
+# Keep Cargo configuration identical for metadata and both builds, even outside the checkout.
+cd "$ROOT"
 
 echo "building binaries..."
-cargo build -q -p wing-emulator --bin wing-emulator
-( cd "$ROOT/libwing" && cargo build -q --example wingcapture --example wingdrive )
+cargo build -q --locked --manifest-path "$ROOT/Cargo.toml" -p wing-emulator --bin wing-emulator
+cargo build -q --locked --manifest-path "$ROOT/libwing/Cargo.toml" --example wingcapture --example wingdrive
 
-EMU="$ROOT/target/debug/wing-emulator"
-WC="$ROOT/libwing/target/debug/examples/wingcapture"
-WD="$ROOT/libwing/target/debug/examples/wingdrive"
+target_directory() {
+  cargo metadata --no-deps --locked --format-version 1 --manifest-path "$1" \
+    | python3 -c 'import json, sys; print(json.load(sys.stdin)["target_directory"])'
+}
+EMU="$(target_directory "$ROOT/Cargo.toml")/debug/wing-emulator"
+LIBWING_TARGET="$(target_directory "$ROOT/libwing/Cargo.toml")"
+WC="$LIBWING_TARGET/debug/examples/wingcapture"
+WD="$LIBWING_TARGET/debug/examples/wingdrive"
 
 WORK="$(mktemp -d)"
 declare -a PIDS=()
-cleanup() { for p in "${PIDS[@]:-}"; do kill -9 "$p" 2>/dev/null || true; done; wait 2>/dev/null || true; rm -rf "$WORK"; }
+cleanup() {
+  local status=$?
+  for p in "${PIDS[@]:-}"; do kill "$p" 2>/dev/null || true; done
+  wait 2>/dev/null || true
+  if [ "$status" -ne 0 ]; then
+    if [ -n "${WING_DIFFERENTIAL_LOG_DIR:-}" ]; then
+      mkdir -p "$WING_DIFFERENTIAL_LOG_DIR"
+      find "$WORK" -maxdepth 1 -type f \( -name '*.log' -o -name '*.txt' \) \
+        -exec cp {} "$WING_DIFFERENTIAL_LOG_DIR/" \;
+    fi
+    for log in "$WORK"/*.log "$WORK"/*.txt; do
+      [ -f "$log" ] || continue
+      echo "--- $log"
+      tail -100 "$log"
+    done
+  fi
+  rm -rf "$WORK"
+  exit "$status"
+}
 trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 Q="$WORK/quar"
 "$WC" --init-quarantine "$Q" >/dev/null
@@ -40,7 +67,7 @@ capture() {
   local ep=$!; PIDS+=("$ep"); disown "$ep" 2>/dev/null || true; sleep 1
   "$WC" --proxy-native 127.0.0.1:0 "127.0.0.1:$3" "$Q" "$2" --allow-state-changing --seconds 30 \
     >"$WORK/px_$2.log" 2>&1 &
-  local pp=$!
+  local pp=$!; PIDS+=("$pp")
   local addr=""
   for _ in $(seq 1 50); do
     addr="$(grep -oE '127\.0\.0\.1:[0-9]+' "$WORK/px_$2.log" | head -1 || true)"

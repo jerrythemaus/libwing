@@ -587,27 +587,29 @@ fn every_checked_in_fixture_passes_redaction() {
             }
         }
 
-        for line in &fx.lines {
-            let bytes = match line {
-                Line::NativeOut(b)
-                | Line::NativeIn(b)
-                | Line::MeterIn(b)
-                | Line::MeterRawIn(b)
-                | Line::MeterOut(b)
-                | Line::OscIn(b)
-                | Line::OscOut(b)
-                | Line::DiscoveryIn(b)
-                | Line::DiscoveryOut(b) => Some(b),
-                Line::Expect(_) => None,
-            };
-            if let Some(bytes) = bytes {
-                let findings = redact::scan(bytes);
-                assert!(
-                    findings.is_empty(),
-                    "{path:?}: un-redacted content in payload bytes: {findings:?}"
-                );
-            }
-        }
+        let events: Vec<_> = fx
+            .lines
+            .iter()
+            .filter_map(|line| {
+                let (channel, bytes) = match line {
+                    Line::NativeOut(b) => ("N>", b),
+                    Line::NativeIn(b) => ("N<", b),
+                    Line::MeterIn(b) | Line::MeterRawIn(b) => ("M<", b),
+                    Line::MeterOut(b) => ("M>", b),
+                    Line::OscIn(b) => ("O<", b),
+                    Line::OscOut(b) => ("O>", b),
+                    Line::DiscoveryIn(b) => ("D<", b),
+                    Line::DiscoveryOut(b) => ("D>", b),
+                    Line::Expect(_) => return None,
+                };
+                Some((channel.to_string(), bytes.clone()))
+            })
+            .collect();
+        let findings = redact::scan_events(&events);
+        assert!(
+            findings.is_empty(),
+            "{path:?}: un-redacted streams: {findings:?}"
+        );
     }
 }
 

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read, Write};
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
@@ -352,6 +352,9 @@ pub struct WingConsole {
     read_gate: Arc<Mutex<()>>,
     reconnect_gate: Arc<Mutex<()>>,
     reconnecting: Arc<AtomicBool>,
+    /// A raw capture timed out after consuming part of an uncorrelated stream. Only a new
+    /// TCP session can prove that the unread tail no longer belongs to the failed request.
+    stream_tainted: Arc<AtomicBool>,
     /// Clones waiting on `reconnect_gate`; a `dump_subtree` sweep yields to them.
     pending_reconnects: Arc<AtomicUsize>,
     /// Bumped by every successful reconnect, so a clone that queued behind another clone's
@@ -599,6 +602,7 @@ impl WingConsole {
             read_gate: Arc::new(Mutex::new(())),
             reconnect_gate: Arc::new(Mutex::new(())),
             reconnecting: Arc::new(AtomicBool::new(false)),
+            stream_tainted: Arc::new(AtomicBool::new(false)),
             pending_reconnects: Arc::new(AtomicUsize::new(0)),
             session_generation: Arc::new(AtomicU64::new(0)),
             mtrs: Arc::new(Mutex::new(_WingConsoleMeters {
@@ -705,6 +709,7 @@ impl WingConsole {
                         *self.firmware.lock_recover() = firmware;
                     }
                     self.session_generation.fetch_add(1, Ordering::AcqRel);
+                    self.stream_tainted.store(false, Ordering::Release);
                     self.reconnecting.store(false, Ordering::Release);
                     return Ok(ReconnectOutcome {
                         attempts: attempt,
@@ -734,6 +739,9 @@ impl WingConsole {
 
     /// Complete one read while the caller holds `read_gate`.
     fn read_locked(&mut self) -> Result<WingResponse> {
+        if self.stream_tainted.load(Ordering::Acquire) {
+            return Err(Error::ConnectionError);
+        }
         if self.reconnecting.load(Ordering::Acquire) {
             return Err(Error::Reconnecting);
         }
@@ -957,6 +965,7 @@ impl WingConsole {
     /// hang up the connection after a 10 seconds of no activity. You should call this yourself
     /// periodically if you are not calling read().
     pub fn keep_alive(&mut self) -> Result<()> {
+        self.ensure_stream_usable()?;
         self._keep_alive(&mut self.main.clone().lock_recover())
     }
 
@@ -974,6 +983,7 @@ impl WingConsole {
     /// hang up the connection after a 5 seconds of no activity. You should call this yourself
     /// periodically if you are not calling read_meters().
     pub fn keep_alive_meters(&mut self) -> Result<()> {
+        self.ensure_stream_usable()?;
         self._keep_alive_meters(&mut self.mtrs.clone().lock_recover())
     }
 
@@ -1160,6 +1170,7 @@ impl WingConsole {
     }
 
     pub fn request_node_definition(&mut self, id: i32) -> Result<()> {
+        self.ensure_stream_usable()?;
         let mut buf = Vec::new();
         if id == 0 {
             buf.push(0xda);
@@ -1172,6 +1183,7 @@ impl WingConsole {
     }
 
     pub fn request_node_data(&mut self, id: i32) -> Result<()> {
+        self.ensure_stream_usable()?;
         let mut buf = Vec::new();
         if id == 0 {
             buf.push(0xda);
@@ -1181,6 +1193,14 @@ impl WingConsole {
         };
         self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
+    }
+
+    fn ensure_stream_usable(&self) -> Result<()> {
+        if self.stream_tainted.load(Ordering::Acquire) {
+            Err(Error::ConnectionError)
+        } else {
+            Ok(())
+        }
     }
 
     fn set_op_deadline(&mut self, deadline: Option<Instant>) {
@@ -1299,6 +1319,56 @@ impl WingConsole {
         result
     }
 
+    /// Requests and drains a complete subtree definition stream while holding the shared
+    /// read gate. Responses queued before the request are excluded from the transaction.
+    /// An end marker is accepted only after a definition belonging to this request has
+    /// started the batch; an empty subtree cannot be distinguished from an unrelated end
+    /// marker, so an end-only response remains inconclusive and the operation times out.
+    /// Older queued responses and unrelated newly-read traffic are preserved for the next
+    /// reader.
+    pub(crate) fn get_node_definitions(
+        &mut self,
+        root_id: i32,
+        timeout: Duration,
+    ) -> Result<Vec<WingNodeDef>> {
+        let read_gate = self.read_gate.clone();
+        let _read_guard = read_gate.lock_recover();
+        let mut earlier = {
+            let mut main = self.main.lock_recover();
+            std::mem::take(&mut main.pending)
+        };
+        if let Err(error) = self.request_node_definition(root_id) {
+            self.requeue(earlier.into());
+            return Err(error);
+        }
+        let deadline = Instant::now() + timeout;
+        self.set_op_deadline(Some(deadline));
+        let mut definitions = Vec::new();
+        let mut ids = HashSet::from([root_id]);
+        let mut buffered = Vec::new();
+        let result = loop {
+            match self.read_locked() {
+                Ok(WingResponse::NodeDef(def))
+                    if ids.contains(&def.id) || ids.contains(&def.parent_id) =>
+                {
+                    ids.insert(def.id);
+                    definitions.push(def);
+                }
+                Ok(WingResponse::RequestEnd) if !definitions.is_empty() => break Ok(definitions),
+                Ok(other) if buffered.len() < MAX_ATTENDED_BUFFERED => buffered.push(other),
+                Ok(_) => break Err(Error::InvalidData),
+                Err(err) => break Err(err),
+            }
+            if Instant::now() >= deadline {
+                break Err(Error::Timeout);
+            }
+        };
+        self.set_op_deadline(None);
+        earlier.extend(buffered);
+        self.requeue(earlier.into());
+        result
+    }
+
     /// [`get_node_definition`](Self::get_node_definition), addressing the node by its
     /// property-map name instead of numeric id.
     pub fn get_node_definition_by_name(
@@ -1313,6 +1383,7 @@ impl WingConsole {
     /// Subscribes to meters from the Wing mixer and returns a meter ID that can be used to
     /// associate the values that come back when you call read_meter()
     pub fn request_meter(&mut self, meters: &[Meter]) -> Result<u16> {
+        self.ensure_stream_usable()?;
         let mut encoded_meters = Vec::with_capacity(meters.len() * 2);
         for meter in meters {
             Self::encode_meter(&mut encoded_meters, meter)?;
@@ -1437,18 +1508,21 @@ impl WingConsole {
     }
 
     pub fn set_string(&mut self, id: i32, value: &str) -> Result<()> {
+        self.ensure_stream_usable()?;
         let buf = Self::set_string_message(id, value)?;
         self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
 
     pub fn set_float(&mut self, id: i32, value: f32) -> Result<()> {
+        self.ensure_stream_usable()?;
         let buf = Self::set_float_message(id, value)?;
         self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
     }
 
     pub fn set_int(&mut self, id: i32, value: i32) -> Result<()> {
+        self.ensure_stream_usable()?;
         let buf = Self::set_int_message(id, value)?;
         self.wsock.clone().lock_recover().write_all(&buf)?;
         Ok(())
@@ -1458,6 +1532,7 @@ impl WingConsole {
     /// 0xd8`), the `wToggleTokenInt` primitive. Flips the parameter server-side without a
     /// read-before-write, so it can't race a concurrent change the way get-then-set would.
     pub fn toggle(&mut self, id: i32) -> Result<()> {
+        self.ensure_stream_usable()?;
         let mut buf = Vec::new();
         Self::format_id(id, &mut buf, 0xd7, Some(0xd8));
         self.wsock.clone().lock_recover().write_all(&buf)?;
@@ -1481,6 +1556,8 @@ impl WingConsole {
     /// end-of-data token, so it must not run concurrently with another reader on the same
     /// session -- interleaved unrelated traffic would be captured into the buffer. Bounded
     /// by `timeout`, returning [`Error::Timeout`] if the stream doesn't terminate in time.
+    /// After a timeout the Native stream is fenced: subsequent reads and writes return
+    /// [`Error::ConnectionError`] until a successful reconnect discards the uncertain tail.
     pub fn get_binary_node(&mut self, id: i32, timeout: Duration) -> Result<Vec<u8>> {
         let read_gate = self.read_gate.clone();
         let _read_guard = read_gate.lock_recover();
@@ -1512,6 +1589,9 @@ impl WingConsole {
         let mut main = mainptr.lock_recover();
         main.op_deadline = None;
         let captured = main.capture.take().unwrap_or_default();
+        if matches!(result, Err(Error::Timeout)) {
+            self.stream_tainted.store(true, Ordering::Release);
+        }
         result.map(|()| captured)
     }
 
@@ -1522,6 +1602,7 @@ impl WingConsole {
     /// versus one write per parameter through [`set_int`](Self::set_int) et al. Returns the
     /// number of bytes written to the wire (`>= data.len()` when escaping expands it).
     pub fn set_binary_node(&mut self, data: &[u8]) -> Result<usize> {
+        self.ensure_stream_usable()?;
         let mut buf = Vec::with_capacity(data.len());
         Self::extend_escaped(&mut buf, data);
         self.wsock.clone().lock_recover().write_all(&buf)?;
@@ -1929,15 +2010,20 @@ impl WingConsole {
     /// defense in depth, restoring one is skipped (reported as
     /// `Err(Error::InvalidInput)` in the returned list) rather than attempted.
     ///
-    /// One `Result` per entry, in the order actually applied -- a failure on
-    /// one entry doesn't stop the rest from being attempted.
+    /// One `Result` per entry, in the order actually applied. A failed model
+    /// selector stops the restore: later values may belong to that selector's
+    /// model and must not be written into whichever model remains active.
     pub fn restore(&mut self, dump: &NodeDump) -> Vec<(String, Result<()>)> {
         let mut ordered: Vec<&DumpEntry> = dump.entries.iter().collect();
         ordered.sort_by_key(|entry| restore_order_key(&entry.fullname));
 
+        let mut selector_failed = false;
         ordered
             .into_iter()
             .map(|entry| {
+                if selector_failed {
+                    return (entry.fullname.clone(), Err(Error::InvalidInput));
+                }
                 let blocked = NAME_TO_DEF
                     .get(entry.fullname.as_str())
                     .map(|def| def.read_only)
@@ -1947,6 +2033,9 @@ impl WingConsole {
                 } else {
                     self.write_node_value(entry.id, &entry.value)
                 };
+                if entry.fullname.rsplit('/').next() == Some("mdl") && result.is_err() {
+                    selector_failed = true;
+                }
                 (entry.fullname.clone(), result)
             })
             .collect()

@@ -43,7 +43,7 @@ use libwing::native::{encode_channel, ChannelDecoder, NativeRequest, NativeReque
 
 use utils::Args;
 
-const SANITIZER_VERSION: &str = "wingcapture/2";
+const SANITIZER_VERSION: &str = "wingcapture/3";
 const REQUIRED_V2_HEADERS: [&str; 8] = [
     "scenario",
     "source",
@@ -184,6 +184,8 @@ fn sanitize_file(input_path: &str, output_path: &str) -> Result<(), String> {
     let text = fs::read_to_string(input_path).map_err(|e| format!("reading {input_path}: {e}"))?;
     let mut out_lines = Vec::new();
     let mut saw_sanitizer_header = false;
+    let mut events = Vec::new();
+    let mut payload_lines = Vec::new();
 
     for line in text.lines() {
         let line = line.trim_end();
@@ -214,8 +216,17 @@ fn sanitize_file(input_path: &str, output_path: &str) -> Result<(), String> {
         let (prefix, hex) = split_capture_line(line)
             .ok_or_else(|| format!("unrecognized fixture line: {line:?}"))?;
         let bytes = decode_hex(hex.trim()).map_err(|e| format!("{line:?}: {e}"))?;
-        let redacted = redact::redact_bytes(&bytes).map_err(|e| format!("{line:?}: {e}"))?;
-        out_lines.push(format!("{prefix} {}", encode_hex(&redacted)));
+        events.push((prefix.split_whitespace().last().unwrap().to_string(), bytes));
+        payload_lines.push((out_lines.len(), prefix));
+        out_lines.push(String::new());
+    }
+
+    redact::redact_events(&mut events)?;
+    if !redact::scan_events(&events).is_empty() {
+        return Err("sanitized streams still contain sensitive identifiers".into());
+    }
+    for ((line_index, prefix), (_, bytes)) in payload_lines.into_iter().zip(&events) {
+        out_lines[line_index] = format!("{prefix} {}", encode_hex(bytes));
     }
 
     if !saw_sanitizer_header {
@@ -228,12 +239,6 @@ fn sanitize_file(input_path: &str, output_path: &str) -> Result<(), String> {
         if let Some(rest) = line.strip_prefix('#') {
             if !redact::scan_str(rest).is_empty() {
                 return Err(format!("sanitized output still fails the scan: {line:?}"));
-            }
-        } else if let Some((_prefix, hex)) = split_capture_line(line) {
-            if let Ok(bytes) = decode_hex(hex.trim()) {
-                if !redact::scan(&bytes).is_empty() {
-                    return Err(format!("sanitized output still fails the scan: {line:?}"));
-                }
             }
         }
     }
@@ -282,7 +287,13 @@ fn decode_hex(s: &str) -> Result<Vec<u8>, String> {
 }
 
 fn encode_hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 15) as usize] as char);
+    }
+    out
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -440,6 +451,7 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
     let mut previous_offset = 0u64;
     let mut event_count = 0usize;
     let mut matrix = MatrixEvidence::default();
+    let mut redaction_events = Vec::new();
     let mut declared_version = None;
     let mut saw_data = false;
 
@@ -512,8 +524,8 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
         if channel == "M<" && bytes.len() < 4 {
             return Err("V2 meter input omits the four-byte report token".to_string());
         }
-        if promotion && !redact::scan(&bytes).is_empty() {
-            return Err(format!("sensitive identifier in event {ordinal}"));
+        if promotion {
+            redaction_events.push((channel.to_string(), bytes.clone()));
         }
         channels.insert(channel.to_string());
         match channel {
@@ -536,6 +548,9 @@ fn parse_capture_with_policy(text: &str, promotion: bool) -> Result<CaptureSumma
         event_count += 1;
     }
 
+    if promotion && !redact::scan_events(&redaction_events).is_empty() {
+        return Err("sensitive identifier in capture streams".into());
+    }
     let version = declared_version
         .ok_or_else(|| "promotion requires wingcap_version: 2".to_string())?
         .parse::<u8>()
@@ -1779,7 +1794,7 @@ mod tests {
              # console_model: RACK\n\
              # firmware: 3.1\n\
              # capture_date: 2026-07-12\n\
-             # sanitizer: wingcapture/2\n\
+             # sanitizer: wingcapture/3\n\
              # manual_redaction_attested: {attested}\n\
              # expected_behavior: complete synthetic exchange\n\
              @1 +0us D> 2f3f\n\
@@ -1795,7 +1810,7 @@ mod tests {
         let mut text = include_str!("../tests/fixtures/complete_session_v2.wingcap")
             .to_string()
             .replace("# source: synthetic", "# source: hardware")
-            .replace("# sanitizer: n/a", "# sanitizer: wingcapture/2")
+            .replace("# sanitizer: n/a", "# sanitizer: wingcapture/3")
             .replace("@1 +0us D> 2f3f00002c000000", "@1 +0us D> 57494e473f")
             .replace("@3 +200us N> df0100df", "@3 +200us N> dfd1")
             .replace(
@@ -1866,7 +1881,7 @@ mod tests {
                         \x20 - Console model: RACK\n\
                         \x20 - Firmware: 3.1\n\
                         \x20 - Capture date: 2026-07-12\n\
-                        \x20 - Sanitizer: wingcapture/2\n";
+                        \x20 - Sanitizer: wingcapture/3\n";
         fs::write(&provenance, reviewed).unwrap();
         preflight(&capture, &provenance).unwrap();
 
@@ -1876,7 +1891,7 @@ mod tests {
             ("Console model: RACK", "Console model: OTHER"),
             ("Firmware: 3.1", "Firmware: 3.0"),
             ("Capture date: 2026-07-12", "Capture date: 2026-07-11"),
-            ("Sanitizer: wingcapture/2", "Sanitizer: n/a"),
+            ("Sanitizer: wingcapture/3", "Sanitizer: n/a"),
         ] {
             fs::write(&provenance, reviewed.replace(expected, mismatch)).unwrap();
             assert!(
@@ -1901,7 +1916,7 @@ mod tests {
              \x20 - Console model: RACK\n\
              \x20 - Firmware: 3.1\n\
              \x20 - Capture date: 2026-07-12\n\
-             \x20 - Sanitizer: wingcapture/2\n",
+             \x20 - Sanitizer: wingcapture/3\n",
         )
         .unwrap();
         assert!(preflight(&capture, &provenance)
@@ -2275,7 +2290,7 @@ mod tests {
             .replace("pending-manual-entry", "RACK")
             .replace("# firmware: RACK", "# firmware: 3.1")
             .replace("# capture_date: RACK", "# capture_date: 2026-07-12")
-            .replace("# sanitizer: pending", "# sanitizer: wingcapture/2")
+            .replace("# sanitizer: pending", "# sanitizer: wingcapture/3")
             .replace(
                 "# manual_redaction_attested: false",
                 "# manual_redaction_attested: true",
@@ -2362,6 +2377,68 @@ mod tests {
                 .unwrap_err()
                 .contains("not owner-only"));
         }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn hex_encoder_matches_all_byte_values() {
+        let bytes: Vec<u8> = (0..=255).collect();
+        let reference: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
+        assert_eq!(encode_hex(&bytes), reference);
+        assert_eq!(decode_hex(&encode_hex(&bytes)).unwrap(), bytes);
+        assert_eq!(encode_hex(&[]), "");
+    }
+
+    #[test]
+    fn sanitizer_accepts_redacted_ip_at_every_chunk_boundary() {
+        let root = temp_root("split-ip-sanitize");
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("raw.wingcap");
+        let output = root.join("clean.wingcap");
+        let identifier = b"10.20.30.40";
+        for split in 1..identifier.len() {
+            fs::write(
+                &input,
+                format!(
+                    "N< {}\nN< {}\n",
+                    encode_hex(&identifier[..split]),
+                    encode_hex(&identifier[split..])
+                ),
+            )
+            .unwrap();
+            sanitize_file(input.to_str().unwrap(), output.to_str().unwrap()).unwrap();
+            let clean = fs::read_to_string(&output).unwrap();
+            let events: Vec<_> = clean
+                .lines()
+                .filter_map(|line| split_capture_line(line))
+                .map(|(channel, hex)| (channel, decode_hex(hex).unwrap()))
+                .collect();
+            assert!(redact::scan_events(&events).is_empty());
+        }
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn promotion_rejects_ip_split_between_native_events() {
+        let text = complete_v2(true).replace("@4 +3us N< df0100df", "@4 +3us N< 31302e32302e")
+            + "@7 +6us N< 33302e3430\n";
+        parse_capture_structure(&text).unwrap();
+        assert!(parse_capture(&text)
+            .unwrap_err()
+            .contains("sensitive identifier in capture streams"));
+    }
+
+    #[test]
+    fn sanitizer_reassembles_fragmented_native_identifiers() {
+        let root = temp_root("split-sanitize");
+        fs::create_dir_all(&root).unwrap();
+        let input = root.join("raw.wingcap");
+        let output = root.join("clean.wingcap");
+        fs::write(&input, "N< 4e4743313233\nN> 00\nN< 34353637\n").unwrap();
+        sanitize_file(input.to_str().unwrap(), output.to_str().unwrap()).unwrap();
+        let clean = fs::read_to_string(&output).unwrap();
+        assert!(clean.contains("N< 4e4743303030"));
+        assert!(clean.contains("N< 30303030"));
         fs::remove_dir_all(root).unwrap();
     }
 

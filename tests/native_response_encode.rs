@@ -135,6 +135,23 @@ fn round_trips_string_and_float_enum_families() {
 }
 
 #[test]
+fn round_trips_zero_count_enums() {
+    let mut def = integer_def();
+    def.node_type = NodeType::StringEnum;
+    def.min_int = None;
+    def.max_int = None;
+    def.string_enum = Some(Vec::new());
+    let parsed = WingNodeDef::try_from_bytes(&def.to_wire_bytes().unwrap()).unwrap();
+    assert!(parsed.string_enum.as_ref().unwrap().is_empty());
+
+    def.node_type = NodeType::FloatEnum;
+    def.string_enum = None;
+    def.float_enum = Some(Vec::new());
+    let parsed = WingNodeDef::try_from_bytes(&def.to_wire_bytes().unwrap()).unwrap();
+    assert!(parsed.float_enum.as_ref().unwrap().is_empty());
+}
+
+#[test]
 fn rejects_incomplete_metadata_instead_of_guessing() {
     let mut def = integer_def();
     def.max_int = None;

@@ -28,7 +28,21 @@ jobs:
       run: cargo build --no-default-features
 
     - name: cargo test (--no-default-features)
-      run: cargo test --no-default-features
+      run: cargo test --no-default-features --all-targets
+
+    - name: C11 and C++17 consumer ABI smoke
+      run: |
+        set -o pipefail
+        mkdir -p abi-diagnostics
+        tests/c_abi_smoke.sh 2>&1 | tee abi-diagnostics/smoke.log
+
+    - name: Upload ABI failure diagnostics
+      if: failure()
+      uses: actions/upload-artifact@v4
+      with:
+        name: c-abi-failure-diagnostics
+        path: abi-diagnostics/
+        if-no-files-found: warn
 
   build:
     # Only the manual release dispatch builds/packages/publishes; every push

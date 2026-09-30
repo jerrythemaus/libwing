@@ -71,6 +71,9 @@ pub const SUBSCRIPTION_RENEW_MARGIN: Duration = Duration::from_secs(5);
 /// [`take_unsolicited_dropped`](WingOscClient::take_unsolicited_dropped).
 pub const UNSOLICITED_CAP: usize = 1024;
 
+/// Maximum datagrams inspected after a matching reply while discarding duplicates.
+const DUPLICATE_DRAIN_CAP: usize = 64;
+
 /// `#[non_exhaustive]` (R21) for the same reason as [`crate::Error`]: new failure modes
 /// may be added without that being a breaking change for callers matching with a
 /// wildcard arm.
@@ -389,12 +392,26 @@ pub fn set_enum_by_index(path: &str, index: i32) -> Result<OscMessage> {
 
 /// Formats `name=value` pairs into the `,` and `=` node-string grammar shared by
 /// [`node_set_local`] and [`node_set_root`] (page 23).
-fn format_node_pairs(pairs: &[(&str, &str)]) -> String {
-    pairs
-        .iter()
-        .map(|(name, value)| format!("{name}={value}"))
-        .collect::<Vec<_>>()
-        .join(",")
+fn format_node_pairs(pairs: &[(&str, &str)]) -> Result<String> {
+    let mut formatted = Vec::with_capacity(pairs.len());
+    for &(name, value) in pairs {
+        if name.is_empty()
+            || name.contains(['/', '.', ',', '='])
+            || name.as_bytes().contains(&0)
+            || matches!(name, "." | "..")
+        {
+            return Err(OscError::Malformed(
+                "node pair names must be local leaf names without grammar separators",
+            ));
+        }
+        if value.contains(',') || value.as_bytes().contains(&0) {
+            return Err(OscError::Malformed(
+                "node pair values cannot contain commas or embedded NULs; use set_string for arbitrary strings",
+            ));
+        }
+        formatted.push(format!("{name}={value}"));
+    }
+    Ok(formatted.join(","))
 }
 
 /// SET multiple parameters under one node in a single request (page 24), e.g.
@@ -404,7 +421,7 @@ pub fn node_set_local(node_path: &str, pairs: &[(&str, &str)]) -> Result<OscMess
     validate_address_path(node_path)?;
     Ok(OscMessage::new(
         node_path,
-        vec![OscArg::Str(format_node_pairs(pairs))],
+        vec![OscArg::Str(format_node_pairs(pairs)?)],
     ))
 }
 
@@ -856,9 +873,8 @@ impl WingOscClient {
     /// of the one `connect` created (the console's IP doesn't change, page 21 -- only
     /// the destination port of its reply does). This is also the mechanism for giving
     /// a subscription its own socket/port when a caller also needs foreground
-    /// `request`/`request_with_policy` calls against the same console -- see
-    /// [`poll_event`](Self::poll_event)'s docs -- by wrapping the subscribe message with
-    /// [`with_reply_port`] targeting this port before sending it on a second client.
+    /// `request`/`request_with_policy` calls against the same console. Subscription and
+    /// renewal messages automatically include this socket's reply-port prefix.
     ///
     /// Local port conflict (R75): if `reply_port` is already bound by another process
     /// (or another socket in this one), this returns `Err(OscError::Io(_))` -- bind
@@ -908,12 +924,15 @@ impl WingOscClient {
     /// duplicates of `matched` (R75: WING or an intervening network can deliver a UDP
     /// reply twice). Anything that isn't an exact duplicate is buffered via
     /// [`unsolicited`](Self::take_unsolicited) instead of being lost. Uses a very short
-    /// timeout rather than a true non-blocking peek: a genuine duplicate of a just-sent
-    /// reply arrives essentially immediately on a loopback/LAN, so this adds negligible
-    /// latency while still catching it.
-    fn drain_duplicate_replies(&self, matched: &OscMessage) {
-        loop {
-            match self.recv(Duration::from_millis(1)) {
+    /// timeout rather than a true non-blocking peek. Work is capped by both the request
+    /// deadline and [`DUPLICATE_DRAIN_CAP`] so sustained traffic cannot extend a request.
+    fn drain_duplicate_replies(&self, matched: &OscMessage, deadline: Instant) {
+        for _ in 0..DUPLICATE_DRAIN_CAP {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                break;
+            }
+            match self.recv(remaining.min(Duration::from_millis(1))) {
                 Ok(msg) if msg == *matched => continue,
                 Err(OscError::Malformed(_)) => continue,
                 Ok(msg) => {
@@ -954,7 +973,7 @@ impl WingOscClient {
                 Err(e) => return Err(e),
             };
             if reply_matches(&msg.addr, &reply.addr) {
-                self.drain_duplicate_replies(&reply);
+                self.drain_duplicate_replies(&reply, deadline);
                 return Ok(reply);
             }
             self.buffer_unsolicited(reply);
@@ -1035,7 +1054,7 @@ impl WingOscClient {
         format: SubscriptionFormat,
         renew_interval: Duration,
     ) -> Result<()> {
-        self.send(&subscribe(format))?;
+        self.send(&self.subscription_message(format)?)?;
         *self.subscription.borrow_mut() = Some(SubscriptionState {
             format,
             renew_interval,
@@ -1063,11 +1082,19 @@ impl WingOscClient {
             Some(s) => s.format,
             None => return Ok(()),
         };
-        self.send(&subscribe(format))?;
+        self.send(&self.subscription_message(format)?)?;
         if let Some(s) = self.subscription.borrow_mut().as_mut() {
             s.next_renew = Instant::now() + s.renew_interval;
         }
         Ok(())
+    }
+
+    fn subscription_message(&self, format: SubscriptionFormat) -> Result<OscMessage> {
+        let message = subscribe(format);
+        match &self.reply_socket {
+            Some(socket) => Ok(with_reply_port(socket.local_addr()?.port(), message)),
+            None => Ok(message),
+        }
     }
 
     /// Blocks up to `timeout` for the next subscription event, transparently renewing
@@ -1085,8 +1112,8 @@ impl WingOscClient {
     /// misclassified as an [`OscEvent::Raw`], or an event could be consumed by
     /// `request` and buffered as unsolicited instead of reaching `poll_event`. A caller
     /// needing both should use [`bind_reply_port`](Self::bind_reply_port) to give the
-    /// subscription (via [`with_reply_port`]) a dedicated socket/port, polling that from
-    /// one client while issuing requests from another.
+    /// subscription a dedicated socket/port, polling that from one client while issuing
+    /// requests from another.
     pub fn poll_event(&self, timeout: Duration) -> Result<OscEvent> {
         if self.subscription.borrow().is_none() {
             return Err(OscError::Malformed(

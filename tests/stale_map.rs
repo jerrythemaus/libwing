@@ -114,6 +114,17 @@ fn non_numeric_leading_segment_is_unknown() {
     assert_eq!(Schema::staleness("v3.1"), Staleness::Unknown);
 }
 
+#[test]
+fn malformed_later_segments_are_unknown() {
+    for firmware in ["3.1.garbage", "3.1.", "3..2"] {
+        assert_eq!(
+            Schema::staleness(firmware),
+            Staleness::Unknown,
+            "{firmware}"
+        );
+    }
+}
+
 // --- R8, R35, R36: map metadata ---
 
 #[test]
@@ -327,4 +338,45 @@ fn apply_node_def_falls_back_to_id_only_when_parent_unknown() {
         Provenance::Live,
     );
     assert_eq!(resolved.name, "x");
+}
+
+#[test]
+fn explicit_fullname_promotes_an_id_only_definition() {
+    let mut live = LiveSchema::new();
+    const ID: i32 = i32::MIN + 20;
+    const UNKNOWN_PARENT: i32 = i32::MIN + 21;
+    let definition = def(ID, UNKNOWN_PARENT, "leaf", 0.0, 1.0);
+
+    live.apply_node_def(&definition, None);
+    live.apply_node_def(&definition, Some("/new/leaf"));
+
+    assert_confirmed(
+        live.resolve_id(ID, None).unwrap(),
+        "/new/leaf",
+        Provenance::Live,
+    );
+    assert_confirmed(
+        live.resolve_path("/new/leaf", None).unwrap(),
+        "/new/leaf",
+        Provenance::Live,
+    );
+}
+
+#[test]
+#[cfg(feature = "propmap")]
+fn refreshed_model_child_keeps_live_metadata_when_wire_parent_omits_model() {
+    let mut live = LiveSchema::new();
+    let mut refreshed = WingConsole::name_to_def("/fx/1/HALL/pdel").unwrap().clone();
+    let id = refreshed.id;
+    let parent_id = WingConsole::name_to_id("/fx/1").unwrap();
+    refreshed.parent_id = parent_id;
+    refreshed.max_int = Some(999);
+
+    live.apply_node_def(&refreshed, None);
+    let resolved = assert_confirmed(
+        live.resolve_id(id, Some("HALL")).unwrap(),
+        &format!("#{id}"),
+        Provenance::Live,
+    );
+    assert_eq!(resolved.max_int, Some(999));
 }
