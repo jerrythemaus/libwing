@@ -4,6 +4,8 @@
 
 ### Breaking
 
+- Removed the C API, `libwing.h`, public FFI handle types, and `cdylib` output;
+  libwing now exposes only its Rust API.
 - `NodeDump` gains a public `unknown_models` field; struct literals must set it (or
   use `..Default::default()`).
 - `dump_subtree` now captures StringEnum leaves (including model selectors) as
@@ -11,14 +13,14 @@
   `set_nodes`/`restore` and comparing through `values_match_at` treat both forms
   alike, but a stored dump compared byte-for-byte against one taken before this
   change will differ on every StringEnum entry.
-- `request_meter` / `wing_console_request_meter` reject out-of-family meter
-  indices and nonzero MONITOR/RTA indices instead of sending them; see the ranges
-  documented beside `METER_ID` in `libwing.h`.
+- `request_meter` rejects out-of-family meter indices instead of sending them;
+  see `Meter::wire` in `src/console.rs` for the family ranges. `Meter::Monitor`
+  and `Meter::Rta` have no index.
 - `osc::WingOscClient::request_with_policy` sends a relative write (`osc::toggle`,
   i.e. any single `,i -1` argument) exactly once and returns `OscError::Timeout`, not
   `OscError::RetriesExhausted`, when its reply is lost: a retry would toggle back.
 - `read_meters` returns `Error::Timeout` when no meter frame arrives for one keepalive
-  interval (3 s) instead of waiting forever; the C meter reads return -1 with code 7.
+  interval (3 s) instead of waiting forever.
   Loops that treat every error as fatal must treat `Timeout` as "keep reading".
 - Each `request_meter` replaces the previous subscription: the meter keepalive renews
   only the most recent report id, so earlier ids stop streaming. A failed subscribe no
@@ -32,7 +34,7 @@
 
 ### Added
 
-- `Error::Reconnecting` (C code 9): an operation was interrupted by a reconnect on
+- `Error::Reconnecting`: an operation was interrupted by a reconnect on
   another clone. Retry it; do not reconnect again.
 - `WingNodeData::string_enum_item`: resolves a StringEnum value sent either as an
   index or as a label.
@@ -41,10 +43,7 @@
 - `osc::UNSOLICITED_CAP` and `osc::WingOscClient::take_unsolicited_dropped`: the
   unsolicited buffer's size limit and how many messages it has dropped.
 - `WingConsole::read_meters_timeout` and `WingConsole::read_meters_into` (decodes into a
-  caller buffer; the C meter reads now allocate nothing per frame).
-- C: `wing_console_read_timeout`; last-error code -2 for a Rust panic caught at the FFI
-  boundary; `libwing.h` states the threading contract (never destroy a handle while
-  another thread is inside a call on it).
+  caller buffer).
 - `WingConsole::preload_property_map`: builds the embedded map and its id index up front
   (about 20 ms), so an application can take that cost on a background thread.
 
@@ -87,7 +86,6 @@
 - `read_meters` no longer holds the meter lock while waiting for a frame, so
   `keep_alive_meters`/`request_meter` on another clone never wait behind it.
 - The firmware probe ignores replies from any host but the console.
-- Every C entry point catches Rust panics instead of aborting the host process.
 - `WingConsole`'s drop shuts its sockets down even when a lock was poisoned.
 - The embedded property map is allocated at its final size (no rehashing at startup).
 - `read()` costs about 80 ns per value instead of 260 ns: it checked the keepalive clock on

@@ -1,21 +1,20 @@
 # Introduction to libwing
 
-This is a library for discovering and controlling the [Behringer
+libwing is a pure [Rust](https://rustlang.org) communication library for
+discovering and controlling the [Behringer
 Wing](https://www.behringer.com/behringer/wing) digital mixer over the local
-network. It also includes a series of utilities built using this library.
+network through the Native, Discovery, and OSC protocols. It also includes
+six helper tools built using the library:
 
-Included in this package are:
-
-- An [Rust](https://rustlang.org) library
-- C API bindings for the Rust library
-- <b>wingprop:</b> A command line utility for setting and getting property values, as well as looking at property schemas
-- <b>wingmon:</b> A command line utility for monitoring your Wing's properies as they change in real time.
-- <b>wingmeters:</b> An app to show some channel level meters of the Wing in real time.
-- <b>wingschema</b>: A command line utility for generating a JSON schema of your
-  Wing's properties, as well as updating a name to id mapping of Wing's
-  properties. See below for more information on this mapping.
-
-Additionally, you can find a [dart](https://dart.dev) package is also available for making Flutter apps that uses the C API.
+- **wingmon:** Monitor property changes in real time.
+- **wingprop:** Get and set property values and inspect property schemas.
+- **wingmeters:** Show channel level meters in real time.
+- **wingschema:** Generate a JSON schema and update the property name-to-id mapping,
+  or regenerate the embedded map offline.
+- **wingcapture:** Record, sanitize, and compare protocol captures, including
+  Native proxy captures for differential verification.
+- **wingdrive:** Run a deterministic conformance battery against a console or
+  emulator; read-only unless `--allow-state-changing` is passed.
 
 -------
 
@@ -31,12 +30,19 @@ cargo add libwing
 cargo build --all-targets
 ```
 
-Check out the code in the tools/ subdir for simple utilities that discovers,
-connects, and do various simple things with **libwing**.
+Check out `tools/` for examples of discovering, connecting, and communicating
+with a Wing. Build all helper tools from this checkout with `cargo build --examples`,
+then run one with `cargo run --example <tool> -- <arguments>`.
 
 ### Rust API overview
 
-libwing is a Rust library first (the C API below is a best-effort mirror).
+- **Native**: `WingConsole` connects over TCP for property reads, writes, and
+  node definitions, with UDP meter subscriptions. `libwing::native` provides
+  codecs for offline decoding and encoding.
+- **Discovery**: `WingConsole::scan` discovers consoles over UDP and returns
+  `DiscoveryInfo` metadata.
+- **OSC**: `libwing::osc::WingOscClient` provides a sibling UDP transport.
+
 Beyond the low-level primitives (`connect`/`read`/`request_node_*`/`set_*`),
 the crate provides:
 
@@ -63,15 +69,21 @@ Unknown future firmware values (node types, units, enum items) are preserved
 explicitly rather than coerced (`NodeType::Unknown(..)` etc.), and public
 enums are `#[non_exhaustive]` so additions don't break consumers.
 
-## FFI/C API
+## Development
 
-The library provides a C API through FFI bindings covering connection,
-get/set, node definitions, meters, property-map lookups, keepalives, and
-structured last-error retrieval. The C surface is best-effort: it tracks the
-Rust API but does not cover all of it (no OSC, schema resolution, or
-dump/restore helpers yet) — see [COVERAGE.md](COVERAGE.md) for the current
-status and [libwing.h](libwing.h) for the available declarations, including
-per-function ownership and out-parameter rules.
+Run from the libwing root:
+
+```sh
+cargo fmt --check
+cargo test --all-targets --locked
+cargo test --no-default-features --all-targets --locked
+cargo test --doc --locked
+cargo clippy --all-targets --locked -- -D warnings
+```
+
+In a wing-control checkout, also run `bash tests/differential_selftest.sh` to
+verify the emulator/driver/proxy/capture pipeline offline. These tests do not
+constitute hardware evidence; see [COVERAGE.md](COVERAGE.md).
 
 ## [propmap.rs](src/propmap.rs), [empty-propmap.rs](src/empty-propmap.rs), and [propmap.jsonl](propmap.jsonl)
 
@@ -148,14 +160,14 @@ Wing before running **wingschema** and restore it afterwards.
 - set a property value
 - get a property schema
 
-It also has an option to output as JSON (`-j`). Run `wingprop --help` to see the options.
+It also has an option to output as JSON (`-j`). Run `wingprop` with no arguments
+for usage (it prints the options and exits with status 1 without connecting).
 
 ## wingmeters utility
 
-**wingmeters** is a grphical app that shows you the output levels of the
-channels 1-16 in realtime. Just run it with no arguments (it'll discover the
-Wing on the network for you). Now make a channel make noise and you should see
-meters jump around. Run `wingmeters --help` to see the options.
+**wingmeters** is a graphical app that shows channel levels in real time.
+Run it with no arguments to discover a Wing, or pass `-h <host>` to connect
+to a specific mixer. It opens a GUI and connects to the console.
 
 ## wingschema utility
 
@@ -164,8 +176,9 @@ As of the pinned 3.1 WING Rack sweep, there are 60,748 entries. See above about
 more information about the two files as well as how you can use this to update
 the property map in the library. The live sweep is destructive (it flips every
 model selector); it warns, snapshots the selectors, and restores them
-afterwards, reporting anything it could not restore. Run `wingschema --help` to
-see the options.
+afterwards, reporting anything it could not restore. Use `-h <host>` for an
+explicit mixer; `--yes` skips only the interactive confirmation, not the
+snapshot/restore safeguards.
 
 ## wingmon utility
 
@@ -173,7 +186,7 @@ see the options.
 run it with no arguments (it'll discover the Wing on the network for you). Walk
 over to your Wing and touch a button or move a fader. You can also use the Wing
 apps to change properties. You'll see all the things that changed printed to
-the console. Run `wingmon --help` to see the options.
+the console. Pass `-h <host>` to select a specific mixer.
 
 
 # Protocols

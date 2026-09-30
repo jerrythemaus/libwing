@@ -11,9 +11,6 @@
 //! network, connecting to them, reading/writing console parameters, and receiving
 //! any changes made on the mixer itself.
 //!
-//! There is a C wrapper for this library. It generally follows the Rust API. You
-//! can find it in `libwing.h`.
-//!
 //! ## Basic Concepts
 //!
 //! The Wing console exposes its functionality through a tree of nodes. Each node has:
@@ -79,7 +76,6 @@
 //! All these calls are thread safe.
 
 mod console;
-mod ffi;
 mod helpers;
 /// WING icon index ↔ name map (decoded from the protocol-spec "WING Icons" appendix).
 pub mod icons;
@@ -105,7 +101,6 @@ pub use console::{
     NodeDump, NodeValue, ReconnectOutcome, ReconnectPolicy, SessionGap, Transport, VerifyReport,
     WingConsole,
 };
-pub use ffi::{ResponseHandle, WingConsoleHandle};
 pub use helpers::{
     decode_enum, encode_enum, write_enum, EnumDecode, EnumKey, EnumValue, RawEnumValue,
 };
