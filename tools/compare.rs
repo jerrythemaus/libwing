@@ -43,7 +43,7 @@ impl Value {
 #[derive(Default)]
 struct Control {
     values: BTreeMap<i32, Vec<Value>>,
-    definitions: BTreeSet<i32>,
+    definitions: BTreeMap<i32, BTreeSet<Vec<u8>>>,
     request_ends: usize,
 }
 
@@ -200,18 +200,18 @@ fn compare_control(hardware: &Control, emulator: &Control, deviations: &mut Vec<
         }
     }
     for id in hardware_ids.intersection(&emulator_ids) {
-        match (
-            hardware.definitions.contains(id),
-            emulator.definitions.contains(id),
-        ) {
-            (true, false) => deviations.push(format!(
+        match (hardware.definitions.get(id), emulator.definitions.get(id)) {
+            (Some(_), None) => deviations.push(format!(
                 "definition {} hw=present emu=missing",
                 describe_id(*id)
             )),
-            (false, true) => deviations.push(format!(
+            (None, Some(_)) => deviations.push(format!(
                 "definition {} hw=missing emu=present",
                 describe_id(*id)
             )),
+            (Some(hw), Some(emu)) if hw != emu => {
+                deviations.push(format!("definition {} metadata differs", describe_id(*id)))
+            }
             _ => {}
         }
     }
@@ -227,7 +227,7 @@ fn observed_ids(control: &Control) -> BTreeSet<i32> {
     control
         .values
         .keys()
-        .chain(control.definitions.iter())
+        .chain(control.definitions.keys())
         .copied()
         .collect()
 }
@@ -416,7 +416,15 @@ fn decode_control(events: &[(String, Vec<u8>)]) -> Result<Control, String> {
                 .or_default()
                 .push(Value::from_node(&data)),
             Ok(WingResponse::NodeDef(definition)) => {
-                control.definitions.insert(definition.id);
+                control
+                    .definitions
+                    .entry(definition.id)
+                    .or_default()
+                    .insert(
+                        definition
+                            .to_wire_bytes()
+                            .map_err(|error| error.to_string())?,
+                    );
             }
             Ok(WingResponse::RequestEnd) => control.request_ends += 1,
             Err(Error::Io(error)) if error.kind() == std::io::ErrorKind::UnexpectedEof => {
@@ -534,5 +542,42 @@ mod tests {
         assert_eq!(report.deviations, 1);
         assert!(report.text.contains("path=/ch/1/fdr"), "{}", report.text);
         assert!(report.text.contains("hw=1 emu=2"), "{}", report.text);
+    }
+}
+
+#[cfg(all(test, feature = "propmap"))]
+mod definition_regressions {
+    use super::*;
+    use libwing::native::{encode_responses, NativeResponse};
+
+    fn definitions(defs: &[libwing::WingNodeDef]) -> Vec<(String, Vec<u8>)> {
+        let responses: Vec<_> = defs.iter().cloned().map(NativeResponse::NodeDef).collect();
+        vec![("N<".into(), encode_responses(&responses).unwrap())]
+    }
+
+    #[test]
+    fn same_id_metadata_changes_are_deviations() {
+        let def = WingConsole::name_to_def("/ch/1/fdr").unwrap().clone();
+        let mut changed = def.clone();
+        changed.read_only = !def.read_only;
+        let report = compare_fidelity(&definitions(&[def]), &definitions(&[changed]));
+        assert_eq!(report.deviations, 1);
+        assert!(report.text.contains("metadata differs"));
+    }
+
+    #[test]
+    fn earlier_model_metadata_changes_survive_same_id_reuse() {
+        let def = WingConsole::name_to_def("/ch/1/fdr").unwrap().clone();
+        let mut changed = def.clone();
+        changed.read_only = !def.read_only;
+        let first = definitions(&[def.clone(), changed.clone()]);
+        let second = definitions(&[changed.clone(), changed.clone()]);
+        assert_eq!(compare_fidelity(&first, &second).deviations, 1);
+        let reordered = definitions(&[changed, def]);
+        assert_eq!(
+            compare_fidelity(&first, &reordered).deviations,
+            0,
+            "order and repeated definitions do not change metadata"
+        );
     }
 }

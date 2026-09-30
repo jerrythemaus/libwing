@@ -295,6 +295,25 @@ fn golden_node_local_set() {
 }
 
 #[test]
+fn node_local_set_rejects_unrepresentable_pairs() {
+    for name in ["", "mute=1", "../mute", "node.leaf", "node,leaf", ".", ".."] {
+        assert!(matches!(
+            node_set_local("/ch/1", &[(name, "1")]),
+            Err(osc::OscError::Malformed(_))
+        ));
+    }
+
+    assert!(matches!(
+        node_set_local("/ch/1", &[("name", "Desk,mute=1")]),
+        Err(osc::OscError::Malformed(_))
+    ));
+    assert!(matches!(
+        node_set_local("/ch/1", &[("name", "Desk\0")]),
+        Err(osc::OscError::Malformed(_))
+    ));
+}
+
+#[test]
 fn golden_node_dump_parse() {
     // Page 25: "/fx/1 ,s *" -> "/fx/1~~~,s~~mdl=NONE,fxmix=100,~" (32 bytes).
     let bytes = encode(&osc::node_dump("/fx/1").unwrap()).unwrap();

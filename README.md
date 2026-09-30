@@ -195,7 +195,6 @@ The Wing's Native protocol is a binary protocol that is more efficient and relia
 than OSC. It is the protocol used by all the Behringer Wing apps to communicate
 with the Wing.
 
-**libwing** implements the Native protocol and the Discovery protocol.
-
-**libwing** does not implement the OSC protocol, but there are many other
-libraries available that do support OSC.
+**libwing** implements the Native, Discovery, and OSC protocols. OSC operations
+are exposed through [`libwing::osc`](https://docs.rs/libwing/latest/libwing/osc/);
+live-console OSC verification remains pending (see [COVERAGE.md](COVERAGE.md)).

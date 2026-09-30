@@ -288,24 +288,28 @@ impl WingNodeDef {
             }
             NodeType::StringEnum => {
                 let num = read_u16(raw, &mut i)?;
+                string_enum = Some(Vec::with_capacity(num as usize));
                 for _ in 0..num {
                     let item_len = read_u8(raw, &mut i)? as usize;
                     let item = read_string(raw, &mut i, item_len)?;
                     let long_item_len = read_u8(raw, &mut i)? as usize;
                     let long_item = read_string(raw, &mut i, long_item_len)?;
                     string_enum
-                        .get_or_insert_with(Vec::new)
+                        .as_mut()
+                        .expect("initialized above")
                         .push(StringEnumItem { item, long_item });
                 }
             }
             NodeType::FloatEnum => {
                 let num = read_u16(raw, &mut i)?;
+                float_enum = Some(Vec::with_capacity(num as usize));
                 for _ in 0..num {
                     let item = read_f32(raw, &mut i)?;
                     let long_item_len = read_u8(raw, &mut i)? as usize;
                     let long_item = read_string(raw, &mut i, long_item_len)?;
                     float_enum
-                        .get_or_insert_with(Vec::new)
+                        .as_mut()
+                        .expect("initialized above")
                         .push(FloatEnumItem { item, long_item });
                 }
             }

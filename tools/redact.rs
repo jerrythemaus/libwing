@@ -63,6 +63,69 @@ pub fn scan(bytes: &[u8]) -> Vec<Finding> {
     find_matches(bytes).into_iter().map(|m| m.finding).collect()
 }
 
+/// Visit complete Native streams per direction and connection; UDP payloads remain separate.
+fn groups(events: &[(String, Vec<u8>)]) -> Vec<Vec<usize>> {
+    let mut groups = Vec::new();
+    let mut incoming = Vec::new();
+    let mut outgoing = Vec::new();
+    for (index, (channel, bytes)) in events.iter().enumerate() {
+        if channel == "N<" && bytes.is_empty() {
+            if !incoming.is_empty() {
+                groups.push(std::mem::take(&mut incoming));
+            }
+            if !outgoing.is_empty() {
+                groups.push(std::mem::take(&mut outgoing));
+            }
+        } else if channel == "N<" {
+            incoming.push(index);
+        } else if channel == "N>" {
+            outgoing.push(index);
+        } else {
+            groups.push(vec![index]);
+        }
+    }
+    if !incoming.is_empty() {
+        groups.push(incoming);
+    }
+    if !outgoing.is_empty() {
+        groups.push(outgoing);
+    }
+    groups
+}
+
+pub fn scan_events(events: &[(String, Vec<u8>)]) -> Vec<Finding> {
+    groups(events)
+        .into_iter()
+        .flat_map(|indices| {
+            let bytes: Vec<u8> = indices
+                .iter()
+                .flat_map(|&i| events[i].1.iter().copied())
+                .collect();
+            scan(&bytes)
+        })
+        .collect()
+}
+
+/// Redact reassembled streams, then scatter same-length replacements back into chunks.
+pub fn redact_events(events: &mut [(String, Vec<u8>)]) -> Result<(), String> {
+    for indices in groups(events) {
+        let bytes: Vec<u8> = indices
+            .iter()
+            .flat_map(|&i| events[i].1.iter().copied())
+            .collect();
+        let redacted = redact_bytes(&bytes)?;
+        let mut offset = 0;
+        for index in indices {
+            let len = events[index].1.len();
+            events[index]
+                .1
+                .copy_from_slice(&redacted[offset..offset + len]);
+            offset += len;
+        }
+    }
+    Ok(())
+}
+
 /// [`scan`] over a `&str` (e.g. a fixture's header/comment text, or a lossy-UTF8
 /// interpretation of decoded payload bytes).
 pub fn scan_str(s: &str) -> Vec<Finding> {
@@ -340,5 +403,50 @@ mod tests {
         // "8.8.8.8" is 7 chars -- shorter than any TEST-NET-1 literal (9..=11).
         let err = redact_bytes(b"resolver=8.8.8.8").unwrap_err();
         assert!(err.contains("rewrite this fixture by hand"), "{err}");
+    }
+}
+
+#[cfg(test)]
+mod stream_tests {
+    use super::*;
+    #[test]
+    fn identifiers_at_every_tcp_split_are_redacted() {
+        for identifier in ["NGC1234567", "10.10.10.10", "aa:bb:cc:dd:ee:ff"] {
+            for split in 1..identifier.len() {
+                let mut events = vec![
+                    ("N<".into(), identifier.as_bytes()[..split].to_vec()),
+                    ("N>".into(), b"unrelated".to_vec()),
+                    ("N<".into(), identifier.as_bytes()[split..].to_vec()),
+                ];
+                assert!(!scan_events(&events).is_empty());
+                let lengths: Vec<_> = events.iter().map(|e| e.1.len()).collect();
+                redact_events(&mut events).unwrap();
+                assert!(scan_events(&events).is_empty());
+                assert_eq!(
+                    lengths,
+                    events.iter().map(|e| e.1.len()).collect::<Vec<_>>()
+                );
+            }
+        }
+    }
+    #[test]
+    fn connections_and_datagrams_are_independent() {
+        for middle in ["N<", "D<"] {
+            let events = vec![
+                ("N<".into(), b"10.20.".to_vec()),
+                (middle.into(), vec![]),
+                ("N<".into(), b"30.40".to_vec()),
+            ];
+            if middle == "N<" {
+                assert!(scan_events(&events).is_empty());
+            } else {
+                assert!(!scan_events(&events).is_empty());
+            }
+        }
+        assert!(scan_events(&[
+            ("D<".into(), b"10.20.".to_vec()),
+            ("D<".into(), b"30.40".to_vec())
+        ])
+        .is_empty());
     }
 }

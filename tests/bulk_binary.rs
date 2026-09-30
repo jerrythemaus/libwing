@@ -19,7 +19,7 @@ use std::time::Duration;
 
 #[cfg(feature = "propmap")]
 use libwing::NodeValue;
-use libwing::{Transport, WingConsole};
+use libwing::{Error, Transport, WingConsole};
 
 struct ScriptReader {
     bytes: VecDeque<u8>,
@@ -193,6 +193,26 @@ fn toggle_emits_click_token() {
     assert_eq!(chunks.len(), 1);
     // d7 <hash> d8  (0xd8 == native click/toggle token)
     assert_eq!(chunks[0], vec![0xd7, 0x11, 0x22, 0x33, 0x44, 0xd8]);
+}
+
+#[test]
+fn timed_out_capture_fences_the_stream_until_reconnect() {
+    let partial = vec![0xd7, 0, 0, 0, 42, 0xd4, 0, 0];
+    let (mut console, writer) = console_with_script(partial);
+
+    assert!(matches!(
+        console.get_binary_node(42, Duration::from_millis(50)),
+        Err(Error::Timeout)
+    ));
+    assert!(matches!(
+        console.get_binary_node(43, Duration::from_millis(50)),
+        Err(Error::ConnectionError)
+    ));
+    assert_eq!(
+        writer.chunks().len(),
+        1,
+        "retry must not reach the tainted wire"
+    );
 }
 
 /// A `d7 <id> d5 <f32>` value pair (float, as a fader carries).

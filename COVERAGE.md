@@ -29,10 +29,10 @@ a v1 gate), **deferred** (out of v1 scope, untouched).
 | Native/OSC availability map | implemented | total over the v1 operation set with rationale |
 | Risk taxonomy + confirmation hooks | implemented | |
 | Destructive-crawl safeguards | implemented | snapshot/restore logic unit-tested; full live crawl hardware-pending |
-| CI test gates | implemented | fmt, all-targets tests, no-default-features build+test on push/PR |
+| CI test gates | implemented | fmt, full/minimal all-targets tests, and C11/C++17 ABI consumer checks on push/PR; parent CI also runs the differential pipeline and Apple Silicon tests |
 | Parser/encoding conformance | implemented | |
 | Record-replay harness + redaction guard | implemented | fixtures currently **synthetic** (spec-derived); no hardware captures yet |
-| C ABI | best-effort | connection/get-set/defs/meters/lookups/keepalive/last-error; **no** OSC, schema resolution, or dump/restore; header compiles as C and C++ |
+| C ABI | best-effort | connection/get-set/defs/meters/lookups/keepalive/last-error; **no** OSC, schema resolution, or dump/restore; all exported declarations compile/link as C11 and C++17; offline ownership/error/lookup smoke runs in CI |
 | Docs (README/PROVENANCE/REDACTION/COVERAGE) | implemented | |
 
 ## Hardware verification tier — all pending
@@ -66,3 +66,15 @@ I/O-dependent surfaces are known-good for the WING Rack only.
 
 Offline/show-prep mode, automation/scripting surface, console emulator,
 Dante/AES50 expansion control, full C ABI parity.
+
+## Offline consumer and differential checks
+
+- `tests/c_abi_smoke.sh` builds the cdylib, checks Rust exports against the header,
+  and compiles, links, and runs C11/C++17 consumers without a console.
+- In a wing-control checkout, `tests/differential_selftest.sh` exercises the actual
+  emulator/driver/proxy/capture pipeline and checks both its zero-deviation floor
+  and known changed values. Cargo metadata selects the current build artifacts;
+  `WING_DIFFERENTIAL_LOG_DIR` preserves logs/reports on failure. Parent CI runs
+  this check with a bounded timeout and uploads failure diagnostics.
+
+These checks are synthetic/offline verification, not hardware evidence.

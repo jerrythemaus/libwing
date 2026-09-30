@@ -62,7 +62,7 @@ as link/checksum only.
   recorded here per `REDACTION.md` rule 4.
 
 This means no capability may be distributed or documented as `hardware-captured` yet. Offline
-replay success is synthetic evidence and does not satisfy the U12 hardware-only release gate.
+replay success is synthetic evidence and must not be described as hardware verification.
 
 ## Synthetic capture contracts
 

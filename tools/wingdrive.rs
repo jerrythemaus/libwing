@@ -30,6 +30,8 @@
 //! plus the unique-id (non-model-variant) leaves observed by the GET battery. Read-only leaves are
 //! skipped (the emulator rejects them).
 
+#[path = "atomic_write.rs"]
+mod atomic_write;
 mod utils;
 use utils::Args;
 
@@ -73,7 +75,7 @@ enum WriteVal {
 }
 
 /// A leaf's value in whichever facet it carried, for before/after restore verification.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 enum Snap {
     Str(String),
     Float(f32),
@@ -336,13 +338,22 @@ fn capture_models(
             else {
                 continue;
             };
-            if let Some((model, leaf)) = tail.split_once('/') {
-                if !leaf.is_empty() {
-                    params
-                        .entry((slot.clone(), model.to_string()))
-                        .or_default()
-                        .push(name);
-                }
+            let mdl_path = format!("{slot}/mdl");
+            let model = WingConsole::name_to_def(&mdl_path)
+                .and_then(|def| def.string_enum.as_ref())
+                .into_iter()
+                .flatten()
+                .filter(|item| {
+                    tail.strip_prefix(&item.item)
+                        .and_then(|tail| tail.strip_prefix('/'))
+                        .is_some_and(|leaf| !leaf.is_empty())
+                })
+                .max_by_key(|item| item.item.len());
+            if let Some(model) = model {
+                params
+                    .entry((slot.clone(), model.item.clone()))
+                    .or_default()
+                    .push(name);
             }
             break;
         }
@@ -350,49 +361,34 @@ fn capture_models(
 
     let mut captured: Vec<(&str, Snap)> = Vec::new();
     let mut restored = 0usize;
+    let recovery_path = format!("{out_path}.recovery.jsonl");
+    if std::fs::symlink_metadata(&recovery_path).is_ok() {
+        return Err(format!(
+            "unresolved model-capture recovery exists at {recovery_path}; refusing to overwrite it"
+        )
+        .into());
+    }
     for slot in &rep_slots {
         let mdl_path = format!("{slot}/mdl");
         let Some(mdl_def) = WingConsole::name_to_def(&mdl_path) else {
             continue;
         };
-        let mdl_id = mdl_def.id;
-        let (original_data, _) = wing
-            .get_node_data(mdl_id, timeout)
-            .map_err(|error| format!("cannot capture original selector {mdl_path}: {error}"))?;
-        let original = restorable_snap_for_def(&original_data, mdl_def)
-            .map_err(|error| format!("cannot restore selector {mdl_path}: {error}"))?;
         let models: Vec<String> = mdl_def
             .string_enum
             .as_ref()
             .map(|items| items.iter().map(|item| item.item.clone()).collect())
             .unwrap_or_default();
-        for model in &models {
-            // Template pseudo-models (*EVEN*, *SOUL*, ...) are placeholders, not loadable models.
-            if model.contains('*') {
-                continue;
-            }
-            if wing.set_string(mdl_id, model).is_err() {
-                continue;
-            }
-            let _ = read_settled(wing, mdl_id, timeout); // barrier: selector applied
-            if let Some(paths) = params.get(&(slot.clone(), model.clone())) {
-                for path in paths {
-                    if let Ok((data, _)) = wing.get_node_data_by_name(path, timeout) {
-                        captured.push((path, snap(&data)));
-                    }
-                }
-            }
-        }
-        let Snap::Str(original_value) = &original else {
-            unreachable!("model selectors are strings")
-        };
-        let write_result = wing.set_string(mdl_id, original_value);
-        let readback = if write_result.is_ok() {
-            read_settled_for_def(wing, mdl_def, timeout)
-        } else {
-            Err(libwing::Error::Timeout)
-        };
-        verify_restore(slot, &original, write_result, readback)?;
+        capture_model_slot(
+            wing,
+            slot,
+            mdl_def,
+            &models,
+            &params,
+            &recovery_path,
+            &mut captured,
+            timeout,
+            |model| original_model_leaves(slot, model),
+        )?;
         restored += 1;
         eprintln!(
             "wingdrive: models captured for {slot} ({} models)",
@@ -408,6 +404,169 @@ fn capture_models(
         restored
     );
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_model_slot(
+    wing: &mut WingConsole,
+    slot: &str,
+    mdl_def: &WingNodeDef,
+    models: &[String],
+    params: &BTreeMap<(String, String), Vec<&'static str>>,
+    recovery_path: &str,
+    captured: &mut Vec<(&'static str, Snap)>,
+    timeout: Duration,
+    active_leaves: impl FnOnce(&str) -> Vec<(&'static str, &'static WingNodeDef)>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mdl_path = format!("{slot}/mdl");
+    let mdl_id = mdl_def.id;
+    let (original_data, _) = wing
+        .get_node_data(mdl_id, timeout)
+        .map_err(|error| format!("cannot capture original selector {mdl_path}: {error}"))?;
+    let original = restorable_snap_for_def(&original_data, mdl_def)
+        .map_err(|error| format!("cannot restore selector {mdl_path}: {error}"))?;
+    let Snap::Str(original_value) = &original else {
+        return Err(format!("selector {mdl_path} is not a string").into());
+    };
+    if !mdl_def
+        .string_enum
+        .as_ref()
+        .is_some_and(|items| items.iter().any(|item| &item.item == original_value))
+    {
+        return Err(format!(
+            "cannot snapshot unknown model {original_value:?} at {mdl_path}; no models changed"
+        )
+        .into());
+    }
+    if original_value.contains('*') {
+        return Err(format!(
+            "selector {mdl_path} contains unrestorable pseudo-model {original_value:?}"
+        )
+        .into());
+    }
+    // Snapshot every writable leaf in the active slot before any selector write.
+    // Shared IDs must be resolved against the original model, never another variant.
+    let mut saved = vec![(mdl_path.clone(), mdl_def.clone(), original.clone())];
+    for (path, def) in active_leaves(original_value) {
+        let (data, _) = wing
+            .get_node_data(def.id, timeout)
+            .map_err(|error| format!("cannot snapshot {path}; no models changed: {error}"))?;
+        let value = restorable_snap_for_def(&data, def)
+            .map_err(|error| format!("cannot snapshot {path}; no models changed: {error}"))?;
+        if matches!(value, Snap::Float(value) if !value.is_finite()) {
+            return Err(
+                format!("cannot snapshot non-finite value at {path}; no models changed").into(),
+            );
+        }
+        saved.push((path.to_string(), def.clone(), value));
+    }
+    let recovery: Vec<_> = saved
+        .iter()
+        .map(|(path, _, value)| (path.as_str(), value.clone()))
+        .collect();
+    write_path_values(recovery_path, &recovery)?;
+
+    let capture_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        for model in models {
+            if model.contains('*') {
+                continue;
+            }
+            wing.set_string(mdl_id, model)?;
+            let selected = read_settled_for_def(wing, mdl_def, timeout)?;
+            if selected != Snap::Str(model.clone()) {
+                return Err(format!("model {model} did not settle at {slot}").into());
+            }
+            if let Some(paths) = params.get(&(slot.to_string(), model.clone())) {
+                for path in paths {
+                    let (data, _) = wing.get_node_data_by_name(path, timeout)?;
+                    captured.push((path, snap(&data)));
+                }
+            }
+        }
+        Ok(())
+    })();
+    // Restore and verify the selector first, then its original processing values.
+    // Retain the durable recovery file whenever any restore fails.
+    let mut failures = Vec::new();
+    let mut selector_restored = false;
+    for (index, (path, def, value)) in saved.iter().enumerate() {
+        let write = match value {
+            Snap::Str(value) => wing.set_string(def.id, value),
+            Snap::Float(value) => wing.set_float(def.id, *value),
+            Snap::Int(value) => wing.set_int(def.id, *value),
+        };
+        let readback = if write.is_ok() {
+            read_settled_for_def(wing, def, timeout)
+        } else {
+            Err(libwing::Error::Timeout)
+        };
+        if let Err(error) = verify_restore(path, value, write, readback) {
+            failures.push(error.to_string());
+            if index == 0 {
+                break;
+            } // Never write children under an unconfirmed selector.
+        } else if index == 0 {
+            selector_restored = true;
+        }
+    }
+    // A later parameter write can couple to and reset a value verified earlier. Keep the
+    // recovery file until one final read-only pass proves the complete original state.
+    if selector_restored {
+        for (path, def, value) in &saved {
+            match read_settled_for_def(wing, def, timeout) {
+                Ok(readback) if &readback == value => {}
+                Ok(readback) => failures.push(format!(
+                    "FINAL RESTORE CHECK FAILED for {path}: before={value:?} after={readback:?}"
+                )),
+                Err(error) => failures.push(format!(
+                    "FINAL RESTORE CHECK FAILED for {path}: readback: {error}"
+                )),
+            }
+        }
+    }
+    if !failures.is_empty() {
+        return Err(format!(
+            "{}; recovery retained at {recovery_path}",
+            failures.join("; ")
+        )
+        .into());
+    }
+    std::fs::remove_file(recovery_path)?;
+    capture_result?;
+    Ok(())
+}
+
+/// Select actual writable leaves, excluding inactive aliases and read-only status nodes.
+fn original_model_leaves(slot: &str, model: &str) -> Vec<(&'static str, &'static WingNodeDef)> {
+    let mut by_id = BTreeMap::new();
+    for (path, def) in WingConsole::propmap_iter() {
+        let Some(tail) = path
+            .strip_prefix(slot)
+            .and_then(|tail| tail.strip_prefix('/'))
+        else {
+            continue;
+        };
+        if tail == "mdl"
+            || def.read_only
+            || def.node_type == NodeType::Node
+            || path.contains('*')
+            || path.contains('$')
+        {
+            continue;
+        }
+        if tail.contains('/') {
+            // Only the active model's synthetic subtree is addressable for shared IDs.
+            if !tail
+                .strip_prefix(model)
+                .and_then(|tail| tail.strip_prefix('/'))
+                .is_some_and(|leaf| !leaf.is_empty())
+            {
+                continue;
+            }
+        }
+        by_id.entry(def.id).or_insert((path, def));
+    }
+    by_id.into_values().collect()
 }
 
 /// Writes `path -> value` pairs as JSONL (`{"path":..,"value":{"type":..,"value":..}}` per line),
@@ -429,7 +588,7 @@ fn write_path_values(
             json_escape(node)
         ));
     }
-    std::fs::write(path, out)?;
+    atomic_write::publish_outputs(&[(std::path::Path::new(path), out.as_bytes())])?;
     Ok(())
 }
 
@@ -1087,5 +1246,213 @@ mod restore_tests {
             Err(libwing::Error::Timeout),
         )
         .is_err());
+    }
+}
+
+#[cfg(all(test, feature = "propmap"))]
+mod model_snapshot_regressions {
+    use super::*;
+    use libwing::Transport;
+    use std::collections::VecDeque;
+    use std::io::{Read, Write};
+    use std::net::{IpAddr, Ipv4Addr};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Default)]
+    struct ScriptState {
+        available: VecDeque<u8>,
+        responses: VecDeque<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    struct ScriptReader(Arc<Mutex<ScriptState>>);
+
+    impl Read for ScriptReader {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let mut state = self.0.lock().unwrap();
+            if state.available.is_empty() {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "no scripted response available",
+                ));
+            }
+            let len = buf.len().min(state.available.len());
+            for byte in buf.iter_mut().take(len) {
+                *byte = state.available.pop_front().unwrap();
+            }
+            Ok(len)
+        }
+    }
+
+    impl Write for ScriptReader {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for ScriptReader {
+        fn set_read_timeout(&mut self, _dur: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    struct ScriptWriter(Arc<Mutex<ScriptState>>);
+
+    impl Read for ScriptWriter {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::TimedOut,
+                "script writer is not readable",
+            ))
+        }
+    }
+
+    impl Write for ScriptWriter {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut state = self.0.lock().unwrap();
+            state.written.extend_from_slice(buf);
+            if buf.last() == Some(&0xdc) {
+                let response = state.responses.pop_front().expect("unexpected request");
+                state.available.extend(response);
+            }
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for ScriptWriter {
+        fn set_read_timeout(&mut self, _dur: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    fn node_data_string(id: i32, value: &str) -> Vec<u8> {
+        let mut frame = vec![0xd7];
+        frame.extend_from_slice(&id.to_be_bytes());
+        frame.push(0x7f + value.len() as u8);
+        frame.extend_from_slice(value.as_bytes());
+        frame
+    }
+
+    fn node_data_int(id: i32, value: i32) -> Vec<u8> {
+        let mut frame = vec![0xd7];
+        frame.extend_from_slice(&id.to_be_bytes());
+        frame.push(0xd4);
+        frame.extend_from_slice(&value.to_be_bytes());
+        frame
+    }
+
+    fn node_data_float(id: i32, value: f32) -> Vec<u8> {
+        let mut frame = vec![0xd7];
+        frame.extend_from_slice(&id.to_be_bytes());
+        frame.push(0xd5);
+        frame.extend_from_slice(&value.to_be_bytes());
+        frame
+    }
+
+    fn scripted_model_capture(
+        fail_leaf_restore: bool,
+    ) -> (Result<(), Box<dyn std::error::Error>>, String, Vec<u8>) {
+        let mdl = WingConsole::name_to_def("/fx/1/mdl").unwrap();
+        let hall = WingConsole::name_to_def("/fx/1/HALL/pdel").unwrap();
+        let room = WingConsole::name_to_def("/fx/1/ROOM/size").unwrap();
+        let final_leaf = if fail_leaf_restore { 1 } else { 77 };
+        let responses = VecDeque::from([
+            node_data_string(mdl.id, "HALL"),
+            node_data_int(hall.id, 77),
+            node_data_string(mdl.id, "ROOM"),
+            node_data_float(room.id, 42.0),
+            node_data_string(mdl.id, "HALL"),
+            node_data_int(hall.id, 77),
+            node_data_string(mdl.id, "HALL"),
+            node_data_int(hall.id, final_leaf),
+        ]);
+        let state = Arc::new(Mutex::new(ScriptState {
+            responses,
+            ..ScriptState::default()
+        }));
+        let mut wing = WingConsole::from_transports(
+            ScriptReader(state.clone()),
+            ScriptWriter(state.clone()),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let recovery = std::env::temp_dir().join(format!(
+            "wingdrive-model-recovery-{}-{fail_leaf_restore}.jsonl",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_file(&recovery);
+        let mut params = BTreeMap::new();
+        params.insert(
+            ("/fx/1".to_string(), "ROOM".to_string()),
+            vec!["/fx/1/ROOM/size"],
+        );
+        let mut captured = Vec::new();
+        let result = capture_model_slot(
+            &mut wing,
+            "/fx/1",
+            mdl,
+            &["ROOM".to_string()],
+            &params,
+            recovery.to_str().unwrap(),
+            &mut captured,
+            Duration::from_millis(1),
+            |_| vec![("/fx/1/HALL/pdel", hall)],
+        );
+        if result.is_ok() {
+            assert_eq!(captured, vec![("/fx/1/ROOM/size", Snap::Float(42.0))]);
+        }
+        let recovery_contents = std::fs::read_to_string(&recovery).unwrap_or_default();
+        let written = state.lock().unwrap().written.clone();
+        let _ = std::fs::remove_file(recovery);
+        (result, recovery_contents, written)
+    }
+
+    #[test]
+    fn snapshot_covers_active_parameters_without_inactive_aliases() {
+        let leaves = original_model_leaves("/fx/1", "HALL");
+        assert!(!leaves.is_empty());
+        assert!(leaves
+            .iter()
+            .any(|(path, _)| path.starts_with("/fx/1/HALL/")));
+        assert!(leaves.iter().all(|(path, def)| !def.read_only
+            && !path.contains('$')
+            && path
+                .strip_prefix("/fx/1/")
+                .unwrap()
+                .split_once('/')
+                .is_none_or(|(model, _)| model == "HALL")));
+        let ids: BTreeSet<_> = leaves.iter().map(|(_, def)| def.id).collect();
+        assert_eq!(ids.len(), leaves.len());
+
+        let slash_model = original_model_leaves("/fx/1", "DEL/REV");
+        assert!(slash_model
+            .iter()
+            .any(|(path, _)| path.starts_with("/fx/1/DEL/REV/")));
+    }
+
+    #[test]
+    fn model_capture_restores_selector_and_nondefault_parameter_after_switch_reset() {
+        let (result, recovery, written) = scripted_model_capture(false);
+        assert!(result.is_ok(), "{result:?}");
+        assert!(recovery.is_empty());
+        assert!(written.windows(4).any(|window| window == b"ROOM"));
+        assert!(written.windows(4).any(|window| window == b"HALL"));
+        assert!(written.windows(3).any(|window| window == [0xd3, 0, 77]));
+    }
+
+    #[test]
+    fn failed_parameter_restore_retains_recovery_file() {
+        let (result, recovery, _) = scripted_model_capture(true);
+        assert!(result.is_err());
+        assert!(recovery.contains("/fx/1/mdl"));
+        assert!(recovery.contains("/fx/1/HALL/pdel"));
+        assert!(recovery.contains("77"));
     }
 }

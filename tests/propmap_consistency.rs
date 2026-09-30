@@ -126,7 +126,14 @@ fn embedded_defs_round_trip_every_sweep_row_field_for_field() {
         if line.trim().is_empty() {
             continue;
         }
-        let row = jzon::parse(line).expect("valid JSON row");
+        let mut row = jzon::parse(line).expect("valid JSON row");
+        // Historical sweep rows omitted zero-count enum metadata. The codec now
+        // represents that valid wire count explicitly as an empty collection.
+        if matches!(row["type"].as_str(), Some("string enum" | "float enum"))
+            && !row.has_key("items")
+        {
+            row.insert("items", jzon::JsonValue::new_array()).unwrap();
+        }
         let fullname = row["fullname"].as_str().expect("row has fullname");
         let def = WingConsole::name_to_def(fullname)
             .unwrap_or_else(|| panic!("`{fullname}` missing from embedded map"));

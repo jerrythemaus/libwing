@@ -1,4 +1,4 @@
-use crate::{console::Meter, Error, NodeType, NodeUnit, WingConsole, WingResponse};
+use crate::{console::Meter, DiscoveryInfo, Error, NodeType, NodeUnit, WingConsole, WingResponse};
 use std::cell::{Cell, RefCell};
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_float, c_int};
@@ -207,8 +207,72 @@ unsafe fn discovery_ref<'a>(
     handle.as_ref()
 }
 
+fn discovery_info_ref<'a>(
+    handle: *const WingDiscoveryInfoHandle,
+    index: c_int,
+    accessor: &str,
+) -> Option<&'a DiscoveryInfo> {
+    let Some(handle) = (unsafe { discovery_ref(handle) }) else {
+        record_ffi_usage_error(&format!("{accessor}: null discovery handle"));
+        return None;
+    };
+    let Some(index) = usize::try_from(index).ok() else {
+        record_ffi_usage_error(&format!("{accessor}: invalid discovery index"));
+        return None;
+    };
+    match handle.info.get(index) {
+        Some(info) => Some(info),
+        None => {
+            record_ffi_usage_error(&format!("{accessor}: discovery index out of range"));
+            None
+        }
+    }
+}
+
 unsafe fn response_ref<'a>(handle: *const ResponseHandle) -> Option<&'a ResponseHandle> {
     handle.as_ref()
+}
+
+fn node_data_ref<'a>(
+    handle: *const ResponseHandle,
+    accessor: &str,
+) -> Option<(i32, &'a crate::WingNodeData)> {
+    match unsafe { response_ref(handle).map(|handle| &handle.response) } {
+        Some(WingResponse::NodeData(id, data)) => Some((*id, data)),
+        Some(_) => {
+            record_ffi_usage_error(&format!("{accessor}: response is not node data"));
+            None
+        }
+        None => {
+            record_ffi_usage_error(&format!("{accessor}: null response handle"));
+            None
+        }
+    }
+}
+
+fn node_definition_ref<'a>(
+    handle: *const ResponseHandle,
+    accessor: &str,
+) -> Option<&'a crate::WingNodeDef> {
+    match unsafe { response_ref(handle).map(|handle| &handle.response) } {
+        Some(WingResponse::NodeDef(def)) => Some(def),
+        Some(_) => {
+            record_ffi_usage_error(&format!("{accessor}: response is not a node definition"));
+            None
+        }
+        None => {
+            record_ffi_usage_error(&format!("{accessor}: null response handle"));
+            None
+        }
+    }
+}
+
+fn accessor_string(value: &str, accessor: &str) -> *mut c_char {
+    let result = string_to_c(value);
+    if result.is_null() {
+        record_ffi_usage_error(&format!("{accessor}: string contains an embedded NUL"));
+    }
+    result
 }
 
 #[no_mangle]
@@ -246,7 +310,13 @@ pub extern "C" fn wing_discover_destroy(handle: *mut WingDiscoveryInfoHandle) {
 
 #[no_mangle]
 pub extern "C" fn wing_discover_count(handle: *const WingDiscoveryInfoHandle) -> c_int {
-    ffi_guard(|| unsafe { discovery_ref(handle).map_or(-1, |handle| handle.info.len() as c_int) })
+    ffi_guard(|| match unsafe { discovery_ref(handle) } {
+        Some(handle) => handle.info.len() as c_int,
+        None => {
+            record_ffi_usage_error("wing_discover_count: null discovery handle");
+            -1
+        }
+    })
 }
 
 #[no_mangle]
@@ -255,13 +325,9 @@ pub extern "C" fn wing_discover_get_ip(
     index: c_int,
 ) -> *mut c_char {
     ffi_guard(|| {
-        unsafe { discovery_ref(handle) }
-            .and_then(|handle| {
-                usize::try_from(index)
-                    .ok()
-                    .and_then(|index| handle.info.get(index))
-            })
-            .map_or(ptr::null_mut(), |info| string_to_c(&info.ip))
+        discovery_info_ref(handle, index, "wing_discover_get_ip").map_or(ptr::null_mut(), |info| {
+            accessor_string(&info.ip, "wing_discover_get_ip")
+        })
     })
 }
 
@@ -271,13 +337,10 @@ pub extern "C" fn wing_discover_get_name(
     index: c_int,
 ) -> *mut c_char {
     ffi_guard(|| {
-        unsafe { discovery_ref(handle) }
-            .and_then(|handle| {
-                usize::try_from(index)
-                    .ok()
-                    .and_then(|index| handle.info.get(index))
+        discovery_info_ref(handle, index, "wing_discover_get_name")
+            .map_or(ptr::null_mut(), |info| {
+                accessor_string(&info.name, "wing_discover_get_name")
             })
-            .map_or(ptr::null_mut(), |info| string_to_c(&info.name))
     })
 }
 
@@ -287,13 +350,10 @@ pub extern "C" fn wing_discover_get_model(
     index: c_int,
 ) -> *mut c_char {
     ffi_guard(|| {
-        unsafe { discovery_ref(handle) }
-            .and_then(|handle| {
-                usize::try_from(index)
-                    .ok()
-                    .and_then(|index| handle.info.get(index))
+        discovery_info_ref(handle, index, "wing_discover_get_model")
+            .map_or(ptr::null_mut(), |info| {
+                accessor_string(&info.model, "wing_discover_get_model")
             })
-            .map_or(ptr::null_mut(), |info| string_to_c(&info.model))
     })
 }
 
@@ -303,13 +363,10 @@ pub extern "C" fn wing_discover_get_serial(
     index: c_int,
 ) -> *mut c_char {
     ffi_guard(|| {
-        unsafe { discovery_ref(handle) }
-            .and_then(|handle| {
-                usize::try_from(index)
-                    .ok()
-                    .and_then(|index| handle.info.get(index))
+        discovery_info_ref(handle, index, "wing_discover_get_serial")
+            .map_or(ptr::null_mut(), |info| {
+                accessor_string(&info.serial, "wing_discover_get_serial")
             })
-            .map_or(ptr::null_mut(), |info| string_to_c(&info.serial))
     })
 }
 
@@ -319,13 +376,10 @@ pub extern "C" fn wing_discover_get_firmware(
     index: c_int,
 ) -> *mut c_char {
     ffi_guard(|| {
-        unsafe { discovery_ref(handle) }
-            .and_then(|handle| {
-                usize::try_from(index)
-                    .ok()
-                    .and_then(|index| handle.info.get(index))
+        discovery_info_ref(handle, index, "wing_discover_get_firmware")
+            .map_or(ptr::null_mut(), |info| {
+                accessor_string(&info.firmware, "wing_discover_get_firmware")
             })
-            .map_or(ptr::null_mut(), |info| string_to_c(&info.firmware))
     })
 }
 
@@ -648,65 +702,44 @@ pub extern "C" fn wing_response_get_type(handle: *const ResponseHandle) -> Respo
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_id(handle: *const ResponseHandle) -> i32 {
-    ffi_guard(|| {
-        if let Some(WingResponse::NodeData(id, _)) =
-            unsafe { response_ref(handle).map(|handle| &handle.response) }
-        {
-            *id
-        } else {
-            0
-        }
-    })
+    ffi_guard(|| node_data_ref(handle, "wing_node_data_get_id").map_or(0, |(id, _)| id))
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_string(handle: *const ResponseHandle) -> *mut c_char {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeData(_, data)) =
-            unsafe { response_ref(handle).map(|handle| &handle.response) }
-        {
-            string_to_c(&data.get_string())
-        } else {
-            ptr::null_mut()
-        }
+        node_data_ref(handle, "wing_node_data_get_string").map_or(ptr::null_mut(), |(_, data)| {
+            accessor_string(&data.get_string(), "wing_node_data_get_string")
+        })
     })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_float(handle: *const ResponseHandle) -> c_float {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeData(_, data)) =
-            unsafe { response_ref(handle).map(|handle| &handle.response) }
-        {
-            data.get_float()
-        } else {
-            0.0
-        }
+        node_data_ref(handle, "wing_node_data_get_float").map_or(0.0, |(_, data)| data.get_float())
     })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_get_int(handle: *const ResponseHandle) -> c_int {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeData(_, data)) =
-            unsafe { response_ref(handle).map(|handle| &handle.response) }
-        {
-            data.get_int()
-        } else {
-            0
-        }
+        node_data_ref(handle, "wing_node_data_get_int").map_or(0, |(_, data)| data.get_int())
     })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_string(handle: *const ResponseHandle) -> c_int {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeData(_, data)) =
-            unsafe { response_ref(handle).map(|handle| &handle.response) }
-        {
+        if let Some((_, data)) = node_data_ref(handle, "wing_node_data_has_string") {
             if data.has_string() && is_c_string_compatible(&data.get_string()) {
                 1
             } else {
+                if data.has_string() {
+                    record_ffi_usage_error(
+                        "wing_node_data_has_string: string contains an embedded NUL",
+                    );
+                }
                 0
             }
         } else {
@@ -718,9 +751,7 @@ pub extern "C" fn wing_node_data_has_string(handle: *const ResponseHandle) -> c_
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_float(handle: *const ResponseHandle) -> c_int {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeData(_, data)) =
-            unsafe { response_ref(handle).map(|handle| &handle.response) }
-        {
+        if let Some((_, data)) = node_data_ref(handle, "wing_node_data_has_float") {
             if data.has_float() {
                 1
             } else {
@@ -735,9 +766,7 @@ pub extern "C" fn wing_node_data_has_float(handle: *const ResponseHandle) -> c_i
 #[no_mangle]
 pub extern "C" fn wing_node_data_has_int(handle: *const ResponseHandle) -> c_int {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeData(_, data)) =
-            unsafe { response_ref(handle).map(|handle| &handle.response) }
-        {
+        if let Some((_, data)) = node_data_ref(handle, "wing_node_data_has_int") {
             if data.has_int() {
                 1
             } else {
@@ -929,40 +958,21 @@ pub extern "C" fn wing_console_keep_alive_meters(handle: *mut WingConsoleHandle)
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_id(def: *const ResponseHandle) -> i32 {
-    ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
-            def.id
-        } else {
-            0
-        }
-    })
+    ffi_guard(|| node_definition_ref(def, "wing_node_definition_get_id").map_or(0, |def| def.id))
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_parent_id(def: *const ResponseHandle) -> i32 {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
-            def.parent_id
-        } else {
-            0
-        }
+        node_definition_ref(def, "wing_node_definition_get_parent_id")
+            .map_or(0, |def| def.parent_id)
     })
 }
 
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_index(def: *const ResponseHandle) -> u16 {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
-            def.index
-        } else {
-            0
-        }
+        node_definition_ref(def, "wing_node_definition_get_index").map_or(0, |def| def.index)
     })
 }
 
@@ -1036,9 +1046,7 @@ impl From<NodeUnit> for FfiNodeUnit {
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_type(def: *const ResponseHandle) -> FfiNodeType {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_type") {
             def.node_type.into()
         } else {
             FfiNodeType::Node
@@ -1049,9 +1057,7 @@ pub extern "C" fn wing_node_definition_get_type(def: *const ResponseHandle) -> F
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_unit(def: *const ResponseHandle) -> FfiNodeUnit {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_unit") {
             def.unit.into()
         } else {
             FfiNodeUnit::None
@@ -1062,10 +1068,8 @@ pub extern "C" fn wing_node_definition_get_unit(def: *const ResponseHandle) -> F
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_name(def: *const ResponseHandle) -> *mut c_char {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
-            string_to_c(&def.name)
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_name") {
+            accessor_string(&def.name, "wing_node_definition_get_name")
         } else {
             ptr::null_mut()
         }
@@ -1075,10 +1079,8 @@ pub extern "C" fn wing_node_definition_get_name(def: *const ResponseHandle) -> *
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_long_name(def: *const ResponseHandle) -> *mut c_char {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
-            string_to_c(&def.long_name)
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_long_name") {
+            accessor_string(&def.long_name, "wing_node_definition_get_long_name")
         } else {
             ptr::null_mut()
         }
@@ -1088,9 +1090,7 @@ pub extern "C" fn wing_node_definition_get_long_name(def: *const ResponseHandle)
 #[no_mangle]
 pub extern "C" fn wing_node_definition_is_read_only(def: *const ResponseHandle) -> c_int {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_is_read_only") {
             if def.read_only {
                 1
             } else {
@@ -1109,11 +1109,10 @@ pub extern "C" fn wing_node_definition_get_min_float(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error("wing_node_definition_get_min_float: null output pointer");
             return 0;
         }
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_min_float") {
             if let Some(min_float) = def.min_float {
                 unsafe {
                     *ret = min_float;
@@ -1135,11 +1134,10 @@ pub extern "C" fn wing_node_definition_get_max_float(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error("wing_node_definition_get_max_float: null output pointer");
             return 0;
         }
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_max_float") {
             if let Some(max_float) = def.max_float {
                 unsafe {
                     *ret = max_float;
@@ -1161,11 +1159,10 @@ pub extern "C" fn wing_node_definition_get_steps(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error("wing_node_definition_get_steps: null output pointer");
             return 0;
         }
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_steps") {
             if let Some(steps) = def.steps {
                 unsafe {
                     *ret = steps;
@@ -1187,11 +1184,10 @@ pub extern "C" fn wing_node_definition_get_min_int(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error("wing_node_definition_get_min_int: null output pointer");
             return 0;
         }
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_min_int") {
             if let Some(min_int) = def.min_int {
                 unsafe {
                     *ret = min_int;
@@ -1213,11 +1209,10 @@ pub extern "C" fn wing_node_definition_get_max_int(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error("wing_node_definition_get_max_int: null output pointer");
             return 0;
         }
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_max_int") {
             if let Some(max_int) = def.max_int {
                 unsafe {
                     *ret = max_int;
@@ -1239,11 +1234,10 @@ pub extern "C" fn wing_node_definition_get_max_string_len(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error("wing_node_definition_get_max_string_len: null output pointer");
             return 0;
         }
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_max_string_len") {
             if let Some(max_string_len) = def.max_string_len {
                 unsafe {
                     *ret = max_string_len as i32;
@@ -1261,9 +1255,7 @@ pub extern "C" fn wing_node_definition_get_max_string_len(
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_string_enum_count(def: *const ResponseHandle) -> c_int {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_string_enum_count") {
             def.string_enum
                 .as_ref()
                 .map_or(0, |string_enum| string_enum.len() as c_int)
@@ -1276,9 +1268,7 @@ pub extern "C" fn wing_node_definition_get_string_enum_count(def: *const Respons
 #[no_mangle]
 pub extern "C" fn wing_node_definition_get_float_enum_count(def: *const ResponseHandle) -> c_int {
     ffi_guard(|| {
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_float_enum_count") {
             def.float_enum
                 .as_ref()
                 .map_or(0, |float_enum| float_enum.len() as c_int)
@@ -1296,20 +1286,23 @@ pub extern "C" fn wing_node_definition_get_float_enum_item(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error("wing_node_definition_get_float_enum_item: null output pointer");
             return 0;
         }
         let Some(index) = usize::try_from(index).ok() else {
+            record_ffi_usage_error("wing_node_definition_get_float_enum_item: invalid enum index");
             return 0;
         };
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_float_enum_item") {
             if let Some(item) = def.float_enum.as_ref().and_then(|items| items.get(index)) {
                 unsafe {
                     *ret = item.item;
                 }
                 1
             } else {
+                record_ffi_usage_error(
+                    "wing_node_definition_get_float_enum_item: enum index out of range",
+                );
                 0
             }
         } else {
@@ -1326,16 +1319,24 @@ pub extern "C" fn wing_node_definition_get_float_enum_long_item(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error(
+                "wing_node_definition_get_float_enum_long_item: null output pointer",
+            );
             return 0;
         }
         let Some(index) = usize::try_from(index).ok() else {
+            record_ffi_usage_error(
+                "wing_node_definition_get_float_enum_long_item: invalid enum index",
+            );
             return 0;
         };
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_float_enum_long_item")
         {
             if let Some(item) = def.float_enum.as_ref().and_then(|items| items.get(index)) {
-                let value = string_to_c(&item.long_item);
+                let value = accessor_string(
+                    &item.long_item,
+                    "wing_node_definition_get_float_enum_long_item",
+                );
                 if value.is_null() {
                     0
                 } else {
@@ -1345,6 +1346,9 @@ pub extern "C" fn wing_node_definition_get_float_enum_long_item(
                     1
                 }
             } else {
+                record_ffi_usage_error(
+                    "wing_node_definition_get_float_enum_long_item: enum index out of range",
+                );
                 0
             }
         } else {
@@ -1361,16 +1365,19 @@ pub extern "C" fn wing_node_definition_get_string_enum_item(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error(
+                "wing_node_definition_get_string_enum_item: null output pointer",
+            );
             return 0;
         }
         let Some(index) = usize::try_from(index).ok() else {
+            record_ffi_usage_error("wing_node_definition_get_string_enum_item: invalid enum index");
             return 0;
         };
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
-        {
+        if let Some(def) = node_definition_ref(def, "wing_node_definition_get_string_enum_item") {
             if let Some(item) = def.string_enum.as_ref().and_then(|items| items.get(index)) {
-                let value = string_to_c(&item.item);
+                let value =
+                    accessor_string(&item.item, "wing_node_definition_get_string_enum_item");
                 if value.is_null() {
                     0
                 } else {
@@ -1380,6 +1387,9 @@ pub extern "C" fn wing_node_definition_get_string_enum_item(
                     1
                 }
             } else {
+                record_ffi_usage_error(
+                    "wing_node_definition_get_string_enum_item: enum index out of range",
+                );
                 0
             }
         } else {
@@ -1395,16 +1405,25 @@ pub extern "C" fn wing_node_definition_get_string_enum_long_item(
 ) -> c_int {
     ffi_guard(|| {
         if ret.is_null() {
+            record_ffi_usage_error(
+                "wing_node_definition_get_string_enum_long_item: null output pointer",
+            );
             return 0;
         }
         let Some(index) = usize::try_from(index).ok() else {
+            record_ffi_usage_error(
+                "wing_node_definition_get_string_enum_long_item: invalid enum index",
+            );
             return 0;
         };
-        if let Some(WingResponse::NodeDef(def)) =
-            unsafe { response_ref(def).map(|handle| &handle.response) }
+        if let Some(def) =
+            node_definition_ref(def, "wing_node_definition_get_string_enum_long_item")
         {
             if let Some(item) = def.string_enum.as_ref().and_then(|items| items.get(index)) {
-                let value = string_to_c(&item.long_item);
+                let value = accessor_string(
+                    &item.long_item,
+                    "wing_node_definition_get_string_enum_long_item",
+                );
                 if value.is_null() {
                     0
                 } else {
@@ -1414,6 +1433,9 @@ pub extern "C" fn wing_node_definition_get_string_enum_long_item(
                     1
                 }
             } else {
+                record_ffi_usage_error(
+                    "wing_node_definition_get_string_enum_long_item: enum index out of range",
+                );
                 0
             }
         } else {
@@ -1554,6 +1576,37 @@ mod tests {
 
         assert_eq!(wing_node_data_has_string(&response), 0);
         assert!(wing_node_data_get_string(&response).is_null());
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+    }
+
+    #[test]
+    fn failed_accessors_replace_stale_last_error() {
+        set_last_error("stale", 99);
+        assert_eq!(wing_discover_count(ptr::null()), -1);
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+        let message = unsafe { CStr::from_ptr(wing_last_error_message()) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("wing_discover_count"));
+
+        set_last_error("stale", 99);
+        assert_eq!(wing_node_data_get_int(ptr::null()), 0);
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+        let message = unsafe { CStr::from_ptr(wing_last_error_message()) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("wing_node_data_get_int"));
+
+        let wrong_kind = ResponseHandle {
+            response: WingResponse::RequestEnd,
+        };
+        set_last_error("stale", 99);
+        assert_eq!(wing_node_definition_get_id(&wrong_kind), 0);
+        assert_eq!(wing_last_error_code(), WING_ERROR_FFI_USAGE);
+        let message = unsafe { CStr::from_ptr(wing_last_error_message()) }
+            .to_str()
+            .unwrap();
+        assert!(message.contains("wing_node_definition_get_id"));
     }
 
     #[test]
@@ -1587,6 +1640,15 @@ mod tests {
                 raw: Vec::new(),
             }),
         };
+        let mut absent = 123.0;
+        set_last_error("stale", 99);
+        assert_eq!(
+            wing_node_definition_get_max_float(&response, &mut absent),
+            0
+        );
+        assert_eq!(wing_last_error_code(), 99);
+        assert_eq!(absent, 123.0);
+
         let mut out: *mut c_char = ptr::null_mut();
         assert_eq!(
             wing_node_definition_get_string_enum_item(&response, -1, &mut out),

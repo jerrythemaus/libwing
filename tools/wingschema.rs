@@ -10,7 +10,10 @@ use std::io::Write;
 use std::path::Path;
 use std::result::Result;
 
-use libwing::{NodeType, WingConsole, WingNodeData, WingNodeDef, WingResponse};
+use libwing::{
+    FloatEnumItem, NodeType, NodeUnit, StringEnumItem, WingConsole, WingNodeData, WingNodeDef,
+    WingResponse,
+};
 
 /// One model selector's pre-crawl state: its node id, its full path (for
 /// reporting), and the value it held before the crawl started flipping it.
@@ -414,34 +417,6 @@ fn parent_id_for(fullname: &str, id_by_fullname: &HashMap<String, i32>) -> i32 {
     0
 }
 
-fn type_code(t: &str) -> u8 {
-    match t {
-        "node" => 0,
-        "linear float" => 1,
-        "log float" => 2,
-        "fader level" => 3,
-        "integer" => 4,
-        "string enum" => 5,
-        "float enum" => 6,
-        "string" => 7,
-        other => panic!("unknown node type `{other}` in sweep row"),
-    }
-}
-
-fn unit_code(u: Option<&str>) -> u8 {
-    match u {
-        None => 0,
-        Some("dB") => 1,
-        Some("%") => 2,
-        Some("ms") => 3,
-        Some("Hz") => 4,
-        Some("meters") => 5,
-        Some("seconds") => 6,
-        Some("octaves") => 7,
-        Some(other) => panic!("unknown unit `{other}` in sweep row"),
-    }
-}
-
 /// Correctly-rounded f32 from a jzon number. `JsonValue::as_f32` computes
 /// `mantissa * 10^exponent` in floating-point, which drifts by 1 ULP once the
 /// decimal mantissa exceeds f64's 53-bit precision (e.g. the 17-digit repr of
@@ -452,90 +427,75 @@ fn json_f32(v: &jzon::JsonValue) -> f32 {
     v.dump().parse().unwrap_or(0.0)
 }
 
-/// Build the type-specific tail of the wire encoding that `WingNodeDef::from_bytes`
-/// expects after the flags word, mirroring `node.rs`'s `from_bytes_inner` parse
-/// (kept in sync by hand since the sweep JSON has no raw bytes to copy from).
-fn build_payload(row: &jzon::JsonValue, tcode: u8) -> Vec<u8> {
-    let mut payload = Vec::new();
-    match tcode {
-        1 | 2 => {
-            payload.extend_from_slice(&json_f32(&row["minfloat"]).to_be_bytes());
-            payload.extend_from_slice(&json_f32(&row["maxfloat"]).to_be_bytes());
-            payload.extend_from_slice(&row["steps"].as_i32().unwrap_or(0).to_be_bytes());
-        }
-        3 => {
-            // Fader level range is optional on the wire (see from_bytes_inner); only
-            // emit it when the sweep row actually carries one.
-            if row.has_key("minfloat") {
-                payload.extend_from_slice(&json_f32(&row["minfloat"]).to_be_bytes());
-                payload.extend_from_slice(&json_f32(&row["maxfloat"]).to_be_bytes());
-                payload.extend_from_slice(&row["steps"].as_i32().unwrap_or(0).to_be_bytes());
-            }
-        }
-        4 => {
-            payload.extend_from_slice(&row["minint"].as_i32().unwrap_or(0).to_be_bytes());
-            payload.extend_from_slice(&row["maxint"].as_i32().unwrap_or(0).to_be_bytes());
-        }
-        5 => {
-            let items: Vec<_> = row["items"].members().collect();
-            payload.extend_from_slice(&(items.len() as u16).to_be_bytes());
-            for item in items {
-                let s = item["item"].as_str().unwrap_or("");
-                payload.push(s.len() as u8);
-                payload.extend_from_slice(s.as_bytes());
-                let l = item["longitem"].as_str().unwrap_or("");
-                payload.push(l.len() as u8);
-                payload.extend_from_slice(l.as_bytes());
-            }
-        }
-        6 => {
-            let items: Vec<_> = row["items"].members().collect();
-            payload.extend_from_slice(&(items.len() as u16).to_be_bytes());
-            for item in items {
-                payload.extend_from_slice(&json_f32(&item["item"]).to_be_bytes());
-                let l = item["longitem"].as_str().unwrap_or("");
-                payload.push(l.len() as u8);
-                payload.extend_from_slice(l.as_bytes());
-            }
-        }
-        7 => {
-            payload.extend_from_slice(&row["maxstringlen"].as_u16().unwrap_or(0).to_be_bytes());
-        }
-        _ => {}
-    }
-    payload
-}
-
-#[allow(clippy::too_many_arguments)]
-fn encode_def_bytes(
-    parent_id: i32,
-    id: i32,
-    index: u16,
-    name: &str,
-    long_name: &str,
-    tcode: u8,
-    ucode: u8,
-    read_only: bool,
-    payload: &[u8],
-) -> Vec<u8> {
-    assert!(name.len() <= 255, "name `{name}` too long to encode");
-    assert!(
-        long_name.len() <= 255,
-        "longname `{long_name}` too long to encode"
+/// Convert one persisted sweep row back into typed definition metadata. Wire
+/// serialization remains owned by `WingNodeDef::to_wire_bytes`.
+fn def_from_sweep_row(row: &jzon::JsonValue, parent_id: i32) -> WingNodeDef {
+    let node_type = match row["type"].as_str() {
+        Some("node") => NodeType::Node,
+        Some("linear float") => NodeType::LinearFloat,
+        Some("log float") => NodeType::LogarithmicFloat,
+        Some("fader level") => NodeType::FaderLevel,
+        Some("integer") => NodeType::Integer,
+        Some("string enum") => NodeType::StringEnum,
+        Some("float enum") => NodeType::FloatEnum,
+        Some("string") => NodeType::String,
+        Some(other) => panic!("unknown node type `{other}` in sweep row"),
+        None => panic!("sweep row missing node type"),
+    };
+    let unit = match row["unit"].as_str() {
+        None => NodeUnit::None,
+        Some("dB") => NodeUnit::Db,
+        Some("%") => NodeUnit::Percent,
+        Some("ms") => NodeUnit::Milliseconds,
+        Some("Hz") => NodeUnit::Hertz,
+        Some("meters") => NodeUnit::Meters,
+        Some("seconds") => NodeUnit::Seconds,
+        Some("octaves") => NodeUnit::Octaves,
+        Some(other) => panic!("unknown unit `{other}` in sweep row"),
+    };
+    let has_float_range = row.has_key("minfloat");
+    let float_range_required = matches!(
+        node_type,
+        NodeType::LinearFloat | NodeType::LogarithmicFloat
     );
-    let mut buf = Vec::new();
-    buf.extend_from_slice(&parent_id.to_be_bytes());
-    buf.extend_from_slice(&id.to_be_bytes());
-    buf.extend_from_slice(&index.to_be_bytes());
-    buf.push(name.len() as u8);
-    buf.extend_from_slice(name.as_bytes());
-    buf.push(long_name.len() as u8);
-    buf.extend_from_slice(long_name.as_bytes());
-    let flags: u16 =
-        ((tcode as u16 & 0x0F) << 4) | (ucode as u16 & 0x0F) | if read_only { 1 << 9 } else { 0 };
-    buf.extend_from_slice(&flags.to_be_bytes());
-    buf.extend_from_slice(payload);
-    buf
+
+    WingNodeDef {
+        parent_id,
+        id: row["id"].as_i32().expect("sweep row missing id"),
+        index: row["index"].as_u16().unwrap_or(0),
+        name: row["name"].as_str().unwrap_or("").to_owned(),
+        long_name: row["longname"].as_str().unwrap_or("").to_owned(),
+        node_type,
+        unit,
+        read_only: row["read_only"].as_bool().unwrap_or(false),
+        min_float: (float_range_required || has_float_range).then(|| json_f32(&row["minfloat"])),
+        max_float: (float_range_required || has_float_range).then(|| json_f32(&row["maxfloat"])),
+        steps: (float_range_required || has_float_range)
+            .then(|| row["steps"].as_i32().unwrap_or(0)),
+        min_int: (node_type == NodeType::Integer).then(|| row["minint"].as_i32().unwrap_or(0)),
+        max_int: (node_type == NodeType::Integer).then(|| row["maxint"].as_i32().unwrap_or(0)),
+        max_string_len: (node_type == NodeType::String)
+            .then(|| row["maxstringlen"].as_u16().unwrap_or(0)),
+        string_enum: (node_type == NodeType::StringEnum).then(|| {
+            row["items"]
+                .members()
+                .map(|item| StringEnumItem {
+                    item: item["item"].as_str().unwrap_or("").to_owned(),
+                    long_item: item["longitem"].as_str().unwrap_or("").to_owned(),
+                })
+                .collect()
+        }),
+        float_enum: (node_type == NodeType::FloatEnum).then(|| {
+            row["items"]
+                .members()
+                .map(|item| FloatEnumItem {
+                    item: json_f32(&item["item"]),
+                    long_item: item["longitem"].as_str().unwrap_or("").to_owned(),
+                })
+                .collect()
+        }),
+        raw: Vec::new(),
+    }
 }
 
 fn embed_from_sweep_to(
@@ -576,22 +536,11 @@ fn embed_from_sweep_to(
     let mut json_output = Vec::new();
 
     for (fullname, line, row) in &rows {
-        let id = row["id"].as_i32().unwrap();
-        let index = row["index"].as_u16().unwrap_or(0);
-        let name = row["name"].as_str().unwrap_or("");
-        let long_name = row["longname"].as_str().unwrap_or("");
-        let type_str = row["type"]
-            .as_str()
-            .unwrap_or_else(|| panic!("{fullname}: row missing type"));
-        let tcode = type_code(type_str);
-        let ucode = unit_code(row["unit"].as_str());
-        let read_only = row["read_only"].as_bool().unwrap_or(false);
-        let payload = build_payload(row, tcode);
         let parent_id = parent_id_for(fullname, &id_by_fullname);
-
-        let def_bytes = encode_def_bytes(
-            parent_id, id, index, name, long_name, tcode, ucode, read_only, &payload,
-        );
+        let def = def_from_sweep_row(row, parent_id);
+        let def_bytes = def
+            .to_wire_bytes()
+            .unwrap_or_else(|error| panic!("{fullname}: invalid definition metadata: {error}"));
         push_entry(&mut raw, 0, fullname, &def_bytes);
         writeln!(json_output, "{line}")?;
     }
@@ -766,6 +715,64 @@ Do you have a backup snapshot you can restore after, and want to continue?
 mod restore_tests {
     use super::*;
 
+    fn converted(json: &str) -> WingNodeDef {
+        let row = jzon::parse(json).unwrap();
+        let def = def_from_sweep_row(&row, 91);
+        let wire = def.to_wire_bytes().unwrap();
+        WingNodeDef::try_from_bytes(&wire).unwrap()
+    }
+
+    #[test]
+    fn sweep_rows_populate_every_node_type_for_the_canonical_encoder() {
+        let node = converted(r#"{"id":1,"type":"node","name":"n"}"#);
+        assert_eq!(node.node_type, NodeType::Node);
+
+        let linear = converted(
+            r#"{"id":2,"type":"linear float","unit":"dB","minfloat":1.2000000476837158,"maxfloat":2.5,"steps":17}"#,
+        );
+        assert_eq!(linear.node_type, NodeType::LinearFloat);
+        assert_eq!(linear.unit, NodeUnit::Db);
+        assert_eq!(linear.min_float.unwrap().to_bits(), 1.2_f32.to_bits());
+        assert_eq!(linear.steps, Some(17));
+
+        let logarithmic =
+            converted(r#"{"id":3,"type":"log float","minfloat":0.125,"maxfloat":8.0,"steps":64}"#);
+        assert_eq!(logarithmic.node_type, NodeType::LogarithmicFloat);
+        assert_eq!(logarithmic.max_float, Some(8.0));
+
+        let fader = converted(r#"{"id":4,"type":"fader level"}"#);
+        assert_eq!(fader.node_type, NodeType::FaderLevel);
+        assert_eq!(
+            (fader.min_float, fader.max_float, fader.steps),
+            (None, None, None)
+        );
+
+        let integer = converted(
+            r#"{"id":5,"type":"integer","unit":"%","minint":-4,"maxint":9,"read_only":true}"#,
+        );
+        assert_eq!(integer.node_type, NodeType::Integer);
+        assert_eq!((integer.min_int, integer.max_int), (Some(-4), Some(9)));
+        assert!(integer.read_only);
+
+        let string_enum =
+            converted(r#"{"id":6,"type":"string enum","items":[{"item":"A","longitem":"Alpha"}]}"#);
+        assert_eq!(string_enum.node_type, NodeType::StringEnum);
+        assert_eq!(string_enum.string_enum.unwrap()[0].long_item, "Alpha");
+
+        let float_enum = converted(
+            r#"{"id":7,"type":"float enum","items":[{"item":1.2000000476837158,"longitem":"One point two"}]}"#,
+        );
+        assert_eq!(float_enum.node_type, NodeType::FloatEnum);
+        assert_eq!(
+            float_enum.float_enum.unwrap()[0].item.to_bits(),
+            1.2_f32.to_bits()
+        );
+
+        let string = converted(r#"{"id":8,"type":"string","maxstringlen":255}"#);
+        assert_eq!(string.node_type, NodeType::String);
+        assert_eq!(string.max_string_len, Some(255));
+    }
+
     #[cfg(feature = "propmap")]
     fn snap(id: i32, fullname: &str, value: &str) -> SelectorSnapshot {
         SelectorSnapshot {
@@ -904,6 +911,34 @@ mod restore_tests {
         );
 
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn canonical_encoder_regenerates_committed_map_byte_for_byte() {
+        let temp =
+            std::env::temp_dir().join(format!("wingschema-canonical-{}", std::process::id()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let source = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let json_output = temp.join("propmap.jsonl");
+        let rust_output = temp.join("propmap.rs");
+        embed_from_sweep_to(
+            source.join("propmap.jsonl").to_str().unwrap(),
+            &json_output,
+            &rust_output,
+        )
+        .unwrap();
+        // Compare bytes without printing the multi-megabyte generated map on failure.
+        assert!(
+            std::fs::read(&rust_output).unwrap()
+                == std::fs::read(source.join("src/propmap.rs")).unwrap(),
+            "canonical encoding changed committed wire bytes"
+        );
+        assert!(
+            std::fs::read(&json_output).unwrap()
+                == std::fs::read(source.join("src/propmap.jsonl")).unwrap(),
+            "sweep JSON changed"
+        );
+        std::fs::remove_dir_all(temp).unwrap();
     }
 
     #[test]

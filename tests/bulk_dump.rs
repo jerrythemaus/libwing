@@ -363,6 +363,34 @@ fn restore_applies_model_selectors_before_children_shallowest_first() {
 }
 
 #[test]
+fn restore_stops_after_a_model_selector_fails() {
+    let dump = NodeDump {
+        entries: vec![
+            DumpEntry {
+                fullname: "/fx/1/HALL/pdel".to_string(),
+                id: 2,
+                value: NodeValue::Int(7),
+            },
+            DumpEntry {
+                fullname: "/fx/1/mdl".to_string(),
+                id: 1,
+                value: NodeValue::String("x".repeat(300)),
+            },
+        ],
+        unknown_models: Vec::new(),
+    };
+    let (mut console, writer) = console_with_script(Vec::new());
+
+    let results = console.restore(&dump);
+
+    assert_eq!(results.len(), 2);
+    assert!(results
+        .iter()
+        .all(|(_, result)| matches!(result, Err(Error::InvalidInput))));
+    assert!(writer.chunks.lock().unwrap().is_empty());
+}
+
+#[test]
 #[cfg(feature = "propmap")]
 fn dump_subtree_walks_the_embedded_map_in_sorted_order() {
     // /cfg/amix has exactly two writable integer leaves in the embedded map,
