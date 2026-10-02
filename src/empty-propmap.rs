@@ -1,5 +1,5 @@
-use crate::node::{PropMap, WingNodeDef};
+use std::sync::LazyLock;
 
-lazy_static::lazy_static! {
-    pub(crate) static ref NAME_TO_DEF: PropMap<&'static str, WingNodeDef> = PropMap::default();
-}
+use crate::propindex::PropIndex;
+
+pub(crate) static NAME_TO_DEF: LazyLock<PropIndex> = LazyLock::new(PropIndex::empty);

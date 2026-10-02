@@ -53,34 +53,6 @@ pub struct FloatEnumItem {
     pub long_item: String,
 }
 
-/// FNV-1a: a few ns per short key, against ~10 ns for std's SipHash. The property map's keys
-/// are embedded paths and small ids, so SipHash's flooding resistance buys nothing here.
-#[derive(Default)]
-pub(crate) struct FnvHasher(u64);
-
-impl std::hash::Hasher for FnvHasher {
-    fn finish(&self) -> u64 {
-        self.0
-    }
-
-    fn write(&mut self, bytes: &[u8]) {
-        let mut hash = if self.0 == 0 {
-            0xcbf2_9ce4_8422_2325
-        } else {
-            self.0
-        };
-        for &byte in bytes {
-            hash ^= u64::from(byte);
-            hash = hash.wrapping_mul(0x0100_0000_01b3);
-        }
-        self.0 = hash;
-    }
-}
-
-/// The hash map behind the embedded property map and its reverse id index.
-pub(crate) type PropMap<K, V> =
-    std::collections::HashMap<K, V, std::hash::BuildHasherDefault<FnvHasher>>;
-
 #[derive(Clone)]
 pub struct WingNodeDef {
     pub id: i32,

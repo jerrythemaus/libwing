@@ -73,6 +73,8 @@ pub const UNSOLICITED_CAP: usize = 1024;
 
 /// Maximum datagrams inspected after a matching reply while discarding duplicates.
 const DUPLICATE_DRAIN_CAP: usize = 64;
+/// How long [`WingOscClient::request`] waits for a duplicate of the reply it just matched.
+const DUPLICATE_WAIT: Duration = Duration::from_micros(200);
 
 /// `#[non_exhaustive]` (R21) for the same reason as [`crate::Error`]: new failure modes
 /// may be added without that being a breaking change for callers matching with a
@@ -923,16 +925,25 @@ impl WingOscClient {
     /// Drains any datagrams already sitting in the socket buffer that are exact
     /// duplicates of `matched` (R75: WING or an intervening network can deliver a UDP
     /// reply twice). Anything that isn't an exact duplicate is buffered via
-    /// [`unsolicited`](Self::take_unsolicited) instead of being lost. Uses a very short
-    /// timeout rather than a true non-blocking peek. Work is capped by both the request
-    /// deadline and [`DUPLICATE_DRAIN_CAP`] so sustained traffic cannot extend a request.
+    /// [`unsolicited`](Self::take_unsolicited) instead of being lost. Waits at most
+    /// [`DUPLICATE_WAIT`] for each datagram: long enough for a duplicate sent back-to-back
+    /// with the reply to land (a non-blocking read can run in the gap between the two and
+    /// miss it, leaving it to answer the next request), short enough that a request with no
+    /// duplicate pending barely notices. Work is capped by both the request deadline and
+    /// [`DUPLICATE_DRAIN_CAP`] so sustained traffic cannot extend a request.
     fn drain_duplicate_replies(&self, matched: &OscMessage, deadline: Instant) {
+        let sock = self.recv_socket();
+        if sock.set_read_timeout(Some(DUPLICATE_WAIT)).is_err() {
+            return;
+        }
+        let mut buf = [0u8; MAX_PACKET_BYTES];
         for _ in 0..DUPLICATE_DRAIN_CAP {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            if remaining.is_zero() {
+            if Instant::now() >= deadline {
                 break;
             }
-            match self.recv(remaining.min(Duration::from_millis(1))) {
+            // A timeout (nothing pending) and any I/O error both end the drain.
+            let Ok(n) = sock.recv(&mut buf) else { break };
+            match decode(&buf[..n]) {
                 Ok(msg) if msg == *matched => continue,
                 Err(OscError::Malformed(_)) => continue,
                 Ok(msg) => {

@@ -79,6 +79,7 @@ impl Transport for ScriptReader {
 #[derive(Clone, Default)]
 struct RecordingWriter {
     chunks: Arc<Mutex<Vec<Vec<u8>>>>,
+    fail_on_write: Option<usize>,
 }
 
 impl Read for RecordingWriter {
@@ -92,7 +93,14 @@ impl Read for RecordingWriter {
 
 impl Write for RecordingWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.chunks.lock().unwrap().push(buf.to_vec());
+        let mut chunks = self.chunks.lock().unwrap();
+        chunks.push(buf.to_vec());
+        if self.fail_on_write == Some(chunks.len()) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "scripted batch failure",
+            ));
+        }
         Ok(buf.len())
     }
     fn flush(&mut self) -> std::io::Result<()> {
@@ -303,7 +311,155 @@ fn set_nodes_applies_each_value_type_in_order() {
         vec![1, 2, 3]
     );
     assert!(results.iter().all(|(_, r)| r.is_ok()));
-    assert_eq!(writer.chunks.lock().unwrap().len(), 3);
+    // Writes are coalesced, so assert the wire bytes rather than a write count: they must be
+    // exactly what three separate `set_*` calls would have sent, in order.
+    let (mut sequential, seq_writer) = console_with_script(Vec::new());
+    sequential.set_string(1, "STD").unwrap();
+    sequential.set_float(2, 3.5).unwrap();
+    sequential.set_int(3, 42).unwrap();
+    let flat = |w: &RecordingWriter| w.chunks.lock().unwrap().concat();
+    assert_eq!(flat(&writer), flat(&seq_writer));
+    assert_eq!(writer.chunks.lock().unwrap().len(), 1);
+}
+
+/// A bulk write larger than one batch is split into several writes, none lost or reordered.
+#[test]
+fn set_nodes_splits_large_batches_without_changing_the_bytes() {
+    let values: Vec<_> = (1..=3000)
+        .map(|id| (id, NodeValue::Float(id as f32)))
+        .collect();
+    let (mut console, writer) = console_with_script(Vec::new());
+    assert!(console.set_nodes(&values).iter().all(|(_, r)| r.is_ok()));
+
+    let (mut sequential, seq_writer) = console_with_script(Vec::new());
+    for (id, v) in &values {
+        if let NodeValue::Float(f) = v {
+            sequential.set_float(*id, *f).unwrap();
+        }
+    }
+    let flat = |w: &RecordingWriter| w.chunks.lock().unwrap().concat();
+    assert_eq!(flat(&writer), flat(&seq_writer));
+    assert!(writer.chunks.lock().unwrap().len() > 1);
+    assert!(writer.chunks.lock().unwrap().len() < 100);
+}
+
+/// Each valid message is 263 bytes, so the 8 KiB threshold flushes 32 nodes at a
+/// time. The invalid string consumes a result slot but no bytes in the failed batch.
+#[test]
+fn bulk_writes_attribute_a_failed_middle_batch_and_isolate_encoding_errors() {
+    let mut values: Vec<_> = (1..=65)
+        .map(|id| (id, NodeValue::String("x".repeat(256))))
+        .collect();
+    values.insert(40, (999, NodeValue::String("x".repeat(300))));
+
+    for restore in [false, true] {
+        let writer = RecordingWriter {
+            fail_on_write: Some(2),
+            ..Default::default()
+        };
+        let mut console = WingConsole::from_transports(
+            ScriptReader::new(Vec::new()),
+            writer.clone(),
+            IpAddr::V4(Ipv4Addr::LOCALHOST),
+        );
+        let results: Vec<_> = if restore {
+            let dump = NodeDump {
+                entries: values
+                    .iter()
+                    .map(|(id, value)| DumpEntry {
+                        fullname: format!("/review/value/{id}"),
+                        id: *id,
+                        value: value.clone(),
+                    })
+                    .collect(),
+                unknown_models: Vec::new(),
+            };
+            let results = console.restore(&dump);
+            assert_eq!(
+                results.iter().map(|(name, _)| name).collect::<Vec<_>>(),
+                dump.entries
+                    .iter()
+                    .map(|entry| &entry.fullname)
+                    .collect::<Vec<_>>()
+            );
+            results.into_iter().map(|(_, result)| result).collect()
+        } else {
+            let results = console.set_nodes(&values);
+            assert_eq!(
+                results.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                values.iter().map(|(id, _)| *id).collect::<Vec<_>>()
+            );
+            results.into_iter().map(|(_, result)| result).collect()
+        };
+        assert_eq!(results.len(), values.len());
+        for ((id, _), result) in values.iter().zip(&results) {
+            match id {
+                999 => assert!(matches!(result, Err(Error::InvalidInput))),
+                33..=64 => match result {
+                    Err(Error::Io(error)) => {
+                        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
+                        assert_eq!(error.to_string(), "scripted batch failure");
+                    }
+                    _ => panic!("id {id} should belong to the failed batch: {result:?}"),
+                },
+                _ => assert!(result.is_ok(), "id {id}: {result:?}"),
+            }
+        }
+        let chunks = writer.chunks.lock().unwrap();
+        assert_eq!(chunks.len(), 3);
+        for (chunk, ids) in chunks.iter().zip([1..=32, 33..=64, 65..=65]) {
+            assert_eq!(
+                libwing::parse_binary_values(chunk)
+                    .unwrap()
+                    .into_iter()
+                    .map(|(id, _)| id)
+                    .collect::<Vec<_>>(),
+                ids.collect::<Vec<_>>()
+            );
+        }
+    }
+}
+
+#[test]
+fn restore_stops_after_a_model_selector_transport_write_fails() {
+    let writer = RecordingWriter {
+        fail_on_write: Some(2),
+        ..Default::default()
+    };
+    let mut console = WingConsole::from_transports(
+        ScriptReader::new(Vec::new()),
+        writer.clone(),
+        IpAddr::V4(Ipv4Addr::LOCALHOST),
+    );
+    let dump = NodeDump {
+        entries: [
+            ("/review/child", 3),
+            ("/review/mdl", 1),
+            ("/review/nested/mdl", 2),
+        ]
+        .into_iter()
+        .map(|(name, id)| DumpEntry {
+            fullname: name.into(),
+            id,
+            value: NodeValue::Int(7),
+        })
+        .collect(),
+        unknown_models: Vec::new(),
+    };
+    let results = console.restore(&dump);
+    assert_eq!(
+        results
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>(),
+        ["/review/mdl", "/review/nested/mdl", "/review/child"]
+    );
+    assert!(results[0].1.is_ok());
+    assert!(
+        matches!(&results[1].1, Err(Error::Io(e)) if e.kind() == std::io::ErrorKind::BrokenPipe)
+    );
+    assert!(matches!(results[2].1, Err(Error::InvalidInput)));
+    assert_eq!(writer.chunks.lock().unwrap().len(), 2);
 }
 
 /// R18: `restore` applies model-selector (`mdl`) entries before non-selector
