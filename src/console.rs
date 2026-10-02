@@ -662,8 +662,11 @@ impl WingConsole {
                     // Close the old read half to wake a clone blocked in `read()`.
                     // Release the writer lock before waiting for that reader: it may
                     // itself need the writer lock to finish a keepalive.
-                    self.reconnecting.store(true, Ordering::Release);
-                    let _ = self.wsock.lock_recover().shutdown(Shutdown::Read);
+                    {
+                        let writer = self.wsock.lock_recover();
+                        self.reconnecting.store(true, Ordering::Release);
+                        let _ = writer.shutdown(Shutdown::Read);
+                    }
                     let read_gate = self.read_gate.clone();
                     let _read_guard = read_gate.lock_recover();
                     // No reader is active now. Keep the writer locked until both
@@ -698,9 +701,12 @@ impl WingConsole {
                     if firmware.is_some() {
                         *self.firmware.lock_recover() = firmware;
                     }
-                    self.session_generation.fetch_add(1, Ordering::AcqRel);
-                    self.stream_tainted.store(false, Ordering::Release);
-                    self.reconnecting.store(false, Ordering::Release);
+                    {
+                        let _writer = self.wsock.lock_recover();
+                        self.session_generation.fetch_add(1, Ordering::AcqRel);
+                        self.stream_tainted.store(false, Ordering::Release);
+                        self.reconnecting.store(false, Ordering::Release);
+                    }
                     return Ok(ReconnectOutcome {
                         attempts: attempt,
                         gap: gap(self),
@@ -1580,6 +1586,8 @@ impl WingConsole {
         main.op_deadline = None;
         let captured = main.capture.take().unwrap_or_default();
         if matches!(result, Err(Error::Timeout)) {
+            // Serialize the fence with bulk flushes (lock order remains main -> writer).
+            let _writer = self.wsock.lock_recover();
             self.stream_tainted.store(true, Ordering::Release);
         }
         result.map(|()| captured)
@@ -1734,8 +1742,13 @@ impl WingConsole {
     /// `write_all`s instead of one TCP segment per node. The bytes on the wire are exactly
     /// what the same sequence of `set_*` calls would send (there is no per-write ack), and
     /// each item gets its own `Result`: an item that cannot be encoded fails alone, and a
-    /// failed write fails every item whose bytes were in it.
-    fn write_node_values(&mut self, items: &[(i32, &NodeValue)]) -> Vec<Result<()>> {
+    /// failed write fails every item whose bytes were in it. Pending batches are discarded
+    /// if a capture taints the stream or another clone replaces the session.
+    fn write_node_values(
+        &mut self,
+        generation: u64,
+        items: &[(i32, &NodeValue)],
+    ) -> Vec<Result<()>> {
         let mut results = Vec::with_capacity(items.len());
         let mut buf = Vec::new();
         let mut token = Vec::new();
@@ -1754,15 +1767,16 @@ impl WingConsole {
             }
             results.push(result);
             if buf.len() >= WRITE_BATCH_BYTES {
-                self.flush_node_writes(&mut buf, &mut queued, &mut results);
+                self.flush_node_writes(generation, &mut buf, &mut queued, &mut results);
             }
         }
-        self.flush_node_writes(&mut buf, &mut queued, &mut results);
+        self.flush_node_writes(generation, &mut buf, &mut queued, &mut results);
         results
     }
 
     fn flush_node_writes(
         &self,
+        generation: u64,
         buf: &mut Vec<u8>,
         queued: &mut Vec<usize>,
         results: &mut [Result<()>],
@@ -1770,7 +1784,21 @@ impl WingConsole {
         if buf.is_empty() {
             return;
         }
-        if let Err(e) = self.wsock.lock_recover().write_all(buf) {
+        // The taint and reconnect transitions take this same lock, so no batch can
+        // pass its checks and then cross the fence or land on a replacement session.
+        let mut writer = self.wsock.lock_recover();
+        let tainted = self.stream_tainted.load(Ordering::Acquire);
+        let session_changed = self.reconnecting.load(Ordering::Acquire)
+            || self.session_generation.load(Ordering::Acquire) != generation;
+        if tainted || session_changed {
+            for &i in queued.iter() {
+                results[i] = Err(if tainted {
+                    Error::ConnectionError
+                } else {
+                    Error::Reconnecting
+                });
+            }
+        } else if let Err(e) = writer.write_all(buf) {
             for &i in queued.iter() {
                 results[i] = Err(Error::Io(std::io::Error::new(e.kind(), e.to_string())));
             }
@@ -1910,11 +1938,12 @@ impl WingConsole {
     /// large writes. One node's failure doesn't stop the rest -- each gets its own
     /// `Result` in the returned, order-preserving list.
     pub fn set_nodes(&mut self, values: &[(i32, NodeValue)]) -> Vec<(i32, Result<()>)> {
+        let generation = self.session_generation.load(Ordering::Acquire);
         let items: Vec<_> = values.iter().map(|(id, v)| (*id, v)).collect();
         values
             .iter()
             .map(|(id, _)| *id)
-            .zip(self.write_node_values(&items))
+            .zip(self.write_node_values(generation, &items))
             .collect()
     }
 
@@ -2052,6 +2081,7 @@ impl WingConsole {
     /// selector stops the restore: later values may belong to that selector's
     /// model and must not be written into whichever model remains active.
     pub fn restore(&mut self, dump: &NodeDump) -> Vec<(String, Result<()>)> {
+        let generation = self.session_generation.load(Ordering::Acquire);
         let mut ordered: Vec<&DumpEntry> = dump.entries.iter().collect();
         ordered.sort_by_cached_key(|entry| restore_order_key(&entry.fullname));
 
@@ -2074,21 +2104,22 @@ impl WingConsole {
             results.push((entry.fullname.clone(), Ok(())));
             batch.push((slot, entry));
             if entry.fullname.rsplit('/').next() == Some("mdl") {
-                self.flush_restore_batch(&mut batch, &mut results);
+                self.flush_restore_batch(generation, &mut batch, &mut results);
                 selector_failed = results[slot].1.is_err();
             }
         }
-        self.flush_restore_batch(&mut batch, &mut results);
+        self.flush_restore_batch(generation, &mut batch, &mut results);
         results
     }
 
     fn flush_restore_batch(
         &mut self,
+        generation: u64,
         batch: &mut Vec<(usize, &DumpEntry)>,
         results: &mut [(String, Result<()>)],
     ) {
         let items: Vec<_> = batch.iter().map(|(_, e)| (e.id, &e.value)).collect();
-        for ((slot, _), result) in batch.iter().zip(self.write_node_values(&items)) {
+        for ((slot, _), result) in batch.iter().zip(self.write_node_values(generation, &items)) {
             results[*slot].1 = result;
         }
         batch.clear();
@@ -3179,6 +3210,127 @@ mod tests {
         console.mtrs.lock_recover().keep_alive_meters_timer = Instant::now();
         console.keep_alive_meters().unwrap();
         assert_eq!(renewed_ids(&mut server), vec![second]);
+    }
+
+    #[derive(Clone, Default)]
+    struct BatchRecordingTransport {
+        writes: Arc<Mutex<Vec<Vec<u8>>>>,
+        generation_on_first_write: Option<Arc<AtomicU64>>,
+    }
+
+    impl Read for BatchRecordingTransport {
+        fn read(&mut self, _buf: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::ErrorKind::TimedOut.into())
+        }
+    }
+
+    impl Write for BatchRecordingTransport {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            let mut writes = self.writes.lock_recover();
+            writes.push(buf.to_vec());
+            if writes.len() == 1 {
+                if let Some(generation) = &self.generation_on_first_write {
+                    generation.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Transport for BatchRecordingTransport {
+        fn set_read_timeout(&mut self, _dur: Option<Duration>) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn queued_bulk_writes_are_discarded_after_a_clones_capture_timeout() {
+        let transport = BatchRecordingTransport::default();
+        let console = WingConsole::from_transports(
+            transport.clone(),
+            transport.clone(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        let generation = console.session_generation.load(Ordering::Acquire);
+        // Pause the bulk operation between encoding and flush. The clone completes its
+        // real capture timeout before construction resumes; no scheduler sleeps needed.
+        let mut buf = WingConsole::set_int_message(1, 42).unwrap();
+        let mut queued = vec![0];
+        let mut results = vec![Ok(()), Err(Error::InvalidInput)];
+        let mut capture = console.clone();
+        let timeout = std::thread::spawn(move || capture.get_binary_node(0, Duration::ZERO));
+        assert!(matches!(timeout.join().unwrap(), Err(Error::Timeout)));
+        console.flush_node_writes(generation, &mut buf, &mut queued, &mut results);
+        assert!(matches!(results[0], Err(Error::ConnectionError)));
+        assert!(matches!(results[1], Err(Error::InvalidInput)));
+        assert!(buf.is_empty());
+        assert!(queued.is_empty());
+        // Only the capture's request was sent; the pending value never reached transport.
+        assert_eq!(*transport.writes.lock_recover(), vec![vec![0xda, 0xdc]]);
+    }
+
+    #[test]
+    fn queued_bulk_writes_cannot_cross_a_reconnect() {
+        for completed in [false, true] {
+            let transport = BatchRecordingTransport::default();
+            let console = WingConsole::from_transports(
+                transport.clone(),
+                transport.clone(),
+                IpAddr::from([127, 0, 0, 1]),
+            );
+            let generation = console.session_generation.load(Ordering::Acquire);
+            let mut buf = WingConsole::set_int_message(1, 42).unwrap();
+            let mut queued = vec![0];
+            let mut results = vec![Ok(())];
+            let clone = console.clone();
+            // Model the shared state at the beginning and end of the reconnect swap.
+            {
+                let _writer = clone.wsock.lock_recover();
+                if completed {
+                    clone.session_generation.fetch_add(1, Ordering::AcqRel);
+                } else {
+                    clone.reconnecting.store(true, Ordering::Release);
+                }
+            }
+            console.flush_node_writes(generation, &mut buf, &mut queued, &mut results);
+            assert!(matches!(results[0], Err(Error::Reconnecting)));
+            assert!(transport.writes.lock_recover().is_empty());
+        }
+    }
+
+    #[test]
+    fn restore_keeps_one_generation_across_selector_batches() {
+        let transport = BatchRecordingTransport::default();
+        let mut console = WingConsole::from_transports(
+            transport.clone(),
+            transport.clone(),
+            IpAddr::from([127, 0, 0, 1]),
+        );
+        // Advance the shared session after the first selector's bytes are written,
+        // modeling a completed reconnect before the next restore batch is checked.
+        *console.wsock.lock_recover() = Box::new(BatchRecordingTransport {
+            writes: transport.writes.clone(),
+            generation_on_first_write: Some(console.session_generation.clone()),
+        });
+        let dump = NodeDump {
+            entries: ["/review/mdl", "/review/child"]
+                .into_iter()
+                .enumerate()
+                .map(|(i, name)| DumpEntry {
+                    fullname: name.into(),
+                    id: i as i32 + 1,
+                    value: NodeValue::Int(42),
+                })
+                .collect(),
+            unknown_models: Vec::new(),
+        };
+        let results = console.restore(&dump);
+        assert!(results[0].1.is_ok());
+        assert!(matches!(results[1].1, Err(Error::Reconnecting)));
+        assert_eq!(transport.writes.lock_recover().len(), 1);
     }
 
     struct FailingWriter;
