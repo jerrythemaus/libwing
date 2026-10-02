@@ -20,7 +20,7 @@ use crate::safety::Operation;
 use crate::Result;
 
 /// The firmware version the checked-in embedded map (`src/propmap.jsonl` /
-/// `src/propmap.rs`) was swept from. A single obvious const so downstream
+/// `src/propmap.bin`) was swept from. A single obvious const so downstream
 /// consumers (release reports, docs) and [`Schema::staleness`] have exactly
 /// one place to cite/compare against.
 pub const FIRMWARE_BASELINE: &str = "3.1";

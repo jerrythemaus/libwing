@@ -37,7 +37,7 @@ as link/checksum only.
     **absent** from this sweep. Either the sweep predates a point release that
     shipped them or they live outside the swept subtrees — re-sweep against a
     3.1 console to close this (tracked in `COVERAGE.md`).
-  - `src/propmap.jsonl` + `src/propmap.rs` are generated from this file via
+  - `src/propmap.jsonl` + `src/propmap.bin` are generated from this file via
     `cargo run --example wingschema -- embed propmap.jsonl`; the
     `propmap_consistency` suite enforces field-for-field fidelity.
   - Redistribution: schema metadata only (no user data); shipped with the

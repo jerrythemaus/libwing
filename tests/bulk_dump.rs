@@ -303,7 +303,36 @@ fn set_nodes_applies_each_value_type_in_order() {
         vec![1, 2, 3]
     );
     assert!(results.iter().all(|(_, r)| r.is_ok()));
-    assert_eq!(writer.chunks.lock().unwrap().len(), 3);
+    // Writes are coalesced, so assert the wire bytes rather than a write count: they must be
+    // exactly what three separate `set_*` calls would have sent, in order.
+    let (mut sequential, seq_writer) = console_with_script(Vec::new());
+    sequential.set_string(1, "STD").unwrap();
+    sequential.set_float(2, 3.5).unwrap();
+    sequential.set_int(3, 42).unwrap();
+    let flat = |w: &RecordingWriter| w.chunks.lock().unwrap().concat();
+    assert_eq!(flat(&writer), flat(&seq_writer));
+    assert_eq!(writer.chunks.lock().unwrap().len(), 1);
+}
+
+/// A bulk write larger than one batch is split into several writes, none lost or reordered.
+#[test]
+fn set_nodes_splits_large_batches_without_changing_the_bytes() {
+    let values: Vec<_> = (1..=3000)
+        .map(|id| (id, NodeValue::Float(id as f32)))
+        .collect();
+    let (mut console, writer) = console_with_script(Vec::new());
+    assert!(console.set_nodes(&values).iter().all(|(_, r)| r.is_ok()));
+
+    let (mut sequential, seq_writer) = console_with_script(Vec::new());
+    for (id, v) in &values {
+        if let NodeValue::Float(f) = v {
+            sequential.set_float(*id, *f).unwrap();
+        }
+    }
+    let flat = |w: &RecordingWriter| w.chunks.lock().unwrap().concat();
+    assert_eq!(flat(&writer), flat(&seq_writer));
+    assert!(writer.chunks.lock().unwrap().len() > 1);
+    assert!(writer.chunks.lock().unwrap().len() < 100);
 }
 
 /// R18: `restore` applies model-selector (`mdl`) entries before non-selector

@@ -165,7 +165,7 @@ fn restore_outcome_from_readback(
 }
 
 /// Append one `[flag u8][namelen u16][name][deflen u16][def]` entry to the raw
-/// blob that gets embedded into `propmap.rs`. Shared by the live sweep and the
+/// blob that gets embedded into `propmap.bin`. Shared by the live sweep and the
 /// offline `embed` path so both produce byte-identical envelopes.
 fn push_entry(raw: &mut Vec<u8>, flag: u8, fullname: &str, def_bytes: &[u8]) {
     raw.push(flag);
@@ -188,57 +188,71 @@ fn count_entries(raw: &[u8]) -> usize {
     count
 }
 
-/// Write the `propmap.rs` source that embeds `raw` as a `NAME_TO_DEF` lazy static.
-/// The loader emitted here must stay in lockstep with the one already compiled
-/// into `src/propmap.rs` (and `src/empty-propmap.rs`'s empty fallback).
-fn write_propmap_rs(rust_file: &mut impl Write, raw: &[u8]) -> std::io::Result<()> {
-    // rustfmt import order (crate before std), so a fmt pass over the
-    // generated file is a no-op and regeneration produces no diff noise.
-    writeln!(rust_file, "use crate::node::{{PropMap, WingNodeDef}};")?;
-    writeln!(rust_file, "lazy_static::lazy_static! {{")?;
-    writeln!(
-        rust_file,
-        "    pub(crate) static ref NAME_TO_DEF: PropMap<&'static str, WingNodeDef> = {{"
-    )?;
-    // Size the map up front: ~70k entries would otherwise rehash repeatedly at startup.
-    writeln!(
-        rust_file,
-        "        let mut m = PropMap::with_capacity_and_hasher({}, Default::default());",
-        count_entries(raw)
-    )?;
-    write!(rust_file, "        let d = b\"")?;
-    for b in raw {
-        write!(rust_file, "\\x{:02X}", b)?;
+/// FNV-1a over the name bytes, folded to 32 bits: `src/propindex.rs`'s `name_hash`, which
+/// the committed-bytes test keeps in lockstep with this copy.
+fn name_hash(name: &[u8]) -> usize {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for &b in name {
+        h = (h ^ u64::from(b)).wrapping_mul(0x0100_0000_01b3);
     }
-    writeln!(rust_file, "\";")?;
-    writeln!(rust_file, "        let mut i = 0;")?;
-    writeln!(rust_file, "        while i < d.len() {{")?;
-    writeln!(rust_file, "            let _is_fake = d[i];")?;
-    writeln!(rust_file, "            i += 1;")?;
-    writeln!(
-        rust_file,
-        "            let namelen = u16::from_be_bytes([d[i], d[i + 1]]) as usize;"
-    )?;
-    writeln!(rust_file, "            i += 2;")?;
-    writeln!(
-        rust_file,
-        "            let name = std::str::from_utf8(&d[i..i + namelen]).unwrap();"
-    )?;
-    writeln!(rust_file, "            i += namelen;")?;
-    writeln!(
-        rust_file,
-        "            let deflen = u16::from_be_bytes([d[i], d[i + 1]]) as usize;"
-    )?;
-    writeln!(rust_file, "            i += 2;")?;
-    // Use the raw-free constructor: the property map never reads WingNodeDef::raw back,
-    // and retaining it here would duplicate the entire embedded blob on the heap.
-    writeln!(rust_file, "            let def = WingNodeDef::from_bytes_without_raw(&d[i..i + deflen]).expect(\"valid embedded propmap definition\");")?;
-    writeln!(rust_file, "            i += deflen;")?;
-    writeln!(rust_file, "            m.insert(name, def);")?;
-    writeln!(rust_file, "        }}")?;
-    writeln!(rust_file, "        m")?;
-    writeln!(rust_file, "    }};")?;
-    writeln!(rust_file, "}}")?;
+    (h ^ (h >> 32)) as usize
+}
+
+/// Write `propmap.bin`: `raw` (the `push_entry` records) behind a header, followed by the
+/// lookup tables `src/propindex.rs` reads in place, so the library does no work at startup.
+/// The layout is documented there and must stay in lockstep with it.
+fn write_propmap_bin(out: &mut impl Write, raw: &[u8]) -> std::io::Result<()> {
+    // (record offset, name, definition id) for every record.
+    let mut records = Vec::with_capacity(count_entries(raw));
+    let mut i = 0;
+    while i < raw.len() {
+        let offset = i;
+        let namelen = u16::from_be_bytes([raw[i + 1], raw[i + 2]]) as usize;
+        let name = &raw[i + 3..i + 3 + namelen];
+        i += 3 + namelen;
+        let deflen = u16::from_be_bytes([raw[i], raw[i + 1]]) as usize;
+        let def = &raw[i + 2..i + 2 + deflen];
+        // A definition starts with `parent_id: i32, id: i32`.
+        let id = i32::from_be_bytes([def[4], def[5], def[6], def[7]]);
+        i += 2 + deflen;
+        records.push((offset as u32, name, id));
+    }
+    records.sort_by(|a, b| a.1.cmp(b.1));
+    assert!(
+        records.windows(2).all(|w| w[0].1 != w[1].1),
+        "duplicate fullname in the sweep"
+    );
+    // An entry's ordinal is its position in name order; `by_id` lists ordinals by (id, ordinal).
+    let mut by_id: Vec<u32> = (0..records.len() as u32).collect();
+    by_id.sort_by_key(|&o| (records[o as usize].2, o));
+    // Open addressing at load <= 0.5, linear probing, u32::MAX marks a free slot.
+    let slots = if records.is_empty() {
+        0
+    } else {
+        (records.len() * 2).next_power_of_two()
+    };
+    let mut hash = vec![u32::MAX; slots];
+    for (ordinal, (_, name, _)) in records.iter().enumerate() {
+        let mut slot = name_hash(name) & (slots - 1);
+        while hash[slot] != u32::MAX {
+            slot = (slot + 1) & (slots - 1);
+        }
+        hash[slot] = ordinal as u32;
+    }
+
+    out.write_all(b"WPM2")?;
+    out.write_all(&(records.len() as u32).to_be_bytes())?;
+    out.write_all(&(raw.len() as u32).to_be_bytes())?;
+    out.write_all(raw)?;
+    for (offset, _, _) in &records {
+        out.write_all(&offset.to_be_bytes())?;
+    }
+    for ordinal in by_id {
+        out.write_all(&ordinal.to_be_bytes())?;
+    }
+    for ordinal in hash {
+        out.write_all(&ordinal.to_be_bytes())?;
+    }
     Ok(())
 }
 
@@ -389,7 +403,7 @@ fn add(
 // ---------------------------------------------------------------------------
 // Offline regeneration: `wingschema embed [sweep.jsonl]`
 //
-// Rebuilds src/propmap.rs and src/propmap.jsonl from an existing full-sweep
+// Rebuilds src/propmap.bin and src/propmap.jsonl from an existing full-sweep
 // JSONL file (the format `add()` above already writes: one `to_json()` object
 // per line, plus a "fullname"). No live console involved. This exists so the
 // embedded map can be regenerated reproducibly from a checked-in sweep dataset
@@ -501,7 +515,7 @@ fn def_from_sweep_row(row: &jzon::JsonValue, parent_id: i32) -> WingNodeDef {
 fn embed_from_sweep_to(
     input_path: &str,
     json_output_path: &Path,
-    rust_output_path: &Path,
+    bin_output_path: &Path,
 ) -> Result<(), libwing::Error> {
     let text = std::fs::read_to_string(input_path)?;
 
@@ -545,15 +559,15 @@ fn embed_from_sweep_to(
         writeln!(json_output, "{line}")?;
     }
 
-    let mut rust_output = Vec::new();
-    write_propmap_rs(&mut rust_output, &raw)?;
+    let mut bin_output = Vec::new();
+    write_propmap_bin(&mut bin_output, &raw)?;
     publish_outputs(&[
         (json_output_path, json_output.as_slice()),
-        (rust_output_path, rust_output.as_slice()),
+        (bin_output_path, bin_output.as_slice()),
     ])?;
 
     println!(
-        "Embedded {} entries from {input_path} into src/propmap.rs and src/propmap.jsonl",
+        "Embedded {} entries from {input_path} into src/propmap.bin and src/propmap.jsonl",
         rows.len()
     );
     Ok(())
@@ -563,8 +577,65 @@ fn embed_from_sweep(input_path: &str) -> Result<(), libwing::Error> {
     embed_from_sweep_to(
         input_path,
         Path::new("src/propmap.jsonl"),
-        Path::new("src/propmap.rs"),
+        Path::new("src/propmap.bin"),
     )
+}
+
+// ---------------------------------------------------------------------------
+// Offline lookup: `wingschema lookup <fullname | id | text>`
+//
+// Reads the embedded property map, so it needs neither a console nor the sweep
+// file. Output is one `propmap.jsonl`-shaped JSON object per match.
+// ---------------------------------------------------------------------------
+
+/// Most substring matches printed before the rest are only counted.
+const LOOKUP_LIMIT: usize = 50;
+
+/// What the embedded map has for `query`: an id (decimal, or `0x` hex) yields every
+/// definition sharing it, an exact fullname yields that definition, and anything else is a
+/// substring search over fullnames. Results are in name order.
+fn lookup_matches(query: &str) -> Vec<(String, WingNodeDef)> {
+    let id = match query
+        .strip_prefix("0x")
+        .or_else(|| query.strip_prefix("0X"))
+    {
+        Some(hex) => u32::from_str_radix(hex, 16).ok().map(|n| n as i32),
+        None => query.parse::<i32>().ok(),
+    };
+    if let Some(id) = id {
+        return WingConsole::id_to_defs(id).unwrap_or_default();
+    }
+    if let Some(def) = WingConsole::name_to_def(query) {
+        return vec![(query.to_owned(), def.clone())];
+    }
+    WingConsole::propmap_iter()
+        .filter(|(name, _)| name.contains(query))
+        .map(|(name, def)| (name.to_owned(), def.clone()))
+        .collect()
+}
+
+fn lookup(query: &str) -> Result<(), libwing::Error> {
+    if WingConsole::propmap_len() == 0 {
+        eprintln!("this build has no embedded property map (built without the `propmap` feature)");
+        std::process::exit(2);
+    }
+    let matches = lookup_matches(query);
+    if matches.is_empty() {
+        eprintln!("no property matches {query:?}");
+        std::process::exit(1);
+    }
+    for (fullname, def) in matches.iter().take(LOOKUP_LIMIT) {
+        let mut json = def.to_json();
+        json.insert("fullname", fullname.as_str()).unwrap();
+        println!("{json}");
+    }
+    if matches.len() > LOOKUP_LIMIT {
+        eprintln!(
+            "... and {} more matches; narrow the query",
+            matches.len() - LOOKUP_LIMIT
+        );
+    }
+    Ok(())
 }
 
 fn main() -> Result<(), libwing::Error> {
@@ -576,18 +647,31 @@ fn main() -> Result<(), libwing::Error> {
             .unwrap_or("propmap.jsonl");
         return embed_from_sweep(input_path);
     }
+    if cli_args.first().map(String::as_str) == Some("lookup") {
+        return match cli_args.get(1) {
+            Some(query) => lookup(query),
+            None => {
+                eprintln!("usage: wingschema lookup <fullname | id | text>");
+                std::process::exit(2);
+            }
+        };
+    }
 
     let mut args = Args::new(
         r#"
 Usage: wingschema [-h host] [--yes]
        wingschema embed [sweep.jsonl]
+       wingschema lookup <fullname | id | text>
 
    -h host : IP address or hostname of Wing mixer. Default is to discover and connect to the first mixer found.
    --yes   : Skip the interactive confirmation prompt (for automation). The crawl is still
              destructive; only pass this once you've accepted that.
-   embed   : Offline regeneration. Rebuilds src/propmap.rs and src/propmap.jsonl from an
+   embed   : Offline regeneration. Rebuilds src/propmap.bin and src/propmap.jsonl from an
              existing full-sweep JSONL file (default: propmap.jsonl in the current directory)
              without connecting to a live console.
+   lookup  : Offline. Prints the embedded property map's definition(s) for a fullname
+             (/ch/1/fdr), an id (decimal or 0x hex), or a substring of fullnames, as
+             propmap.jsonl-shaped JSON lines. No console needed.
 "#,
     );
     let mut host = None;
@@ -681,11 +765,11 @@ Do you have a backup snapshot you can restore after, and want to continue?
         std::io::stdout().flush().unwrap();
         json_file.flush().unwrap();
         let json_output = std::fs::read(&json_temp).unwrap();
-        let mut rust_output = Vec::new();
-        write_propmap_rs(&mut rust_output, &raw).unwrap();
+        let mut bin_output = Vec::new();
+        write_propmap_bin(&mut bin_output, &raw).unwrap();
         publish_outputs(&[
             (Path::new("propmap.jsonl"), json_output.as_slice()),
-            (Path::new("propmap.rs"), rust_output.as_slice()),
+            (Path::new("propmap.bin"), bin_output.as_slice()),
         ])
         .unwrap();
         let _ = std::fs::remove_file(&json_temp);
@@ -914,23 +998,45 @@ mod restore_tests {
     }
 
     #[test]
+    #[cfg(feature = "propmap")]
+    fn lookup_finds_by_name_id_hex_and_substring() {
+        let by_name = lookup_matches("/ch/1/fdr");
+        assert_eq!(by_name.len(), 1);
+        let (name, def) = &by_name[0];
+        assert_eq!(name, "/ch/1/fdr");
+
+        for query in [def.id.to_string(), format!("0x{:x}", def.id as u32)] {
+            let by_id = lookup_matches(&query);
+            assert!(by_id.iter().any(|(n, _)| n == "/ch/1/fdr"), "{query}");
+            assert!(by_id.iter().all(|(_, d)| d.id == def.id), "{query}");
+        }
+
+        let by_text = lookup_matches("ch/1/fd");
+        assert!(by_text.iter().any(|(n, _)| n == "/ch/1/fdr"));
+        assert!(by_text.windows(2).all(|w| w[0].0 < w[1].0), "name order");
+
+        assert!(lookup_matches("/definitely/not/a/node").is_empty());
+        assert!(lookup_matches("0x7fffffff").is_empty());
+    }
+
+    #[test]
     fn canonical_encoder_regenerates_committed_map_byte_for_byte() {
         let temp =
             std::env::temp_dir().join(format!("wingschema-canonical-{}", std::process::id()));
         std::fs::create_dir_all(&temp).unwrap();
         let source = Path::new(env!("CARGO_MANIFEST_DIR"));
         let json_output = temp.join("propmap.jsonl");
-        let rust_output = temp.join("propmap.rs");
+        let bin_output = temp.join("propmap.bin");
         embed_from_sweep_to(
             source.join("propmap.jsonl").to_str().unwrap(),
             &json_output,
-            &rust_output,
+            &bin_output,
         )
         .unwrap();
         // Compare bytes without printing the multi-megabyte generated map on failure.
         assert!(
-            std::fs::read(&rust_output).unwrap()
-                == std::fs::read(source.join("src/propmap.rs")).unwrap(),
+            std::fs::read(&bin_output).unwrap()
+                == std::fs::read(source.join("src/propmap.bin")).unwrap(),
             "canonical encoding changed committed wire bytes"
         );
         assert!(
@@ -949,18 +1055,18 @@ mod restore_tests {
         std::fs::create_dir_all(&temp).unwrap();
         let sweep = Path::new("src/propmap.jsonl");
         let json_output = temp.join("propmap.jsonl");
-        let rust_output = temp.join("propmap.rs");
+        let bin_output = temp.join("propmap.bin");
         std::fs::write(&json_output, "known-good-json\n").unwrap();
-        std::fs::create_dir(&rust_output).unwrap();
-        std::fs::write(rust_output.join("keep"), "not replaceable").unwrap();
+        std::fs::create_dir(&bin_output).unwrap();
+        std::fs::write(bin_output.join("keep"), "not replaceable").unwrap();
 
-        assert!(embed_from_sweep_to(sweep.to_str().unwrap(), &json_output, &rust_output).is_err());
+        assert!(embed_from_sweep_to(sweep.to_str().unwrap(), &json_output, &bin_output).is_err());
         assert_eq!(
             std::fs::read_to_string(&json_output).unwrap(),
             "known-good-json\n"
         );
         assert_eq!(
-            std::fs::read_to_string(rust_output.join("keep")).unwrap(),
+            std::fs::read_to_string(bin_output.join("keep")).unwrap(),
             "not replaceable"
         );
     }

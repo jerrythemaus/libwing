@@ -88,6 +88,7 @@ mod node;
 /// read confusingly next to the rest of this crate's API. Use it as `osc::get_param(..)`,
 /// `osc::WingOscClient`, etc.
 pub mod osc;
+mod propindex;
 #[cfg(not(feature = "propmap"))]
 #[path = "empty-propmap.rs"]
 mod propmap;

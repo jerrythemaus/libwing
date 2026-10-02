@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::native::{ChannelDecoder, ChannelEvent, NativeValue};
-use crate::node::{NodeType, PropMap, WingNodeData, WingNodeDef};
+use crate::node::{NodeType, WingNodeData, WingNodeDef};
 use crate::propmap::NAME_TO_DEF;
 use crate::{Error, Result, WingResponse};
 
@@ -131,17 +131,9 @@ impl Meter {
     }
 }
 
-lazy_static::lazy_static! {
-    static ref ID_TO_NAME: PropMap<i32, Vec<&'static str>> = {
-        let mut id2name = PropMap::<i32, Vec<&'static str>>::default();
-        for (&fullname, def) in NAME_TO_DEF.iter() {
-            id2name.entry(def.id).or_default().push(fullname);
-        }
-        id2name
-    };
-}
-
 const RX_BUFFER_SIZE: usize = 2048;
+/// Soft cap on one coalesced bulk write in [`WingConsole::set_nodes`]/[`WingConsole::restore`].
+const WRITE_BATCH_BYTES: usize = 8 * 1024;
 const DATA_KEEP_ALIVE_SECONDS: u64 = 7;
 const METERS_KEEP_ALIVE_SECONDS: u64 = 3;
 const WRITE_TIMEOUT_SECONDS: u64 = 5;
@@ -1718,19 +1710,80 @@ impl WingConsole {
     /// `0xd7 <id>` followed by `value`'s token, all escaped for the wire -- the length byte of a
     /// `0xd1` string included. Token encoding is shared with the server-side encoder.
     fn set_value_message(id: i32, value: &NativeValue) -> Result<Vec<u8>> {
-        let mut token = Vec::new();
-        crate::native::encode_value(&mut token, value)?;
-        let mut buf = Vec::with_capacity(token.len() + 8);
-        Self::format_id(id, &mut buf, 0xd7, None);
-        Self::extend_escaped(&mut buf, &token);
+        let mut buf = Vec::new();
+        Self::append_value_message(&mut buf, &mut Vec::new(), id, value)?;
         Ok(buf)
+    }
+
+    /// Appends [`set_value_message`](Self::set_value_message)'s bytes to `buf`, using `token`
+    /// as encoding scratch (cleared here). On error `buf` is left untouched.
+    fn append_value_message(
+        buf: &mut Vec<u8>,
+        token: &mut Vec<u8>,
+        id: i32,
+        value: &NativeValue,
+    ) -> Result<()> {
+        token.clear();
+        crate::native::encode_value(token, value)?;
+        Self::format_id(id, buf, 0xd7, None);
+        Self::extend_escaped(buf, token);
+        Ok(())
+    }
+
+    /// Writes `items` in order, coalescing their messages into [`WRITE_BATCH_BYTES`]-sized
+    /// `write_all`s instead of one TCP segment per node. The bytes on the wire are exactly
+    /// what the same sequence of `set_*` calls would send (there is no per-write ack), and
+    /// each item gets its own `Result`: an item that cannot be encoded fails alone, and a
+    /// failed write fails every item whose bytes were in it.
+    fn write_node_values(&mut self, items: &[(i32, &NodeValue)]) -> Vec<Result<()>> {
+        let mut results = Vec::with_capacity(items.len());
+        let mut buf = Vec::new();
+        let mut token = Vec::new();
+        let mut queued = Vec::new();
+        for (i, &(id, value)) in items.iter().enumerate() {
+            let native = match value {
+                NodeValue::String(s) => NativeValue::String(s.clone()),
+                NodeValue::Float(f) => NativeValue::Float(*f),
+                NodeValue::Int(n) => NativeValue::Integer(*n),
+            };
+            let result = self
+                .ensure_stream_usable()
+                .and_then(|()| Self::append_value_message(&mut buf, &mut token, id, &native));
+            if result.is_ok() {
+                queued.push(i);
+            }
+            results.push(result);
+            if buf.len() >= WRITE_BATCH_BYTES {
+                self.flush_node_writes(&mut buf, &mut queued, &mut results);
+            }
+        }
+        self.flush_node_writes(&mut buf, &mut queued, &mut results);
+        results
+    }
+
+    fn flush_node_writes(
+        &self,
+        buf: &mut Vec<u8>,
+        queued: &mut Vec<usize>,
+        results: &mut [Result<()>],
+    ) {
+        if buf.is_empty() {
+            return;
+        }
+        if let Err(e) = self.wsock.lock_recover().write_all(buf) {
+            for &i in queued.iter() {
+                results[i] = Err(Error::Io(std::io::Error::new(e.kind(), e.to_string())));
+            }
+        }
+        buf.clear();
+        queued.clear();
     }
 
     pub fn name_to_id(fullname: &str) -> Option<i32> {
         if let Ok(num) = fullname.parse::<i32>() {
             Some(num)
         } else {
-            NAME_TO_DEF.get(fullname).map(|x| x.id)
+            NAME_TO_DEF.id_of(fullname)
         }
     }
     pub fn name_to_def(fullname: &str) -> Option<&WingNodeDef> {
@@ -1741,15 +1794,15 @@ impl WingConsole {
     /// (`wing-core::tools::search`, U1) which must rank over the whole tree. Empty when the
     /// `propmap` feature is off.
     pub fn propmap_iter() -> impl Iterator<Item = (&'static str, &'static WingNodeDef)> {
-        NAME_TO_DEF.iter().map(|(&k, v)| (k, v))
+        NAME_TO_DEF.iter()
     }
 
-    /// Builds the embedded property map and its reverse id index now instead of on first use.
-    /// Together they take about 20 ms, so an application should call this on a background
-    /// thread at startup; otherwise the first lookup pays for it, possibly on a UI thread.
+    /// Sets up the embedded property map now instead of on first use. The map is a view over
+    /// static data, so this is a few microseconds and only touches the header; each
+    /// definition is parsed on its first lookup. Kept so an application can still warm it from
+    /// a background thread at startup.
     pub fn preload_property_map() {
-        lazy_static::initialize(&NAME_TO_DEF);
-        lazy_static::initialize(&ID_TO_NAME);
+        std::sync::LazyLock::force(&NAME_TO_DEF);
     }
 
     /// Total number of entries in the embedded property map. Exposed for the
@@ -1806,14 +1859,7 @@ impl WingConsole {
     pub fn id_to_defs_iter(
         id: i32,
     ) -> Option<impl ExactSizeIterator<Item = (&'static str, &'static WingNodeDef)>> {
-        ID_TO_NAME.get(&id).map(|names| {
-            names.iter().map(|&name| {
-                let def = NAME_TO_DEF
-                    .get(name)
-                    .expect("reverse property index references embedded definition");
-                (name, def)
-            })
-        })
+        NAME_TO_DEF.by_id(id)
     }
 
     /// Attended-gets every id in `ids`, in order (U6).
@@ -1859,23 +1905,17 @@ impl WingConsole {
         out
     }
 
-    /// Writes every `(id, value)` pair in `values`, in order, via the matching
-    /// `set_string`/`set_float`/`set_int` (U6). One node's failure doesn't stop
-    /// the rest -- each gets its own `Result` in the returned, order-preserving
-    /// list.
+    /// Writes every `(id, value)` pair in `values`, in order, with the same bytes the
+    /// matching `set_string`/`set_float`/`set_int` calls would send (U6), coalesced into
+    /// large writes. One node's failure doesn't stop the rest -- each gets its own
+    /// `Result` in the returned, order-preserving list.
     pub fn set_nodes(&mut self, values: &[(i32, NodeValue)]) -> Vec<(i32, Result<()>)> {
+        let items: Vec<_> = values.iter().map(|(id, v)| (*id, v)).collect();
         values
             .iter()
-            .map(|(id, value)| (*id, self.write_node_value(*id, value)))
+            .map(|(id, _)| *id)
+            .zip(self.write_node_values(&items))
             .collect()
-    }
-
-    fn write_node_value(&mut self, id: i32, value: &NodeValue) -> Result<()> {
-        match value {
-            NodeValue::String(s) => self.set_string(id, s),
-            NodeValue::Float(f) => self.set_float(id, *f),
-            NodeValue::Int(i) => self.set_int(id, *i),
-        }
     }
 
     /// Snapshots every writable value node under `root_fullname` (itself
@@ -2013,30 +2053,45 @@ impl WingConsole {
     /// model and must not be written into whichever model remains active.
     pub fn restore(&mut self, dump: &NodeDump) -> Vec<(String, Result<()>)> {
         let mut ordered: Vec<&DumpEntry> = dump.entries.iter().collect();
-        ordered.sort_by_key(|entry| restore_order_key(&entry.fullname));
+        ordered.sort_by_cached_key(|entry| restore_order_key(&entry.fullname));
 
+        // Writes are coalesced, so a selector's outcome is only known once its batch is
+        // flushed. Flushing right after each selector keeps "a failed selector stops the
+        // restore" exact; the (few) selectors cost one write each, everything else batches.
+        let mut results: Vec<(String, Result<()>)> = Vec::with_capacity(ordered.len());
+        let mut batch: Vec<(usize, &DumpEntry)> = Vec::new();
         let mut selector_failed = false;
-        ordered
-            .into_iter()
-            .map(|entry| {
-                if selector_failed {
-                    return (entry.fullname.clone(), Err(Error::InvalidInput));
-                }
-                let blocked = NAME_TO_DEF
+        for entry in ordered {
+            let slot = results.len();
+            let blocked = selector_failed
+                || NAME_TO_DEF
                     .get(entry.fullname.as_str())
-                    .map(|def| def.read_only)
-                    .unwrap_or(false);
-                let result = if blocked {
-                    Err(Error::InvalidInput)
-                } else {
-                    self.write_node_value(entry.id, &entry.value)
-                };
-                if entry.fullname.rsplit('/').next() == Some("mdl") && result.is_err() {
-                    selector_failed = true;
-                }
-                (entry.fullname.clone(), result)
-            })
-            .collect()
+                    .is_some_and(|def| def.read_only);
+            if blocked {
+                results.push((entry.fullname.clone(), Err(Error::InvalidInput)));
+                continue;
+            }
+            results.push((entry.fullname.clone(), Ok(())));
+            batch.push((slot, entry));
+            if entry.fullname.rsplit('/').next() == Some("mdl") {
+                self.flush_restore_batch(&mut batch, &mut results);
+                selector_failed = results[slot].1.is_err();
+            }
+        }
+        self.flush_restore_batch(&mut batch, &mut results);
+        results
+    }
+
+    fn flush_restore_batch(
+        &mut self,
+        batch: &mut Vec<(usize, &DumpEntry)>,
+        results: &mut [(String, Result<()>)],
+    ) {
+        let items: Vec<_> = batch.iter().map(|(_, e)| (e.id, &e.value)).collect();
+        for ((slot, _), result) in batch.iter().zip(self.write_node_values(&items)) {
+            results[*slot].1 = result;
+        }
+        batch.clear();
     }
 }
 
@@ -2142,12 +2197,9 @@ pub struct VerifyReport {
 /// them, so their live value can drift and would only produce false positives. An id absent from
 /// the map is treated as writable, so it's still checked.
 fn id_is_read_only(id: i32) -> bool {
-    match ID_TO_NAME.get(&id) {
-        Some(names) if !names.is_empty() => names
-            .iter()
-            .all(|n| NAME_TO_DEF.get(*n).is_some_and(|d| d.read_only)),
-        _ => false,
-    }
+    NAME_TO_DEF
+        .by_id(id)
+        .is_some_and(|mut defs| defs.all(|(_, d)| d.read_only))
 }
 
 /// Compares a read-back value against the expected one, tolerating float requantization: WING
@@ -2179,14 +2231,12 @@ fn values_match_at(id: i32, a: &NodeValue, b: &NodeValue) -> bool {
     let Ok(idx) = usize::try_from(idx) else {
         return false;
     };
-    ID_TO_NAME.get(&id).is_some_and(|names| {
-        names.iter().any(|name| {
-            NAME_TO_DEF.get(*name).is_some_and(|def| {
-                def.string_enum
-                    .as_ref()
-                    .and_then(|items| items.get(idx))
-                    .is_some_and(|item| item.item == label)
-            })
+    NAME_TO_DEF.by_id(id).is_some_and(|mut defs| {
+        defs.any(|(_, def)| {
+            def.string_enum
+                .as_ref()
+                .and_then(|items| items.get(idx))
+                .is_some_and(|item| item.item == label)
         })
     })
 }

@@ -1,6 +1,6 @@
 //! Consistency checks for the embedded property map (U1: R8, R9, R30, R31).
 //!
-//! `src/propmap.rs` and `src/propmap.jsonl` are regenerated from the full,
+//! `src/propmap.bin` and `src/propmap.jsonl` are regenerated from the full,
 //! per-model sweep at `propmap.jsonl` via:
 //!
 //!     cargo run --example wingschema -- embed propmap.jsonl
@@ -19,7 +19,7 @@ use libwing::WingConsole;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// The full, per-model sweep that `src/propmap.rs` / `src/propmap.jsonl` are
+/// The full, per-model sweep that `src/propmap.bin` / `src/propmap.jsonl` are
 /// regenerated from. Excluded from the packaged crate (see Cargo.toml), but
 /// present in the repo checkout that these tests run from.
 fn sweep_path() -> PathBuf {
