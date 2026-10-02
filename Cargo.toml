@@ -32,6 +32,10 @@ thiserror = "2.0.18"
 [dev-dependencies]
 eframe = "0.35.0"
 
+[[bench]]
+name = "perf"
+harness = false
+
 [[example]]
 name = "wingmeters"
 path = "tools/wingmeters.rs"
